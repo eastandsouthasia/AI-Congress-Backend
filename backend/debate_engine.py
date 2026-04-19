@@ -33,20 +33,18 @@ class DebateEngine:
         await self.ws.send_json({"type": type, **kwargs})
 
         async def wait_for_ready(self):
-        """클라이언트 ready 신호 대기 - 타임아웃을 120초로 늘리고 로그 강화"""
-        print(f"[Engine] {self.current_round}라운드 ready 대기 시작...")
+        """클라이언트 ready 신호 대기"""
+        print(f"[Engine] ready 신호 대기 중... (현재 발언 수: {len(self.ctx.all_logs)})")
         try:
-            async with asyncio.timeout(120):   # 90초 → 120초로 증가
+            async with asyncio.timeout(60):   # 60초로 줄임
                 while True:
                     message = await self.ws.receive_text()
                     data = json.loads(message)
                     if data.get("type") == "ready":
-                        print(f"[Engine] ✓ ready 수신 완료 (발언 진행)")
+                        print("[Engine] ✓ ready 수신 → 다음 발언 진행")
                         return
-                    # 다른 메시지도 무시하지 않고 로그
-                    print(f"[Engine] received non-ready message: {data.get('type')}")
         except asyncio.TimeoutError:
-            print("[Engine] ⚠️ ready 타임아웃 (120초) → 강제 다음 발언 진행")
+            print("[Engine] ready 타임아웃 → 강제 진행")
         except Exception as e:
             print(f"[Engine] ready 대기 오류: {e}")
 
