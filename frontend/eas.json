@@ -1,0 +1,16 @@
+{
+  "cli": {
+    "version": ">= 5.9.1",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "preview": {
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_BACKEND_WS_URL": "wss://ai-congress.up.railway.app/debate"
+      }
+    }
+  }
+}
