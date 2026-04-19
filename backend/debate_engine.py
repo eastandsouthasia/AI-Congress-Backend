@@ -70,8 +70,9 @@ class DebateEngine:
         self.speech_count[member_id] = self.speech_count.get(member_id, 0) + 1
 
         # ★★★ 핵심: TTS가 끝날 때까지 기다림 ★★★
-        await self.wait_for_ready()
-
+        # await self.wait_for_ready() #
+        # 대신 간단한 대기만 넣음 (TTS 시간 맞추기용)
+        await asyncio.sleep(1.8)   # 1.8초 대기
     @staticmethod
     def detect_type(text: str) -> str:
         if "[REFUTE]" in text:
