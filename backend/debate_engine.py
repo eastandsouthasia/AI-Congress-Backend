@@ -32,21 +32,23 @@ class DebateEngine:
     async def send(self, type: str, **kwargs):
         await self.ws.send_json({"type": type, **kwargs})
 
-    async def wait_for_ready(self):
-        """클라이언트가 TTS(또는 딜레이) 완료 후 'ready' 신호를 보낼 때까지 대기"""
-        print(f"[Engine] ready 신호 대기 중... (현재 발언 수: {len(self.ctx.all_logs)})")
+        async def wait_for_ready(self):
+        """클라이언트 ready 신호 대기 - 타임아웃을 120초로 늘리고 로그 강화"""
+        print(f"[Engine] {self.current_round}라운드 ready 대기 시작...")
         try:
-            async with asyncio.timeout(90):  # 최대 90초 대기
+            async with asyncio.timeout(120):   # 90초 → 120초로 증가
                 while True:
                     message = await self.ws.receive_text()
                     data = json.loads(message)
                     if data.get("type") == "ready":
-                        print("[Engine] ✓ ready 수신 → 다음 발언 진행")
+                        print(f"[Engine] ✓ ready 수신 완료 (발언 진행)")
                         return
+                    # 다른 메시지도 무시하지 않고 로그
+                    print(f"[Engine] received non-ready message: {data.get('type')}")
         except asyncio.TimeoutError:
-            print("[Engine] ready 타임아웃 → 강제 진행")
+            print("[Engine] ⚠️ ready 타임아웃 (120초) → 강제 다음 발언 진행")
         except Exception as e:
-            print(f"[Engine] ready 대기 중 오류: {e}")
+            print(f"[Engine] ready 대기 오류: {e}")
 
     async def send_speech(self, member_id: str, text: str, speech_type: str, is_chair: bool):
         """발언 전송 후 클라이언트의 ready 신호를 기다림"""
@@ -203,12 +205,14 @@ class DebateEngine:
             }
         ]
 
-        try:
-            result = await call_member(member, messages, temperature=0.25 if is_chair else 0.55)
-            return result or f"{member['name']} 의원은 이 안건에 대해 신중한 검토가 필요하다고 봅니다."
-        except:
-            return f"{member['name']} 의원은 기술적 문제로 이번 발언을 생략합니다."
-
+               try:
+            result = await call_member(member, messages, temperature=0.25 if is_chair else 0.6)
+            if not result or len(result.strip()) < 10:
+                raise Exception("Empty response")
+            return result
+        except Exception as e:
+            print(f"[Opinion] {member['name']} API 호출 실패: {e}")
+            return f"{member['name']} 의원은 현재 토론 상황을 종합해 신중한 입장을 유지하고 있습니다."
     # ─────────────────────────────────────────────
     # 최종 투표
     # ─────────────────────────────────────────────

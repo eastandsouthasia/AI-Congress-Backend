@@ -182,7 +182,7 @@ const DebateScreen = ({ issue, duration = 40, onFinish }) => {
           await speakAndWaitSafe(clean, { language: 'ko-KR', pitch, rate, volume, voice });
         } else {
           // TTS OFF 시 자연스러운 속도로 대기
-          await new Promise(r => setTimeout(r, 2200));
+          await new Promise(r => setTimeout(r, 1800));
         }
       }
 
@@ -213,7 +213,7 @@ const DebateScreen = ({ issue, duration = 40, onFinish }) => {
       historyRef.current = next;
       return next;
     });
-
+    setStatus(`${data.displayName} 발언 완료 → 다음 의원 대기 중...`);
     setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
 
     // TTS 큐에 추가
