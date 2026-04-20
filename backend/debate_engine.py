@@ -113,8 +113,8 @@ class DebateEngine:
             avatar      = member.get("avatar", "💬"),
         )
         self.speech_count[member["id"]] = self.speech_count.get(member["id"], 0) + 1
-        # 고정 딜레이: 의장 사회(0.5초) vs 의원 발언(2.5초) — 발언 하나씩 천천히 표시
-        await asyncio.sleep(0.5 if skip_wait else 2.5)
+        # 고정 딜레이: 의장 사회(0.5초) vs 의원 발언(2.0초)
+        await asyncio.sleep(0.5 if skip_wait else 2.0)
 
 
     @staticmethod
@@ -398,19 +398,15 @@ class DebateEngine:
         for round_num in range(1, self.rounds + 1):
             self.current_round = round_num
 
-            # ✅ 버그2+3 수정: 라운드 시작 선언을 고정 문자열로 (AI 생성 제거 → 즉시 출력)
-            # 중간 라운드에서 요약+선언이 겹치던 문제 해결
-            if self.rounds == 1:
-                round_text = f"토론을 시작합니다. 각 의원께서는 입장과 근거를 명확히 밝혀주십시오."
-            elif round_num == 1:
-                round_text = f"━━ {round_num}라운드 · 초기 입장 표명 ━━  각 의원께서는 안건에 대한 입장과 핵심 근거를 밝혀주십시오."
-            elif round_num == self.rounds:
-                round_text = f"━━ {round_num}라운드 · 최종 입장 확정 ━━  전체 토론을 바탕으로 최종 입장을 확정해 주십시오."
-            else:
-                round_text = f"━━ {round_num}라운드 · 반박 및 재반박 ━━  앞선 발언의 논리적 약점을 지적하고 반박해 주십시오."
-
-            self.ctx.push(f"[의장 {chair['name']}]", round_text)
-            await self.send_speech(chair, round_text, "NORMAL", True, skip_wait=True)
+            # 라운드 선언: 1라운드는 개회사가 이미 역할을 하므로 생략
+            # 2라운드부터만 의장이 선언 후 충분히 끊고 첫 지목으로 넘어감
+            if round_num > 1:
+                if round_num == self.rounds:
+                    round_text = f"{round_num}라운드입니다. 전체 토론을 바탕으로 최종 입장을 밝혀주십시오."
+                else:
+                    round_text = f"{round_num}라운드입니다. 앞선 발언의 논리적 약점을 지적하고 반박해 주십시오."
+                self.ctx.push(f"[의장 {chair['name']}]", round_text)
+                await self.send_speech(chair, round_text, "NORMAL", True)  # 자연스럽게 끊어줌
 
             order = non_chair.copy()
             if round_num > 1:
@@ -418,27 +414,23 @@ class DebateEngine:
 
             prev_speaker_id = None
 
-            for idx, m in enumerate(order):
-                # 지목 전송 (고정 문자열, 즉시)
+            for m in order:
+                # 의장 지목 → API 호출(대기) → 발언 표시
+                # 이것이 릴레이의 핵심: 지목 → (생성 중) → 발언 → 다음 지목
                 nominate = f"{m['name']} 의원님, 발언해 주시기 바랍니다."
                 self.ctx.push(f"[의장 {chair['name']}]", nominate)
                 await self.send_speech(chair, nominate, "NORMAL", True, skip_wait=True)
 
-                await self.send("status",
-                    message=f"[릴레이 {round_num}/{self.rounds}라운드] {m['name']} 의원 발언 준비 중...")
-
-                # ✅ 순차 처리: 이전 발언이 완전히 전송된 후 다음 API 호출
+                await self.send("status", message=f"⏳ {m['name']} 의원 발언 준비 중...")
                 opinion = await self.get_opinion(
                     m, chair["name"],
                     format_guide=fmt_guide, round_num=round_num,
                 )
 
-                await self.send("status",
-                    message=f"[릴레이 {round_num}/{self.rounds}라운드] {m['name']} 의원 발언 중...")
                 stype = self.detect_type(opinion)
                 self.memories[m["id"]].append(opinion)
                 self.ctx.push(f"[{m['name']} 의원]", opinion)
-                await self.send_speech(m, opinion, stype, False)
+                await self.send_speech(m, opinion, stype, False)  # 2.0초 대기 → 다음 지목으로 자연스럽게
 
                 # 즉석 반박권 (2라운드 이상, 마지막 라운드 제외)
                 if (stype == "REFUTE"
@@ -452,6 +444,7 @@ class DebateEngine:
                         self.ctx.push(f"[의장 {chair['name']}]", allow)
                         await self.send_speech(chair, allow, "NORMAL", True, skip_wait=True)
 
+                        await self.send("status", message=f"⏳ {prev_m['name']} 의원 반박 준비 중...")
                         rebuttal = await self.get_opinion(
                             prev_m, chair["name"],
                             format_guide=fmt_guide,
@@ -467,11 +460,11 @@ class DebateEngine:
                 prev_speaker_id = m["id"]
                 await self.ctx.compress_if_needed()
 
-            # ✅ 라운드 전환 발언도 고정 문자열 (skip_wait으로 다음 라운드 즉시 시작)
+            # 라운드 전환 (마지막 라운드는 run_conclusion이 처리)
             if round_num < self.rounds:
-                transition = f"{round_num}라운드가 종료되었습니다. {round_num + 1}라운드로 넘어갑니다."
+                transition = f"{round_num}라운드가 종료되었습니다. 잠시 후 {round_num + 1}라운드를 시작합니다."
                 self.ctx.push(f"[의장 {chair['name']}]", transition)
-                await self.send_speech(chair, transition, "NORMAL", True, skip_wait=True)
+                await self.send_speech(chair, transition, "NORMAL", True)  # 충분히 끊어줌
 
         await self.run_conclusion(chair)
 

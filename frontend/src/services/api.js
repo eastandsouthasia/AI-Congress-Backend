@@ -16,13 +16,14 @@ export const MEMBER_ENGINE_MAP = {
   gemini:     { engine: "gemini",     model: "gemini-2.5-flash" },
   llama4:     { engine: "groq",       model: "meta-llama/llama-4-scout-17b-16e-instruct" },
   chatgpt:    { engine: "groq",       model: "llama-3.3-70b-versatile" },
-  claude:     { engine: "openrouter", model: "anthropic/claude-3-haiku" },
-  grok:       { engine: "openrouter", model: "x-ai/grok-3-mini-beta" },
-  deepseek:   { engine: "openrouter", model: "deepseek/deepseek-r1-0528:free" },
+  // claude-3-haiku는 openrouter 무료 경유 시 느림 → groq llama로 대체
+  claude:     { engine: "groq",       model: "llama-3.3-70b-versatile" },
+  // grok-3-mini-beta 무료 티어 응답 30~90초 → mistral-small(~5s)으로 대체
+  grok:       { engine: "openrouter", model: "mistralai/mistral-small-3.2-24b-instruct:free" },
   perplexity: { engine: "openrouter", model: "mistralai/mistral-small-3.2-24b-instruct:free" },
   manus:      { engine: "openrouter", model: "qwen/qwen3-8b:free" },
-  glm5:       { engine: "openrouter", model: "thudm/glm-z1-32b:free" },
-  kimi:       { engine: "openrouter", model: "moonshotai/moonlight-16a-a3b-instruct:free" },
+  // deepseek: 무료 응답 60~120초로 제거됨
+  // glm5, kimi: 의원 목록에서 이미 제거됨
 };
 
 // ─────────────────────────────────────────────
@@ -128,7 +129,7 @@ export const getOpenRouterCompletion = async (
         'HTTP-Referer': 'https://ai-congress.app',
         'X-Title': 'AI Congress',
       },
-      timeout: 50000,
+      timeout: 20000,  // 50000→20000: 느린 모델 교체로 20초면 충분
     }
   );
   return ensureComplete(response.data.choices?.[0]?.message?.content || "");

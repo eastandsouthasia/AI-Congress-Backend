@@ -115,23 +115,22 @@ async def call_groq(
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 350,
+        "max_tokens": 300,       # 350→300: 불필요한 토큰 줄여 응답 속도 향상
         "presence_penalty": 0.4,
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=15) as client:  # 30s→15s: 느린 응답 빠르게 포기
         try:
             r = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 json=payload,
                 headers=headers,
             )
-            if r.status_code == 429 and retry < 4:
-                _BUCKETS["groq"].penalize(20)
-                # Retry-After 헤더 우선 사용
-                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 6))
-                wait = min(retry_after, 30)
-                print(f"[Groq 429] {wait}초 대기 후 재시도 ({retry+1}/4)")
+            if r.status_code == 429 and retry < 2:   # 4→2회: 재시도 횟수 줄임
+                _BUCKETS["groq"].penalize(10)           # 20s→10s: 패널티 단축
+                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 4))  # 6s→4s
+                wait = min(retry_after, 15)             # 30s→15s: 최대 대기 단축
+                print(f"[Groq 429] {wait}초 대기 후 재시도 ({retry+1}/2)")
                 await asyncio.sleep(wait)
                 return await call_groq(messages, temperature, model, retry + 1)
 
@@ -140,9 +139,9 @@ async def call_groq(
             return ensure_complete(content)
 
         except httpx.TimeoutException:
-            if retry < 2:
-                print(f"[Groq 타임아웃] 재시도 ({retry+1}/2)")
-                await asyncio.sleep(4)
+            if retry < 1:   # 2→1회
+                print(f"[Groq 타임아웃] 재시도 ({retry+1}/1)")
+                await asyncio.sleep(2)  # 4s→2s
                 return await call_groq(messages, temperature, model, retry + 1)
             raise ValueError("Groq 응답 시간 초과")
 
@@ -189,14 +188,14 @@ async def call_gemini(
         },
     }
 
-    async with httpx.AsyncClient(timeout=35) as client:
+    async with httpx.AsyncClient(timeout=20) as client:  # 35s→20s
         try:
             r = await client.post(url, json=payload)
 
-            if r.status_code == 429 and retry < 4:
-                _BUCKETS["gemini"].penalize(20)
-                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 7))
-                wait = min(retry_after, 35)
+            if r.status_code == 429 and retry < 2:   # 4→2회
+                _BUCKETS["gemini"].penalize(10)        # 20s→10s
+                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 5))
+                wait = min(retry_after, 20)            # 35s→20s
                 print(f"[Gemini 429] {wait}초 대기 후 재시도")
                 await asyncio.sleep(wait)
                 return await call_gemini(messages, temperature, model, retry + 1)
@@ -206,8 +205,8 @@ async def call_gemini(
             return ensure_complete(content)
 
         except httpx.TimeoutException:
-            if retry < 2:
-                await asyncio.sleep(4)
+            if retry < 1:   # 2→1회
+                await asyncio.sleep(2)
                 return await call_gemini(messages, temperature, model, retry + 1)
             raise ValueError("Gemini 응답 시간 초과")
 
@@ -239,7 +238,7 @@ async def call_openrouter(
         "presence_penalty": 0.4,
     }
 
-    async with httpx.AsyncClient(timeout=45) as client:
+    async with httpx.AsyncClient(timeout=20) as client:  # 45s→20s: 느린 모델 교체로 충분
         try:
             r = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -247,10 +246,10 @@ async def call_openrouter(
                 headers=headers,
             )
 
-            if r.status_code == 429 and retry < 4:
-                _BUCKETS["openrouter"].penalize(20)
-                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 7))
-                wait = min(retry_after, 40)
+            if r.status_code == 429 and retry < 2:   # 4→2회
+                _BUCKETS["openrouter"].penalize(10)    # 20s→10s
+                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 5))
+                wait = min(retry_after, 20)            # 40s→20s
                 print(f"[OpenRouter 429] {wait}초 대기 후 재시도")
                 await asyncio.sleep(wait)
                 return await call_openrouter(messages, temperature, model, retry + 1)
@@ -268,23 +267,29 @@ async def call_openrouter(
             return ensure_complete(content)
 
         except httpx.TimeoutException:
-            if retry < 2:
-                await asyncio.sleep(4)
+            if retry < 1:   # 2→1회
+                await asyncio.sleep(2)
                 return await call_openrouter(messages, temperature, model, retry + 1)
             raise ValueError("OpenRouter 응답 시간 초과")
 
 # ─────────────────────────────────────────────
 # 의원 엔진 매핑
+# ⚠️ 무료 모델 응답속도 기준:
+#   빠름(~5s): groq 모델, gemini-2.5-flash, mistral-small:free, qwen3-8b:free
+#   느림(30s+): deepseek-r1:free, grok-3-mini-beta → 제거됨
 # ─────────────────────────────────────────────
 MEMBER_ENGINE_MAP = {
     "gemini":     {"engine": "gemini",      "model": "gemini-2.5-flash"},
     "llama4":     {"engine": "groq",        "model": "meta-llama/llama-4-scout-17b-16e-instruct"},
     "chatgpt":    {"engine": "groq",        "model": "llama-3.3-70b-versatile"},
-    "claude":     {"engine": "openrouter",  "model": "anthropic/claude-3-haiku"},
-    "grok":       {"engine": "openrouter",  "model": "x-ai/grok-3-mini-beta"},
-    "deepseek":   {"engine": "openrouter",  "model": "deepseek/deepseek-r1-0528:free"},
+    # claude-3-haiku는 openrouter 무료 경유 시 느림 → groq llama로 대체
+    "claude":     {"engine": "groq",        "model": "llama-3.3-70b-versatile"},
+    # grok-3-mini-beta 무료 티어 응답 30~90초 → mistral-small(빠름)으로 대체
+    "grok":       {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},
     "perplexity": {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},
     "manus":      {"engine": "openrouter",  "model": "qwen/qwen3-8b:free"},
+    # deepseek: 무료 응답 60~120초로 제거됨
+    # glm5, kimi: 의원 목록에서 이미 제거됨
 }
 
 # ─────────────────────────────────────────────
