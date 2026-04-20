@@ -2,10 +2,12 @@
 AI 호출 레이어 - 레이트 리밋 완전 대응 버전
 
 핵심 변경사항:
-- 엔진별 글로벌 RPM 토큰버킷 추가 (Groq 25/min, Gemini 12/min, OpenRouter 15/min)
-- 발언은 반드시 순차적으로 처리 (GLOBAL_SEMAPHORE로 동시 호출 1개 제한)
-- 429 발생 시 버킷을 즉시 소진 처리 후 대기
-- 문장 완성 보장 (끊김 방지)
+- 엔진별 글로벌 RPM 토큰버킷 (Groq 20/min, Gemini 12/min, OpenRouter 15/min)
+- claude → Gemini로 이동 (Groq 과부하 해소)
+- chatgpt → OpenRouter mistral로 이동 (Groq 분산)
+- 폴백 순서: 전용엔진 → 다른엔진 교차 → Gemini → 최소응답
+- penalize 축소 (5초) → 회복 시간 단축
+- 429 시 Retry-After 헤더 우선 준수
 """
 
 import os
@@ -19,12 +21,12 @@ GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 # ─────────────────────────────────────────────
-# 엔진별 동시 호출 제한 (글로벌 1개 → 엔진별 독립)
+# 엔진별 동시 호출 제한
 # ─────────────────────────────────────────────
 _ENGINE_SEMAPHORES = {
     "groq":       asyncio.Semaphore(1),
     "gemini":     asyncio.Semaphore(1),
-    "openrouter": asyncio.Semaphore(2),
+    "openrouter": asyncio.Semaphore(1),  # 2→1: openrouter도 순차처리로 안정화
 }
 
 # ─────────────────────────────────────────────
@@ -36,11 +38,11 @@ class TokenBucket:
     burst: 순간 최대 토큰 (기본 = rpm의 절반, 최소 1)
     """
     def __init__(self, rpm: int, burst: int = None):
-        self.rpm        = rpm
-        self.capacity   = burst or max(1, rpm // 2)
-        self.tokens     = float(self.capacity)
+        self.rpm         = rpm
+        self.capacity    = burst or max(1, rpm // 2)
+        self.tokens      = float(self.capacity)
         self.last_refill = time.monotonic()
-        self._lock      = None  # asyncio.Lock은 이벤트루프 생성 후 초기화
+        self._lock       = None  # asyncio.Lock은 이벤트루프 생성 후 초기화
 
     def _ensure_lock(self):
         if self._lock is None:
@@ -49,9 +51,8 @@ class TokenBucket:
     async def acquire(self):
         self._ensure_lock()
         async with self._lock:
-            now = time.monotonic()
+            now     = time.monotonic()
             elapsed = now - self.last_refill
-            # 경과 시간에 비례해 토큰 보충
             self.tokens = min(
                 self.capacity,
                 self.tokens + elapsed * (self.rpm / 60.0)
@@ -60,23 +61,25 @@ class TokenBucket:
 
             if self.tokens >= 1.0:
                 self.tokens -= 1.0
-                return  # 즉시 통과
+                return
 
-            # 토큰 부족 → 다음 토큰까지 대기
             wait = (1.0 - self.tokens) / (self.rpm / 60.0)
             print(f"[RateLimit] {wait:.1f}초 대기 중...")
             await asyncio.sleep(wait)
             self.tokens = 0.0
 
-    def penalize(self, seconds: float = 15.0):
-        """429 수신 시 토큰 강제 소진 + 추가 패널티"""
-        self.tokens = -seconds * (self.rpm / 60.0)
+    def penalize(self, seconds: float = 5.0):
+        """429 수신 시 토큰 강제 소진. 패널티 5초로 축소 (이전: 10~20초)"""
+        self.tokens = max(self.tokens - seconds * (self.rpm / 60.0), -self.capacity)
 
-# 엔진별 버킷 (무료 티어 기준으로 여유 있게 설정)
+
+# 엔진별 버킷
+# ⚠️ Groq을 20 RPM으로 낮춤: claude+chatgpt가 Groq에서 빠져나가므로
+#    llama4 단독 사용 → 더 여유롭게 운영 가능
 _BUCKETS = {
-    "groq":       TokenBucket(rpm=25, burst=3),   # Groq 무료: ~30 RPM → 25로 제한
-    "gemini":     TokenBucket(rpm=12, burst=2),   # Gemini 무료: ~15 RPM → 12로 제한
-    "openrouter": TokenBucket(rpm=15, burst=2),   # OpenRouter 무료: ~20 RPM → 15로 제한
+    "groq":       TokenBucket(rpm=20, burst=2),
+    "gemini":     TokenBucket(rpm=12, burst=2),
+    "openrouter": TokenBucket(rpm=15, burst=2),
 }
 
 # ─────────────────────────────────────────────
@@ -115,21 +118,22 @@ async def call_groq(
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 300,       # 350→300: 불필요한 토큰 줄여 응답 속도 향상
+        "max_tokens": 300,
         "presence_penalty": 0.4,
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:  # 30s→15s: 느린 응답 빠르게 포기
+    async with httpx.AsyncClient(timeout=15) as client:
         try:
             r = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 json=payload,
                 headers=headers,
             )
-            if r.status_code == 429 and retry < 2:   # 4→2회: 재시도 횟수 줄임
-                _BUCKETS["groq"].penalize(10)           # 20s→10s: 패널티 단축
-                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 4))  # 6s→4s
-                wait = min(retry_after, 15)             # 30s→15s: 최대 대기 단축
+            if r.status_code == 429 and retry < 2:
+                _BUCKETS["groq"].penalize(5)
+                # Retry-After 헤더를 최우선으로 준수
+                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 5))
+                wait = min(retry_after, 20)
                 print(f"[Groq 429] {wait}초 대기 후 재시도 ({retry+1}/2)")
                 await asyncio.sleep(wait)
                 return await call_groq(messages, temperature, model, retry + 1)
@@ -139,9 +143,9 @@ async def call_groq(
             return ensure_complete(content)
 
         except httpx.TimeoutException:
-            if retry < 1:   # 2→1회
+            if retry < 1:
                 print(f"[Groq 타임아웃] 재시도 ({retry+1}/1)")
-                await asyncio.sleep(2)  # 4s→2s
+                await asyncio.sleep(2)
                 return await call_groq(messages, temperature, model, retry + 1)
             raise ValueError("Groq 응답 시간 초과")
 
@@ -188,14 +192,14 @@ async def call_gemini(
         },
     }
 
-    async with httpx.AsyncClient(timeout=20) as client:  # 35s→20s
+    async with httpx.AsyncClient(timeout=20) as client:
         try:
             r = await client.post(url, json=payload)
 
-            if r.status_code == 429 and retry < 2:   # 4→2회
-                _BUCKETS["gemini"].penalize(10)        # 20s→10s
-                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 5))
-                wait = min(retry_after, 20)            # 35s→20s
+            if r.status_code == 429 and retry < 2:
+                _BUCKETS["gemini"].penalize(5)
+                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 6))
+                wait = min(retry_after, 20)
                 print(f"[Gemini 429] {wait}초 대기 후 재시도")
                 await asyncio.sleep(wait)
                 return await call_gemini(messages, temperature, model, retry + 1)
@@ -205,7 +209,7 @@ async def call_gemini(
             return ensure_complete(content)
 
         except httpx.TimeoutException:
-            if retry < 1:   # 2→1회
+            if retry < 1:
                 await asyncio.sleep(2)
                 return await call_gemini(messages, temperature, model, retry + 1)
             raise ValueError("Gemini 응답 시간 초과")
@@ -238,7 +242,7 @@ async def call_openrouter(
         "presence_penalty": 0.4,
     }
 
-    async with httpx.AsyncClient(timeout=20) as client:  # 45s→20s: 느린 모델 교체로 충분
+    async with httpx.AsyncClient(timeout=20) as client:
         try:
             r = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -246,67 +250,91 @@ async def call_openrouter(
                 headers=headers,
             )
 
-            if r.status_code == 429 and retry < 2:   # 4→2회
-                _BUCKETS["openrouter"].penalize(10)    # 20s→10s
-                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 5))
-                wait = min(retry_after, 20)            # 40s→20s
+            if r.status_code == 429 and retry < 2:
+                _BUCKETS["openrouter"].penalize(5)
+                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 6))
+                wait = min(retry_after, 20)
                 print(f"[OpenRouter 429] {wait}초 대기 후 재시도")
                 await asyncio.sleep(wait)
                 return await call_openrouter(messages, temperature, model, retry + 1)
 
             if r.status_code == 402:
-                print(f"[OpenRouter 402] 크레딧 부족 → mistral 무료 폴백")
-                return await call_openrouter(
-                    messages, temperature,
-                    "mistralai/mistral-small-3.2-24b-instruct:free",
-                    retry
-                )
+                # 크레딧 부족: 다른 무료 모델로 교체
+                if model != "mistralai/mistral-small-3.2-24b-instruct:free":
+                    print(f"[OpenRouter 402] 크레딧 부족 → mistral 무료 폴백")
+                    return await call_openrouter(
+                        messages, temperature,
+                        "mistralai/mistral-small-3.2-24b-instruct:free",
+                        retry
+                    )
+                raise ValueError("OpenRouter 크레딧 소진")
 
             r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"]
             return ensure_complete(content)
 
         except httpx.TimeoutException:
-            if retry < 1:   # 2→1회
+            if retry < 1:
                 await asyncio.sleep(2)
                 return await call_openrouter(messages, temperature, model, retry + 1)
             raise ValueError("OpenRouter 응답 시간 초과")
 
 # ─────────────────────────────────────────────
-# 의원 엔진 매핑
+# 의원 엔진 매핑 — ✅ 엔진 분산 재배치
+#
+# 변경 전 문제:
+#   claude + chatgpt + llama4 → 모두 Groq → Groq RPM 폭주
+#
+# 변경 후 분산:
+#   Groq:       llama4 (단독 사용 → 여유로움)
+#   Gemini:     gemini, claude (Gemini는 일 1500회 무료 → 여유 큼)
+#   OpenRouter: grok, perplexity, chatgpt, manus
+#
 # ⚠️ 무료 모델 응답속도 기준:
 #   빠름(~5s): groq 모델, gemini-2.5-flash, mistral-small:free, qwen3-8b:free
-#   느림(30s+): deepseek-r1:free, grok-3-mini-beta → 제거됨
+#   느림(30s+): deepseek-r1:free, grok-3-mini-beta → 사용 안 함
 # ─────────────────────────────────────────────
 MEMBER_ENGINE_MAP = {
+    # Gemini 엔진 (일 1500회 무료, RPM 15 → 여유 있음)
     "gemini":     {"engine": "gemini",      "model": "gemini-2.5-flash"},
+    "claude":     {"engine": "gemini",      "model": "gemini-2.5-flash"},   # ✅ Groq→Gemini
+
+    # Groq 엔진 (llama4 단독 사용 → RPM 소진 위험 대폭 감소)
     "llama4":     {"engine": "groq",        "model": "meta-llama/llama-4-scout-17b-16e-instruct"},
-    "chatgpt":    {"engine": "groq",        "model": "llama-3.3-70b-versatile"},
-    # claude-3-haiku는 openrouter 무료 경유 시 느림 → groq llama로 대체
-    "claude":     {"engine": "groq",        "model": "llama-3.3-70b-versatile"},
-    # grok-3-mini-beta 무료 티어 응답 30~90초 → mistral-small(빠름)으로 대체
+
+    # OpenRouter 엔진 (mistral-small 빠름, qwen3-8b 빠름)
+    "chatgpt":    {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},  # ✅ Groq→OpenRouter
     "grok":       {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},
     "perplexity": {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},
     "manus":      {"engine": "openrouter",  "model": "qwen/qwen3-8b:free"},
-    # deepseek: 무료 응답 60~120초로 제거됨
-    # glm5, kimi: 의원 목록에서 이미 제거됨
 }
 
 # ─────────────────────────────────────────────
-# 통합 호출: 글로벌 세마포어 + 엔진별 버킷 + 폴백
-# 반드시 한 번에 1명씩만 호출됨 (동시 호출 차단)
+# 엔진별 교차 폴백 순서
+# 1차 실패 시 → 다른 엔진으로 교차 시도 (Groq 단일 폴백 제거)
+# ─────────────────────────────────────────────
+_FALLBACK_ORDER = {
+    "groq":       [("gemini", call_gemini), ("openrouter", call_openrouter)],
+    "gemini":     [("groq", call_groq),     ("openrouter", call_openrouter)],
+    "openrouter": [("gemini", call_gemini), ("groq", call_groq)],
+}
+
+# ─────────────────────────────────────────────
+# 통합 호출: 엔진별 버킷 + 교차 폴백
 # ─────────────────────────────────────────────
 async def call_member(member: dict, messages: list, temperature: float = 0.5) -> str:
     member_id = member.get("id", "")
     name      = member.get("name", "?")
-    config    = MEMBER_ENGINE_MAP.get(member_id, {"engine": "groq", "model": "llama-3.3-70b-versatile"})
-    engine    = config["engine"]
-    model     = config["model"]
-    sem       = _ENGINE_SEMAPHORES.get(engine, _ENGINE_SEMAPHORES["openrouter"])
+    config    = MEMBER_ENGINE_MAP.get(
+        member_id,
+        {"engine": "openrouter", "model": "mistralai/mistral-small-3.2-24b-instruct:free"}
+    )
+    engine = config["engine"]
+    model  = config["model"]
+    sem    = _ENGINE_SEMAPHORES.get(engine, _ENGINE_SEMAPHORES["openrouter"])
 
-    # ── 엔진별 순차 처리 (같은 엔진끼리만 대기, 다른 엔진은 병렬 가능) ──
     async with sem:
-        # 1차 시도: 전용 엔진
+        # ── 1차: 전용 엔진 ──
         try:
             if engine == "gemini":
                 return await call_gemini(messages, temperature, model)
@@ -314,19 +342,21 @@ async def call_member(member: dict, messages: list, temperature: float = 0.5) ->
                 return await call_openrouter(messages, temperature, model)
             else:
                 return await call_groq(messages, temperature, model)
-
         except Exception as e1:
             print(f"[{name}/{engine}] 1차 실패: {e1}")
 
-        # 2차 시도: Groq 기본 모델 폴백
-        try:
-            print(f"[{name}] Groq 폴백 시도")
-            return await call_groq(messages, temperature)
+        # ── 2차: 교차 폴백 (엔진별 순서대로) ──
+        for fallback_engine, fallback_fn in _FALLBACK_ORDER.get(engine, []):
+            fallback_sem = _ENGINE_SEMAPHORES.get(fallback_engine, _ENGINE_SEMAPHORES["openrouter"])
+            try:
+                print(f"[{name}] {fallback_engine} 교차 폴백 시도")
+                async with fallback_sem:
+                    return await fallback_fn(messages, temperature)
+            except Exception as e2:
+                print(f"[{name}/{fallback_engine}] 교차 폴백 실패: {e2}")
+                continue
 
-        except Exception as e2:
-            print(f"[{name}] Groq 폴백도 실패: {e2}")
-
-        # 3차: 최소 응답 반환
-        fallback = f"{name} 의원은 이 안건에 대해 충분한 검토가 필요하다는 입장입니다."
-        print(f"[{name}] 최소 응답 반환")
-        return fallback
+        # ── 3차: 최소 응답 ──
+        fallback_text = f"{name} 의원은 더 많은 논의가 필요하다고 판단합니다."
+        print(f"[{name}] 모든 엔진 실패 → 최소 응답 반환")
+        return fallback_text
