@@ -135,7 +135,6 @@ const getVoiceSettings = async (memberId) => {
     case "grok":       pitch=0.85; rate=0.89; break;
     case "claude":     pitch=0.91; rate=0.81; volume=0.97; break;
     case "manus":      pitch=1.03; rate=0.96; break;
-    case "deepseek":   pitch=1.15; rate=1.05; volume=0.95; break;
     case "llama4":     pitch=0.82; rate=0.87; break;
   }
   try {
@@ -293,7 +292,6 @@ const DebateScreen = ({
         .replace(/ChatGPT/gi, "챗지피티")
         .replace(/Llama4?/gi, "라마")
         .replace(/Gemini/gi, "제미나이")
-        .replace(/DeepSeek/gi, "딥시크")
         .replace(/Perplexity/gi, "퍼플렉시티")
         .replace(/Manus/gi, "마누스")
         .replace(/Grok/gi, "그록")

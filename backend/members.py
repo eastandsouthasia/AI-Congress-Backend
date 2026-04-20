@@ -88,7 +88,7 @@ MEMBERS = [
         "avatar": "🏴",
         "pitch":  1.2,
         "engine": "openrouter",
-        "model":  "x-ai/grok-3-mini-beta",
+        "model":  "mistralai/mistral-small-3.2-24b-instruct:free",
     },
     {
         "id":     "claude",
@@ -107,8 +107,8 @@ MEMBERS = [
         "color":  "#D97757",
         "avatar": "🛡",
         "pitch":  0.8,
-        "engine": "openrouter",
-        "model":  "anthropic/claude-3-haiku",
+        "engine": "groq",
+        "model":  "llama-3.3-70b-versatile",
     },
     {
         "id":     "manus",
@@ -129,26 +129,6 @@ MEMBERS = [
         "pitch":  1.0,
         "engine": "openrouter",
         "model":  "qwen/qwen3-8b:free",
-    },
-    {
-        "id":     "deepseek",
-        "name":   "DeepSeek",
-        "lens":   "DeepSeek 학습 기반 — 중국어·수학·추론",
-        "persona": (
-            "당신은 DeepSeek이 개발한 모델입니다. "
-            "역할극이나 인위적 페르소나 없이, 당신이 실제로 학습한 지식과 데이터로만 발언하십시오. "
-            "중국어권 학술·경제·정책 데이터와 수학적 추론 특화 훈련을 바탕으로 "
-            "수치 기반의 엄밀한 논증, 장기 시뮬레이션, 구조적 인과관계 분석에 강점이 있습니다. "
-            "당신이 아는 것은 자신 있게 제시하고, 모르거나 불확실한 것은 반드시 '불확실'로 명시하십시오. "
-            "주장할 때는 구체적 근거를 먼저 제시하고, 논리를 전개하십시오."
-        ),
-        "bias":  "중립",
-        "temperature": 0.6,
-        "color":  "#007BFF",
-        "avatar": "🐋",
-        "pitch":  1.1,
-        "engine": "openrouter",
-        "model":  "deepseek/deepseek-r1-0528:free",
     },
     {
         "id":     "llama4",
