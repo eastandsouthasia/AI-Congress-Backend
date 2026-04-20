@@ -19,9 +19,13 @@ GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 # ─────────────────────────────────────────────
-# 글로벌 동시 호출 제한 (한 번에 1개 발언만)
+# 엔진별 동시 호출 제한 (글로벌 1개 → 엔진별 독립)
 # ─────────────────────────────────────────────
-GLOBAL_SEMAPHORE = asyncio.Semaphore(1)
+_ENGINE_SEMAPHORES = {
+    "groq":       asyncio.Semaphore(1),
+    "gemini":     asyncio.Semaphore(1),
+    "openrouter": asyncio.Semaphore(2),
+}
 
 # ─────────────────────────────────────────────
 # 토큰 버킷 레이트 리미터
@@ -111,11 +115,11 @@ async def call_groq(
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 700,
+        "max_tokens": 350,
         "presence_penalty": 0.4,
     }
 
-    async with httpx.AsyncClient(timeout=55) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         try:
             r = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
@@ -181,11 +185,11 @@ async def call_gemini(
         "system_instruction": {"parts": [{"text": system_text}]},
         "generationConfig": {
             "temperature": temperature,
-            "maxOutputTokens": 700,
+            "maxOutputTokens": 350,
         },
     }
 
-    async with httpx.AsyncClient(timeout=65) as client:
+    async with httpx.AsyncClient(timeout=35) as client:
         try:
             r = await client.post(url, json=payload)
 
@@ -231,11 +235,11 @@ async def call_openrouter(
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 700,
+        "max_tokens": 350,
         "presence_penalty": 0.4,
     }
 
-    async with httpx.AsyncClient(timeout=80) as client:
+    async with httpx.AsyncClient(timeout=45) as client:
         try:
             r = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -293,9 +297,10 @@ async def call_member(member: dict, messages: list, temperature: float = 0.5) ->
     config    = MEMBER_ENGINE_MAP.get(member_id, {"engine": "groq", "model": "llama-3.3-70b-versatile"})
     engine    = config["engine"]
     model     = config["model"]
+    sem       = _ENGINE_SEMAPHORES.get(engine, _ENGINE_SEMAPHORES["openrouter"])
 
-    # ── 글로벌 순차 처리: 한 번에 반드시 1명만 API 호출 ──
-    async with GLOBAL_SEMAPHORE:
+    # ── 엔진별 순차 처리 (같은 엔진끼리만 대기, 다른 엔진은 병렬 가능) ──
+    async with sem:
         # 1차 시도: 전용 엔진
         try:
             if engine == "gemini":

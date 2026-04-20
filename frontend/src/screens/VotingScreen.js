@@ -1,9 +1,10 @@
-
-import React from "react";
+import React, { useState } from "react";
 import {
   View, Text, ScrollView, StyleSheet,
-  TouchableOpacity, SafeAreaView,
+  TouchableOpacity, SafeAreaView, Alert, Modal,
 } from "react-native";
+import * as FileSystem from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
 import { COLORS, MEMBERS } from "../constants/members";
 
 // 추가: 데이터 포인트 분석 함수
@@ -32,7 +33,65 @@ const VOTE_COLOR = {
   기권: COLORS.textMuted,
 };
 
+// 회의록 포맷 (DebateScreen과 동일)
+const formatDebateLog = (issue, history, voteResult = null) => {
+  if (!history || history.length === 0) return "기록된 발언이 없습니다.";
+  const now = new Date().toLocaleString('ko-KR');
+  const header =
+    `==========================================\n` +
+    `🏛️  AI 의회 토론 공식 기록물\n` +
+    `==========================================\n` +
+    `안건: ${issue}\n일시: ${now}\n총 발언: ${history.length}건\n` +
+    `------------------------------------------\n\n`;
+  const body = history.map((log, i) => {
+    const tag = log.type === "REFUTE" ? " [반박]" : log.type === "ADMIT" ? " [수용]" : "";
+    return `[${i + 1}] ${log.displayName}${tag}\n${log.text}\n`;
+  }).join('\n');
+  let resultSection = "";
+  if (voteResult) {
+    resultSection = `\n------------------------------------------\n최종 의결:\n`;
+    if (voteResult.type === "VOTE") {
+      const pro = voteResult.content?.filter(v => v.text?.includes("찬성")).length || 0;
+      const con = voteResult.content?.filter(v => v.text?.includes("반대")).length || 0;
+      const abs = (voteResult.content?.length || 0) - pro - con;
+      resultSection += `찬성 ${pro} / 반대 ${con} / 기권 ${abs}\n결과: ${pro > con ? "✅ 가결" : "❌ 부결"}\n`;
+      voteResult.content?.forEach(v => { resultSection += `${v.memberId}: ${v.text}\n`; });
+    } else {
+      resultSection += `공동 결의안:\n${voteResult.content}`;
+    }
+    resultSection += `\n`;
+  }
+  return header + body + resultSection +
+    `\n------------------------------------------\n본 문서는 AI 의결 시스템에 의해 작성되었습니다.\n==========================================`;
+};
+
 const VotingScreen = ({ issue, result, onReset }) => {
+  const [isSaving, setIsSaving]       = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+
+  // 다운로드 핸들러
+  const handleDownload = async () => {
+    if (isSaving) return;
+    setIsSaving(true);
+    try {
+      const voteResult = { type: result.type, content: result.content };
+      const logText = formatDebateLog(issue, result.history || [], voteResult);
+      const fileName = `AI_Congress_${Date.now()}.txt`;
+      const fileUri = (FileSystem.documentDirectory || FileSystem.cacheDirectory) + fileName;
+      await FileSystem.writeAsStringAsync(fileUri, logText, { encoding: FileSystem.EncodingType.UTF8 });
+      const canShare = await Sharing.isAvailableAsync();
+      if (canShare) {
+        await Sharing.shareAsync(fileUri, { mimeType: 'text/plain', dialogTitle: 'AI 의회 토론 기록' });
+      } else {
+        Alert.alert("저장 완료", `경로: ${fileUri}`);
+      }
+    } catch (e) {
+      Alert.alert("저장 실패", e.message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   // 데이터 지표 집계
   const dataStats = analyzeDataPoints(result.history);
 
@@ -133,10 +192,47 @@ const VotingScreen = ({ issue, result, onReset }) => {
           <View style={{ height: 20 }} />
         </ScrollView>
 
-        <TouchableOpacity style={styles.btn} onPress={onReset} activeOpacity={0.8}>
+        {/* 하단 버튼 3개 */}
+        <View style={styles.btnRow}>
+          <TouchableOpacity style={[styles.btn, styles.btnSecondary]} onPress={() => setShowHistory(true)} activeOpacity={0.8}>
+            <Text style={styles.btnText}>📜 토론 다시 보기</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.btn, styles.btnSecondary, isSaving && styles.btnDisabled]} onPress={handleDownload} disabled={isSaving} activeOpacity={0.8}>
+            <Text style={styles.btnText}>{isSaving ? "저장 중..." : "📤 다운로드"}</Text>
+          </TouchableOpacity>
+        </View>
+        <TouchableOpacity style={[styles.btn, styles.btnPrimary]} onPress={onReset} activeOpacity={0.8}>
           <Text style={styles.btnText}>⚖ 새 안건 상정</Text>
         </TouchableOpacity>
       </View>
+
+      {/* 토론 다시 보기 모달 */}
+      <Modal visible={showHistory} animationType="slide" onRequestClose={() => setShowHistory(false)}>
+        <SafeAreaView style={styles.modalSafe}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>📜 토론 전체 기록</Text>
+            <TouchableOpacity onPress={() => setShowHistory(false)} style={styles.modalClose}>
+              <Text style={styles.modalCloseText}>✕ 닫기</Text>
+            </TouchableOpacity>
+          </View>
+          <ScrollView style={styles.modalScroll} contentContainerStyle={{ padding: 16 }}>
+            {(result.history || []).map((h, i) => {
+              const member = MEMBERS.find(m => m.id === h.memberId);
+              const color = h.color || member?.color || COLORS.border;
+              return (
+                <View key={i} style={[styles.histCard, { borderLeftColor: color }]}>
+                  <Text style={[styles.histName, { color }]}>
+                    {h.avatar || member?.avatar || "💬"} {h.displayName}
+                    {h.type === "REFUTE" ? "  ⚔ 반박" : h.type === "ADMIT" ? "  ✅ 수용" : ""}
+                  </Text>
+                  <Text style={styles.histText}>{h.text}</Text>
+                </View>
+              );
+            })}
+            <View style={{ height: 40 }} />
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
     </SafeAreaView>
   );
 };
@@ -204,12 +300,26 @@ const styles = StyleSheet.create({
   voteReason:   { color: COLORS.textDim, fontSize: 12, lineHeight: 18 },
 
   // 버튼
+  btnRow: { flexDirection: "row", gap: 8, marginTop: 12 },
   btn: {
-    backgroundColor: COLORS.blue,
-    padding: 16, borderRadius: 12,
-    marginTop: 12, alignItems: "center",
+    padding: 14, borderRadius: 12,
+    alignItems: "center", flex: 1,
   },
-  btnText: { color: "#fff", fontWeight: "bold", fontSize: 14, letterSpacing: 1 },
+  btnPrimary:   { backgroundColor: COLORS.blue, marginTop: 8, flex: 0, width: "100%" },
+  btnSecondary: { backgroundColor: COLORS.surface2 || "#1c2128", borderWidth: 1, borderColor: COLORS.border2 },
+  btnDisabled:  { opacity: 0.5 },
+  btnText: { color: "#fff", fontWeight: "bold", fontSize: 13, letterSpacing: 0.5 },
+
+  // 모달
+  modalSafe:    { flex: 1, backgroundColor: COLORS.background },
+  modalHeader:  { flexDirection: "row", justifyContent: "space-between", alignItems: "center", padding: 16, borderBottomWidth: 1, borderBottomColor: COLORS.border2 },
+  modalTitle:   { color: COLORS.text, fontSize: 16, fontWeight: "bold" },
+  modalClose:   { padding: 8 },
+  modalCloseText: { color: COLORS.accent, fontSize: 14 },
+  modalScroll:  { flex: 1 },
+  histCard:     { backgroundColor: COLORS.card, padding: 12, marginBottom: 10, borderRadius: 8, borderLeftWidth: 3 },
+  histName:     { fontSize: 11, fontWeight: "bold", marginBottom: 6 },
+  histText:     { color: COLORS.text, fontSize: 13, lineHeight: 20 },
 });
 
 export default VotingScreen;

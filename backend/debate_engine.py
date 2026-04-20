@@ -92,9 +92,12 @@ class DebateEngine:
         await self.ws.send_json({"type": msg_type, **kwargs})
 
     async def send_speech(self, member: dict, text: str,
-                          speech_type: str, is_chair: bool):
+                          speech_type: str, is_chair: bool,
+                          skip_wait: bool = False):
         """
-        ✅ 버그2 수정: member dict를 직접 받아서 이름/색상 오류 원인 제거
+        ✅ ready 대기 완전 제거 — 고정 딜레이로 대체
+        skip_wait=True: 의장 사회 발언 (0.3초), False: 실제 발언 (1.2초)
+        백엔드가 TTS 완료를 기다리지 않으므로 발언 전환 지연 없음
         """
         display     = f"의장 {member['name']}" if is_chair else f"{member['name']} 의원"
         model_str   = member.get("model", "?")
@@ -110,7 +113,8 @@ class DebateEngine:
             avatar      = member.get("avatar", "💬"),
         )
         self.speech_count[member["id"]] = self.speech_count.get(member["id"], 0) + 1
-        await self._wait_for_ready()
+        # ✅ 고정 딜레이: 화면 전환 연출 시간 확보 (TTS 재생과 무관)
+        await asyncio.sleep(0.3 if skip_wait else 1.2)
 
 
     @staticmethod
@@ -130,17 +134,8 @@ class DebateEngine:
         return cleaned.strip() if cleaned.strip() else text.strip()
 
     async def _wait_for_ready(self):
-        try:
-            async with asyncio.timeout(120):
-                while True:
-                    raw  = await self.ws.receive_text()
-                    data = json.loads(raw)
-                    if data.get("type") == "ready":
-                        return
-        except asyncio.TimeoutError:
-            print("[Engine] ready 타임아웃 → 강제 진행")
-        except Exception as e:
-            print(f"[Engine] ready 대기 오류: {e}")
+        # ✅ 더 이상 사용하지 않음 — send_speech의 고정 딜레이로 대체
+        pass
 
     @staticmethod
     def detect_type(text: str) -> str:
@@ -224,9 +219,21 @@ class DebateEngine:
             "→ 반드시 이 발언에 반응(동의·반박·보완)하며 시작하세요."
         ) if last else ""
 
+        # ✅ 의원별 페르소나·온도 추출 (이념 편향 제거 — 학습 데이터 기반으로 전환)
+        persona     = member.get("persona", f"당신은 {member['name']}입니다.")
+        temperature = member.get("temperature", 0.6)
+
         system = (
             f"당신은 AI 의회 토론 참여자입니다.\n"
-            f"당신은 {member['name']} 의원입니다. 전문 분야: {member['lens']}\n"
+            f"당신은 {member['name']} 의원입니다.\n\n"
+            f"【당신의 정체성과 지식 기반】\n"
+            f"{persona}\n\n"
+            f"【핵심 원칙 — 반드시 준수】\n"
+            "1. 인위적 역할극·이념·페르소나 금지. 당신이 실제로 학습한 지식과 데이터로만 발언하라.\n"
+            "2. 주장은 반드시 '근거 → 논리 → 결론' 순서로 전개하라.\n"
+            "3. 확실한 것은 자신 있게, 불확실한 것은 반드시 '불확실' 또는 '추정'으로 명시하라.\n"
+            "4. 다른 의원의 데이터나 논리에 오류가 있으면 구체적으로 지적하라.\n"
+            "5. 이미 나온 주장을 반복하지 말고, 당신의 학습 기반에서 나오는 고유한 관점을 추가하라.\n\n"
             f"참여 의원 목록 (이 이름만 사용):\n{self.member_list_str}\n\n"
             f"【현재 토론 형식: {self.debate_format}】\n"
             f"{format_guide}\n\n"
@@ -237,13 +244,13 @@ class DebateEngine:
             "[GRAPHIC]: 텍스트 시각화\n\n"
             "필수 규칙:\n"
             f"- {action_guide}\n"
-            "- 이미 나온 주장 반복 금지. 반드시 새 관점·새 데이터 추가.\n"
+            "- 이미 나온 주장 반복 금지. 당신의 학습 기반 고유의 새 관점·데이터를 추가하라.\n"
+            "- 다른 의원과 같은 결론이라도 반드시 다른 근거와 다른 언어로 표현하라.\n"
             "- 반드시 마침표·느낌표·물음표로 완전히 끝내세요.\n"
             "- 자신을 '본 의원'이라 하세요.\n"
             f"- 의장: '{chair_name} 의장님' / 다른 의원: '○○ 의원님'\n"
             "- [ADMIT] 후에는 수정된 입장을 이후 발언에서 일관되게 유지하세요.\n"
             "- 출력 형식 엄수: 발언 내용만 바로 출력. '[이름]:' '[이름 의원]:' 같은 이름 prefix 절대 금지.\n"
-            "- 다른 발언자의 이름이나 발언을 앞에 붙이지 마세요. 시스템이 자동 표기합니다.\n"
         )
 
         messages = [
@@ -252,7 +259,7 @@ class DebateEngine:
             {"role": "user", "content": f"안건: \"{self.issue}\"{last_hint}\n\n지금 발언하세요."},
         ]
         try:
-            result = await call_member(member, messages, temperature=0.6)
+            result = await call_member(member, messages, temperature=temperature)
             result = self._strip_prefix(result)
             return result or f"{member['name']} 의원은 신중한 검토가 필요하다고 봅니다."
         except Exception as ex:
@@ -269,16 +276,20 @@ class DebateEngine:
             if any("[ADMIT]" in s for s in speeches) else ""
         )
         full_summary = f"\n\n[전체 토론 요약]\n{self.ctx.summary}" if self.ctx.summary else ""
+        persona = member.get("persona", "")
+        temp    = member.get("temperature", 0.4)
+
         messages = [
             {
                 "role": "system",
                 "content": (
-                    f"당신은 {member['name']} 의원입니다. 전문 분야: {member['lens']}.\n"
-                    f"참여 의원 목록:\n{self.member_list_str}\n\n"
+                    f"당신은 {member['name']} 의원입니다.\n"
+                    f"【당신의 정체성과 지식 기반】 {persona}\n\n"
                     f"당신의 전체 토론 발언:\n\"\"\"\n"
                     f"{chr(10).join(speeches) if speeches else '발언 없음'}\n\"\"\""
                     f"{full_summary}{admit_note}\n\n"
                     "투표 규칙:\n"
+                    "- 인위적 이념이나 편향이 아니라, 토론 중 제시된 실제 근거와 논리에 따라 투표하세요.\n"
                     "- 위 발언 내용과 논리적으로 완전히 일관된 투표를 하세요.\n"
                     "- 형식: [찬성|반대|기권] 이유 (200자 이내, 완전한 문장으로)"
                 )
@@ -286,7 +297,7 @@ class DebateEngine:
             {"role": "user", "content": f"안건 \"{self.issue}\"에 최종 투표하세요."}
         ]
         try:
-            return await call_member(member, messages, temperature=0.2)
+            return await call_member(member, messages, temperature=max(0.3, temp - 0.2))
         except:
             return "[기권] 시스템 오류로 기권합니다."
 
@@ -362,7 +373,7 @@ class DebateEngine:
         await runner(chair)
 
     # ══════════════════════════════════════════════
-    # 1. 릴레이 토론 — ✅ self.rounds 적용
+    # 1. 릴레이 토론
     # ══════════════════════════════════════════════
     async def _run_relay(self, chair: dict):
         fmt_guide = (
@@ -372,18 +383,12 @@ class DebateEngine:
             "발언은 최대 250자이며, 지목 즉시 발언을 시작하세요."
         )
 
-        round_label = {
-            1: f"총 {self.rounds}라운드로 진행",
-            2: f"총 {self.rounds}라운드로 진행",
-            3: "총 3라운드로 진행",
-        }.get(self.rounds, f"총 {self.rounds}라운드로 진행")
-
+        # ✅ 개회사만 AI 생성 (의미 있는 발언)
         open_text = await self.chair_speak(
             chair,
             f"안건 \"{self.issue}\"에 대한 릴레이 토론을 개회합니다. "
-            f"{round_label}되며, 모든 의원이 의장의 지목 순서에 따라 균등하게 발언합니다. "
-            "지목되지 않은 의원의 발언은 허용하지 않습니다.",
-            max_chars=220
+            f"총 {self.rounds}라운드로 진행되며, 의장 지목 순서에 따라 균등하게 발언합니다.",
+            max_chars=180
         )
         self.ctx.push(f"[의장 {chair['name']}]", open_text)
         await self.send_speech(chair, open_text, "NORMAL", True)
@@ -393,27 +398,19 @@ class DebateEngine:
         for round_num in range(1, self.rounds + 1):
             self.current_round = round_num
 
+            # ✅ 버그2+3 수정: 라운드 시작 선언을 고정 문자열로 (AI 생성 제거 → 즉시 출력)
+            # 중간 라운드에서 요약+선언이 겹치던 문제 해결
             if self.rounds == 1:
-                label = "입장 표명 및 종합 토론"
+                round_text = f"토론을 시작합니다. 각 의원께서는 입장과 근거를 명확히 밝혀주십시오."
             elif round_num == 1:
-                label = "초기 입장 표명"
+                round_text = f"━━ {round_num}라운드 · 초기 입장 표명 ━━  각 의원께서는 안건에 대한 입장과 핵심 근거를 밝혀주십시오."
             elif round_num == self.rounds:
-                label = "최종 입장 확정"
+                round_text = f"━━ {round_num}라운드 · 최종 입장 확정 ━━  전체 토론을 바탕으로 최종 입장을 확정해 주십시오."
             else:
-                label = "반박 및 재반박"
+                round_text = f"━━ {round_num}라운드 · 반박 및 재반박 ━━  앞선 발언의 논리적 약점을 지적하고 반박해 주십시오."
 
-            round_text = await self.chair_speak(
-                chair,
-                f"{round_num}라운드 [{label}]를 시작합니다. "
-                + ("각 의원께서는 안건에 대한 입장과 근거를 명확히 밝혀주십시오."
-                   if round_num == 1 else
-                   "앞선 발언에 대한 반박을 중심으로 발언해 주십시오."
-                   if round_num < self.rounds else
-                   "전체 토론을 바탕으로 최종 입장을 확정해 주십시오."),
-                max_chars=160
-            )
             self.ctx.push(f"[의장 {chair['name']}]", round_text)
-            await self.send_speech(chair, round_text, "NORMAL", True)
+            await self.send_speech(chair, round_text, "NORMAL", True, skip_wait=True)
 
             order = non_chair.copy()
             if round_num > 1:
@@ -422,18 +419,20 @@ class DebateEngine:
             prev_speaker_id = None
 
             for m in order:
-                # ✅ 버그1 수정: 지목 발언은 고정 문자열 (AI 생성 시 지시문을 그대로 반복하는 버그 방지)
+                # 지목 (고정 문자열, TTS 대기 없이 즉시 API 호출)
                 nominate = f"{m['name']} 의원님, 발언해 주시기 바랍니다."
                 self.ctx.push(f"[의장 {chair['name']}]", nominate)
-                await self.send_speech(chair, nominate, "NORMAL", True)
+                await self.send_speech(chair, nominate, "NORMAL", True, skip_wait=True)
 
                 await self.send("status",
-                    message=f"[릴레이 {round_num}/{self.rounds}라운드] {m['name']} 의원 발언 중...")
+                    message=f"[릴레이 {round_num}/{self.rounds}라운드] {m['name']} 의원 발언 준비 중...")
                 opinion = await self.get_opinion(
                     m, chair["name"],
                     format_guide=fmt_guide,
                     round_num=round_num,
                 )
+                await self.send("status",
+                    message=f"[릴레이 {round_num}/{self.rounds}라운드] {m['name']} 의원 발언 중...")
                 stype = self.detect_type(opinion)
                 self.memories[m["id"]].append(opinion)
                 self.ctx.push(f"[{m['name']} 의원]", opinion)
@@ -449,7 +448,7 @@ class DebateEngine:
                     if prev_m:
                         allow = f"{prev_m['name']} 의원님, 즉석 반박권을 인정합니다. 간략히 반박해 주십시오."
                         self.ctx.push(f"[의장 {chair['name']}]", allow)
-                        await self.send_speech(chair, allow, "NORMAL", True)
+                        await self.send_speech(chair, allow, "NORMAL", True, skip_wait=True)
 
                         rebuttal = await self.get_opinion(
                             prev_m, chair["name"],
@@ -466,15 +465,11 @@ class DebateEngine:
                 prev_speaker_id = m["id"]
                 await self.ctx.compress_if_needed()
 
+            # ✅ 라운드 전환 발언도 고정 문자열 (skip_wait으로 다음 라운드 즉시 시작)
             if round_num < self.rounds:
-                summary = await self.chair_speak(
-                    chair,
-                    f"{round_num}라운드가 종료되었습니다. 주요 찬반 논점을 요약하고 "
-                    f"{round_num + 1}라운드를 시작하겠습니다.",
-                    max_chars=200
-                )
-                self.ctx.push(f"[의장 {chair['name']}]", summary)
-                await self.send_speech(chair, summary, "NORMAL", True)
+                transition = f"{round_num}라운드가 종료되었습니다. {round_num + 1}라운드로 넘어갑니다."
+                self.ctx.push(f"[의장 {chair['name']}]", transition)
+                await self.send_speech(chair, transition, "NORMAL", True, skip_wait=True)
 
         await self.run_conclusion(chair)
 
@@ -776,7 +771,7 @@ class DebateEngine:
                 speaker = random.choice(non_chair)
 
             await self.send("status",
-                message=f"[자유토론] {speaker['name']} 의원 발언 중... "
+                message=f"[자유토론] {speaker['name']} 의원 발언 준비 중... "
                         f"({int(elapsed)}분 {int((elapsed % 1) * 60)}초 / {deadline_mins}분 "
                         f"| {turn + 1}/{self.max_free_turns}회)")
 
@@ -786,6 +781,8 @@ class DebateEngine:
                 round_num=1,
                 free_mode=True,
             )
+            await self.send("status",
+                message=f"[자유토론] {speaker['name']} 의원 발언 중...")
             stype = self.detect_type(opinion)
             self.memories[speaker["id"]].append(opinion)
             self.ctx.push(f"[{speaker['name']} 의원]", opinion)
@@ -794,7 +791,7 @@ class DebateEngine:
 
             turn += 1
 
-            # 매 5발언마다 의장 중간 정리
+            # 매 5발언마다 의장 중간 정리 (TTS 대기 없이 즉시 다음 발언으로)
             if turn % 5 == 0 and not self._time_over() and turn < self.max_free_turns:
                 inter = await self.chair_speak(
                     chair,
@@ -802,7 +799,7 @@ class DebateEngine:
                     max_chars=160
                 )
                 self.ctx.push(f"[의장 {chair['name']}]", inter)
-                await self.send_speech(chair, inter, "NORMAL", True)
+                await self.send_speech(chair, inter, "NORMAL", True, skip_wait=True)
 
         print(f"[Engine] 자유토론 종료: {turn}회 발언 / {self._elapsed_minutes():.1f}분 경과")
         await self.run_conclusion(chair)

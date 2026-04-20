@@ -52,16 +52,20 @@ const parseSegments = (text) => {
 };
 
 // TTS 완료 대기
+// 글자당 약 70ms (한국어 평균 낭독 속도 기준), 최소 1.5초, 최대 12초
+// onDone이 늦거나 안 오는 경우를 대비한 안전 타임아웃
 const speakAndWaitSafe = (text, options) => new Promise((resolve) => {
   if (!text || !text.trim()) { resolve(); return; }
   let done = false;
+  const rate = options?.rate || 0.88;
+  const estimatedMs = Math.min(12000, Math.max(1500, (text.length * 70) / rate));
   const finish = () => { if (!done) { done = true; resolve(); } };
-  const timeout = setTimeout(finish, 90000);
+  const timeout = setTimeout(finish, estimatedMs);
   Speech.speak(text, {
     ...options,
-    onDone: () => { clearTimeout(timeout); finish(); },
+    onDone:    () => { clearTimeout(timeout); finish(); },
     onStopped: () => { clearTimeout(timeout); finish(); },
-    onError: () => { clearTimeout(timeout); finish(); },
+    onError:   () => { clearTimeout(timeout); finish(); },
   });
 });
 
@@ -120,7 +124,8 @@ const saveToStorage = async (issue, history, voteResult) => {
   } catch (e) { console.error("저장 실패:", e); }
 };
 
-// TTS 음성 설정
+// TTS 음성 설정 (한국어 음성 목록 캐싱 — 매 발언마다 재조회 방지)
+let _cachedKoreanVoices = null;
 const getVoiceSettings = async (memberId) => {
   let pitch = 1.0, rate = 0.88, volume = 1.0, voice = null;
   switch (memberId) {
@@ -134,11 +139,16 @@ const getVoiceSettings = async (memberId) => {
     case "llama4":     pitch=0.82; rate=0.87; break;
   }
   try {
-    const available = await Speech.getAvailableVoicesAsync();
-    const korean = available.filter(v => v.language?.startsWith('ko') || v.identifier?.toLowerCase().includes('kr'));
-    if (korean.length > 0) {
-      const idx = memberId.split('').reduce((a,c) => a+c.charCodeAt(0), 0) % korean.length;
-      voice = korean[idx].identifier;
+    // ✅ 캐시: 첫 호출 때만 조회, 이후엔 즉시 반환
+    if (_cachedKoreanVoices === null) {
+      const available = await Speech.getAvailableVoicesAsync();
+      _cachedKoreanVoices = available.filter(
+        v => v.language?.startsWith('ko') || v.identifier?.toLowerCase().includes('kr')
+      );
+    }
+    if (_cachedKoreanVoices.length > 0) {
+      const idx = memberId.split('').reduce((a,c) => a+c.charCodeAt(0), 0) % _cachedKoreanVoices.length;
+      voice = _cachedKoreanVoices[idx].identifier;
     }
   } catch {}
   return { pitch, rate, volume, voice };
@@ -168,16 +178,49 @@ const DebateScreen = ({
   const wsRef        = useRef(null);
   const voteResultRef = useRef(null);
 
-  // ─── TTS 큐 처리 + ready 신호 ───
+  // ─── TTS 큐 처리 (ready 신호와 완전 분리) ───
+  // ✅ ready 신호는 addLog에서 발언 화면 표시 즉시 전송
+  //    TTS는 독립적으로 재생만 담당 — 블로킹과 무관하게 백엔드 진행
   const processTtsQueue = useCallback(async () => {
     if (ttsRunning.current) return;
     ttsRunning.current = true;
 
     while (ttsQueue.current.length > 0) {
-      const { text, memberId } = ttsQueue.current.shift();
-      const clean = text
+      const { text, memberId, displayName } = ttsQueue.current.shift();
+
+      // ── 한자 → 한글 변환 (TTS 오독 방지) ──
+      const hanjaMap = {
+        // 토론에서 자주 나오는 한자
+        '愼重|慎重': '신중', '重要': '중요', '重大': '중대',
+        '必要': '필요', '可能': '가능', '不可能': '불가능',
+        '現在': '현재', '現實': '현실', '未來': '미래',
+        '社會': '사회', '國家': '국가', '政府': '정부',
+        '經濟': '경제', '政策': '정책', '制度': '제도',
+        '問題': '문제', '解決': '해결', '方法': '방법',
+        '結果': '결과', '原因': '원인', '根據': '근거',
+        '主張': '주장', '反對': '반대', '贊成': '찬성',
+        '分析': '분석', '判斷': '판단', '決定': '결정',
+        '效率': '효율', '效果': '효과', '影響': '영향',
+        '基準': '기준', '原則': '원칙', '價値': '가치',
+        '自由': '자유', '平等': '평등', '正義': '정의',
+        '安全': '안전', '危險': '위험', '保護': '보호',
+        '發展': '발전', '成長': '성장', '改善': '개선',
+        '統計': '통계', '資料': '자료', '報告': '보고',
+        '議員': '의원', '議長': '의장', '本議員': '본의원',
+        '贊反': '찬반', '論議': '논의', '討論': '토론',
+        '强調': '강조', '指摘': '지적', '提示': '제시',
+        '具體': '구체', '抽象': '추상', '複雜': '복잡',
+        '簡單': '간단', '明確': '명확', '不明確': '불명확',
+      };
+
+      let converted = text;
+      Object.entries(hanjaMap).forEach(([hanja, hangul]) => {
+        const pattern = new RegExp(hanja, 'g');
+        converted = converted.replace(pattern, hangul);
+      });
+
+      const clean = converted
         .replace(/\[REFUTE\]|\[ADMIT\]|\[DATA\]|\[GRAPHIC\]/g, "")
-        // ✅ TTS 영문 AI 이름 발음 보정
         .replace(/ChatGPT/gi, "챗지피티")
         .replace(/Llama4?/gi, "라마")
         .replace(/Gemini/gi, "제미나이")
@@ -185,6 +228,9 @@ const DebateScreen = ({
         .replace(/Perplexity/gi, "퍼플렉시티")
         .replace(/Manus/gi, "마누스")
         .replace(/Grok/gi, "그록")
+        .replace(/[\u4E00-\u9FFF\u3400-\u4DBF]+/g, "") // 미등록 한자 전체 제거
+        .replace(/\uFE0F/g, '')
+        .replace(/(?:^|\n)\s*-\s*/g, '\n')
         .trim();
 
       if (clean) {
@@ -192,25 +238,29 @@ const DebateScreen = ({
           const { pitch, rate, volume, voice } = await getVoiceSettings(memberId);
           await speakAndWaitSafe(clean, { language: 'ko-KR', pitch, rate, volume, voice });
         } else {
-          await new Promise(r => setTimeout(r, 1800));
+          await new Promise(r => setTimeout(r, 400));
         }
       }
-
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "ready" }));
+      // TTS 완료 후 status를 비워서 백엔드 status 메시지가 잘 보이게
+      if (ttsQueue.current.length === 0) {
+        setStatus("다음 발언 준비 중...");
       }
     }
 
     ttsRunning.current = false;
   }, []);
 
-  // ─── 발언 추가 ───
+  // ─── 발언 추가 (한 줄씩 순차 표시) ───
   const addLog = useCallback((data) => {
+    const baseId = Date.now() + Math.random();
+    const fullText = data.text || "";
+    const lines = fullText.split('\n').filter(l => l.trim() !== '');
+
     const entry = {
-      id: Date.now() + Math.random(),
+      id:          baseId,
       memberId:    data.memberId || "",
       displayName: data.displayName || "?",
-      text:        data.text || "",
+      text:        "",
       type:        data.speechType || "NORMAL",
       engineInfo:  data.engineInfo || "",
       color:       data.color || COLORS.border,
@@ -222,10 +272,30 @@ const DebateScreen = ({
       historyRef.current = next;
       return next;
     });
-    setStatus(`${data.displayName} 발언 완료 → 다음 의원 대기 중...`);
-    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
+    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 80);
 
-    ttsQueue.current.push({ text: data.text, memberId: data.memberId });
+    // 한 줄씩 텍스트 추가 (줄당 300ms 간격)
+    let accumulated = "";
+    lines.forEach((line, idx) => {
+      setTimeout(() => {
+        accumulated += (idx === 0 ? "" : "\n") + line;
+        const snapshot = accumulated;
+        setHistory(prev => {
+          const next = prev.map(h =>
+            h.id === baseId ? { ...h, text: snapshot } : h
+          );
+          historyRef.current = next;
+          return next;
+        });
+        if (idx === lines.length - 1) {
+          setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
+        }
+      }, idx * 300);
+    });
+
+    setStatus(`🎙 ${data.displayName} 발언 중...`);
+
+    ttsQueue.current.push({ text: fullText, memberId: data.memberId, displayName: data.displayName });
     processTtsQueue();
   }, [processTtsQueue]);
 
