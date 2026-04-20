@@ -170,17 +170,86 @@ const DebateScreen = ({
   const [isSaving, setIsSaving]   = useState(false);
   const [roundInfo, setRoundInfo] = useState("");
 
-  const scrollRef    = useRef(null);
-  const historyRef   = useRef([]);
+  const scrollRef     = useRef(null);
+  const historyRef    = useRef([]);
   const ttsEnabledRef = useRef(true);
-  const ttsQueue     = useRef([]);
-  const ttsRunning   = useRef(false);
-  const wsRef        = useRef(null);
+  const ttsQueue      = useRef([]);
+  const ttsRunning    = useRef(false);
+  const wsRef         = useRef(null);
   const voteResultRef = useRef(null);
+  const speechQueue   = useRef([]);   // 발언 표시 큐
+  const speechBusy    = useRef(false);// 발언 표시 중 여부
 
-  // ─── TTS 큐 처리 (ready 신호와 완전 분리) ───
-  // ✅ ready 신호는 addLog에서 발언 화면 표시 즉시 전송
-  //    TTS는 독립적으로 재생만 담당 — 블로킹과 무관하게 백엔드 진행
+  // ─── 발언 표시 큐 처리: 한 번에 한 발언씩 순서대로 표시 ───
+  const processSpeechQueue = useCallback(async () => {
+    if (speechBusy.current) return;
+    speechBusy.current = true;
+
+    while (speechQueue.current.length > 0) {
+      const data = speechQueue.current.shift();
+      const baseId   = Date.now() + Math.random();
+      const fullText = data.text || "";
+      const lines    = fullText.split('\n').filter(l => l.trim() !== '');
+
+      // 카드 추가 (텍스트 빈 상태로)
+      setHistory(prev => {
+        const next = [...prev, {
+          id:          baseId,
+          memberId:    data.memberId    || "",
+          displayName: data.displayName || "?",
+          text:        "",
+          type:        data.speechType  || "NORMAL",
+          engineInfo:  data.engineInfo  || "",
+          color:       data.color       || COLORS.border,
+          avatar:      data.avatar      || "💬",
+        }];
+        historyRef.current = next;
+        return next;
+      });
+      setStatus(`🎙 ${data.displayName} 발언 중...`);
+      setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 60);
+
+      // 줄 하나씩 순서대로 표시 (await → 다음 발언 차단)
+      let accumulated = "";
+      for (let i = 0; i < lines.length; i++) {
+        if (i > 0) {
+          // 줄 길이에 비례한 딜레이 (읽는 속도 흉내)
+          await new Promise(r => setTimeout(r, Math.max(200, lines[i-1].length * 22)));
+        }
+        accumulated += (i === 0 ? "" : "\n") + lines[i];
+        const snap = accumulated;
+        setHistory(prev => {
+          const next = prev.map(h => h.id === baseId ? { ...h, text: snap } : h);
+          historyRef.current = next;
+          return next;
+        });
+      }
+      if (lines.length === 0) {
+        setHistory(prev => {
+          const next = prev.map(h => h.id === baseId ? { ...h, text: fullText } : h);
+          historyRef.current = next;
+          return next;
+        });
+      }
+
+      // 마지막 줄 표시 후 최소 대기 (짧은 발언도 읽을 시간 확보)
+      const lastLineLen = lines.length > 0 ? lines[lines.length - 1].length : 10;
+      await new Promise(r => setTimeout(r, Math.max(800, lastLineLen * 22)));
+      setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
+
+      // TTS 큐에 추가 (표시와 독립적으로 재생)
+      ttsQueue.current.push({ text: fullText, memberId: data.memberId, displayName: data.displayName });
+      processTtsQueue();
+
+      // 발언 카드 간 여백
+      await new Promise(r => setTimeout(r, 600));
+    }
+
+    speechBusy.current = false;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ─── TTS 큐 처리 ───
   const processTtsQueue = useCallback(async () => {
     if (ttsRunning.current) return;
     ttsRunning.current = true;
@@ -250,54 +319,11 @@ const DebateScreen = ({
     ttsRunning.current = false;
   }, []);
 
-  // ─── 발언 추가 (한 줄씩 순차 표시) ───
+  // ─── 발언 추가: speechQueue에 넣고 순차 처리 ───
   const addLog = useCallback((data) => {
-    const baseId = Date.now() + Math.random();
-    const fullText = data.text || "";
-    const lines = fullText.split('\n').filter(l => l.trim() !== '');
-
-    const entry = {
-      id:          baseId,
-      memberId:    data.memberId || "",
-      displayName: data.displayName || "?",
-      text:        "",
-      type:        data.speechType || "NORMAL",
-      engineInfo:  data.engineInfo || "",
-      color:       data.color || COLORS.border,
-      avatar:      data.avatar || "💬",
-    };
-
-    setHistory(prev => {
-      const next = [...prev, entry];
-      historyRef.current = next;
-      return next;
-    });
-    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 80);
-
-    // 한 줄씩 텍스트 추가 (줄당 300ms 간격)
-    let accumulated = "";
-    lines.forEach((line, idx) => {
-      setTimeout(() => {
-        accumulated += (idx === 0 ? "" : "\n") + line;
-        const snapshot = accumulated;
-        setHistory(prev => {
-          const next = prev.map(h =>
-            h.id === baseId ? { ...h, text: snapshot } : h
-          );
-          historyRef.current = next;
-          return next;
-        });
-        if (idx === lines.length - 1) {
-          setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
-        }
-      }, idx * 300);
-    });
-
-    setStatus(`🎙 ${data.displayName} 발언 중...`);
-
-    ttsQueue.current.push({ text: fullText, memberId: data.memberId, displayName: data.displayName });
-    processTtsQueue();
-  }, [processTtsQueue]);
+    speechQueue.current.push(data);
+    processSpeechQueue();
+  }, [processSpeechQueue]);
 
   // ─── WebSocket ───
   useEffect(() => {
