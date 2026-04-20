@@ -18,7 +18,7 @@ MEMBERS = [
     },
     {
         "id":     "chatgpt",
-        "name":   "ChatGPT",
+        "name":   "챗지피티",
         "lens":   "사회적 지표 및 보편적 가치 체계",
         "color":  "#10A37F",
         "avatar": "⚡",
@@ -78,7 +78,7 @@ MEMBERS = [
     },
     {
         "id":     "llama4",
-        "name":   "Llama 4",
+        "name":   "라마",
         "lens":   "보안 데이터 및 초거대 모델 분석",
         "color":  "#0668E1",
         "avatar": "🦙",

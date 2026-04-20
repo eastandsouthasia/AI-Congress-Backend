@@ -1,23 +1,24 @@
 """
-토론 맥락 관리자 (DebateContext) - 장시간 토론 대응 버전
+토론 맥락 관리자 (DebateContext)
 
-변경사항:
-- COMPRESS_TRIGGER: 10 → 14 (압축 빈도 줄여 Groq 부하 경감)
-- COMPRESS_KEEP: 4 → 5 (최근 맥락 더 많이 보존)
-- RECENT_WINDOW: 6 → 7 (더 많은 최근 발언 전문 전달)
-- compress_if_needed가 GLOBAL_SEMAPHORE 밖에서 호출되도록 주석 명시
+✅ 버그 수정:
+- to_messages()에서 "speaker: text" 포맷 제거
+  → AI가 자기 발언에도 "[이름]:(콜론)" prefix를 붙이는 원인이었음
+- 마지막 메시지가 assistant로 끝나는 경우 제거
+  → AI가 직전 자기 발언을 다시 반복하는 원인이었음
+- speaker 정보는 "▶ 이름" 헤더로만 전달
 """
 
 from ai_caller import call_groq
 
 class DebateContext:
-    RECENT_WINDOW    = 7    # 전문으로 전달할 최근 발언 수 (6→7)
-    COMPRESS_TRIGGER = 14   # 압축 실행 임계값 (10→14, Groq 부하 감소)
-    COMPRESS_KEEP    = 5    # 압축 후 전문으로 남길 발언 수 (4→5)
+    RECENT_WINDOW    = 6
+    COMPRESS_TRIGGER = 10
+    COMPRESS_KEEP    = 4
 
     def __init__(self):
-        self.all_logs: list[dict] = []   # {"speaker": str, "text": str}
-        self.summary: str = ""           # 압축된 과거 요약
+        self.all_logs: list[dict] = []
+        self.summary: str = ""
 
     def push(self, speaker: str, text: str):
         self.all_logs.append({"speaker": speaker, "text": text})
@@ -28,11 +29,14 @@ class DebateContext:
 
         messages = []
 
+        # 요약 블록
         summary_parts = []
         if self.summary:
             summary_parts.append(self.summary)
         if older:
-            summary_parts.append("\n".join(f"{l['speaker']}: {l['text']}" for l in older))
+            summary_parts.append(
+                "\n".join(f"{l['speaker']}: {l['text']}" for l in older)
+            )
 
         if summary_parts:
             messages.append({
@@ -48,16 +52,18 @@ class DebateContext:
                 "content": "이전 토론 내용을 모두 숙지했습니다."
             })
 
+        # ✅ 최근 발언: speaker를 "▶ 이름" 헤더로만 표기, 콜론 포맷 완전 제거
         for i, log in enumerate(recent):
-            messages.append({
-                "role": "user" if i % 2 == 0 else "assistant",
-                "content": f"{log['speaker']}: {log['text']}"
-            })
+            role = "user" if i % 2 == 0 else "assistant"
+            content = f"▶ {log['speaker']}\n{log['text']}"
+            messages.append({"role": role, "content": content})
+
+        # ✅ 마지막이 assistant면 제거 → AI 자기 발언 반복 방지
+        if messages and messages[-1]["role"] == "assistant":
+            messages.pop()
 
         return messages
 
-    # ⚠️ 주의: 이 메서드는 GLOBAL_SEMAPHORE 바깥에서 호출해야 합니다.
-    # debate_engine에서 발언 사이 대기 시간 중에 호출하세요.
     async def compress_if_needed(self):
         if len(self.all_logs) < self.COMPRESS_TRIGGER:
             return
@@ -70,8 +76,6 @@ class DebateContext:
         prev = f"이전 요약:\n{self.summary}\n\n" if self.summary else ""
 
         try:
-            # 압축은 Groq 호출이지만 GLOBAL_SEMAPHORE 밖이므로
-            # 발언 간 대기 시간에 실행 → API 부하에 영향 없음
             self.summary = await call_groq([
                 {
                     "role": "system",

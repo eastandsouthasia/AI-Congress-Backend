@@ -175,7 +175,17 @@ const DebateScreen = ({
 
     while (ttsQueue.current.length > 0) {
       const { text, memberId } = ttsQueue.current.shift();
-      const clean = text.replace(/\[REFUTE\]|\[ADMIT\]|\[DATA\]|\[GRAPHIC\]/g, "").trim();
+      const clean = text
+        .replace(/\[REFUTE\]|\[ADMIT\]|\[DATA\]|\[GRAPHIC\]/g, "")
+        // ✅ TTS 영문 AI 이름 발음 보정
+        .replace(/ChatGPT/gi, "챗지피티")
+        .replace(/Llama4?/gi, "라마")
+        .replace(/Gemini/gi, "제미나이")
+        .replace(/DeepSeek/gi, "딥시크")
+        .replace(/Perplexity/gi, "퍼플렉시티")
+        .replace(/Manus/gi, "마누스")
+        .replace(/Grok/gi, "그록")
+        .trim();
 
       if (clean) {
         if (ttsEnabledRef.current) {
