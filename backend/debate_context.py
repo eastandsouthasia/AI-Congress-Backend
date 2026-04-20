@@ -1,19 +1,19 @@
 """
-토론 맥락 관리자 (DebateContext)
+토론 맥락 관리자 (DebateContext) - 장시간 토론 대응 버전
 
-핵심 설계:
-- 모든 발언을 allLogs에 원문 보존
-- 발언이 쌓이면 오래된 것을 AI가 압축 요약
-- 각 의원 호출 시: [압축 요약] + [최근 6개 전문] 전달
-- 어느 의원이든 토론 처음부터 지금까지 전체 흐름 인지
+변경사항:
+- COMPRESS_TRIGGER: 10 → 14 (압축 빈도 줄여 Groq 부하 경감)
+- COMPRESS_KEEP: 4 → 5 (최근 맥락 더 많이 보존)
+- RECENT_WINDOW: 6 → 7 (더 많은 최근 발언 전문 전달)
+- compress_if_needed가 GLOBAL_SEMAPHORE 밖에서 호출되도록 주석 명시
 """
 
 from ai_caller import call_groq
 
 class DebateContext:
-    RECENT_WINDOW    = 6   # 전문으로 전달할 최근 발언 수
-    COMPRESS_TRIGGER = 10  # 이 수를 넘으면 압축 실행
-    COMPRESS_KEEP    = 4   # 압축 후 전문으로 남길 발언 수
+    RECENT_WINDOW    = 7    # 전문으로 전달할 최근 발언 수 (6→7)
+    COMPRESS_TRIGGER = 14   # 압축 실행 임계값 (10→14, Groq 부하 감소)
+    COMPRESS_KEEP    = 5    # 압축 후 전문으로 남길 발언 수 (4→5)
 
     def __init__(self):
         self.all_logs: list[dict] = []   # {"speaker": str, "text": str}
@@ -22,15 +22,12 @@ class DebateContext:
     def push(self, speaker: str, text: str):
         self.all_logs.append({"speaker": speaker, "text": text})
 
-    # LLM에 전달할 메시지 배열 생성
-    # = [요약 블록] + [최근 N개 전문]
     def to_messages(self) -> list[dict]:
         recent = self.all_logs[-self.RECENT_WINDOW:]
         older  = self.all_logs[:-self.RECENT_WINDOW] if len(self.all_logs) > self.RECENT_WINDOW else []
 
         messages = []
 
-        # 요약 블록 구성
         summary_parts = []
         if self.summary:
             summary_parts.append(self.summary)
@@ -51,7 +48,6 @@ class DebateContext:
                 "content": "이전 토론 내용을 모두 숙지했습니다."
             })
 
-        # 최근 전문: user/assistant 교대 배치
         for i, log in enumerate(recent):
             messages.append({
                 "role": "user" if i % 2 == 0 else "assistant",
@@ -60,7 +56,8 @@ class DebateContext:
 
         return messages
 
-    # 발언 수가 임계값 초과 시 오래된 발언 자동 압축
+    # ⚠️ 주의: 이 메서드는 GLOBAL_SEMAPHORE 바깥에서 호출해야 합니다.
+    # debate_engine에서 발언 사이 대기 시간 중에 호출하세요.
     async def compress_if_needed(self):
         if len(self.all_logs) < self.COMPRESS_TRIGGER:
             return
@@ -73,6 +70,8 @@ class DebateContext:
         prev = f"이전 요약:\n{self.summary}\n\n" if self.summary else ""
 
         try:
+            # 압축은 Groq 호출이지만 GLOBAL_SEMAPHORE 밖이므로
+            # 발언 간 대기 시간에 실행 → API 부하에 영향 없음
             self.summary = await call_groq([
                 {
                     "role": "system",
@@ -89,7 +88,6 @@ class DebateContext:
                 }
             ], temperature=0.3)
 
-            # 압축된 발언 제거, 최근만 남김
             self.all_logs = self.all_logs[-self.COMPRESS_KEEP:]
             print(f"[Context] 압축 완료. 현재 로그 수: {len(self.all_logs)}")
 

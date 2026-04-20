@@ -1,6 +1,6 @@
 /**
  * DebateScreen - TTS와 발언을 완벽하게 동기화한 버전
- * TTS가 끝난 후에만 서버에 "ready" 신호를 보내 다음 발언이 생성되도록 함
+ * ✅ activeMembers prop 추가 → WebSocket으로 백엔드 전달
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -65,7 +65,7 @@ const speakAndWaitSafe = (text, options) => new Promise((resolve) => {
   });
 });
 
-// 회의록 포맷 (기존 그대로)
+// 회의록 포맷
 const formatDebateLog = (issue, history, voteResult = null) => {
   if (!history || history.length === 0) return "기록된 발언이 없습니다.";
   const now = new Date().toLocaleString('ko-KR');
@@ -78,25 +78,21 @@ const formatDebateLog = (issue, history, voteResult = null) => {
 
   const body = history.map((log, i) => {
     const tag = log.type === "REFUTE" ? " [반박]" : log.type === "ADMIT" ? " [수용]" : "";
-    const engine = log.engineInfo ? ` (${log.engineInfo})` : "";
-    return `[${i + 1}] ${log.displayName}${tag}${engine}\n${log.text}\n`;
+    return `[${i + 1}] ${log.displayName}${tag}\n${log.text}\n`;
   }).join('\n');
 
   let resultSection = "";
   if (voteResult) {
-    resultSection = `\n==========================================\n📋 최종 의결 결과\n==========================================\n`;
-    if (voteResult.type === "VOTE" && Array.isArray(voteResult.content)) {
-      const tally = { 찬성: 0, 반대: 0, 기권: 0 };
-      voteResult.content.forEach(v => {
-        if (v.text?.includes("찬성")) tally["찬성"]++;
-        else if (v.text?.includes("반대")) tally["반대"]++;
-        else tally["기권"]++;
+    resultSection = `\n------------------------------------------\n최종 의결:\n`;
+    if (voteResult.type === "VOTE") {
+      const pro  = voteResult.content?.filter(v => v.text?.includes("찬성")).length || 0;
+      const con  = voteResult.content?.filter(v => v.text?.includes("반대")).length || 0;
+      const abs  = (voteResult.content?.length || 0) - pro - con;
+      resultSection += `찬성 ${pro} / 반대 ${con} / 기권 ${abs}\n결과: ${pro > con ? "✅ 가결" : "❌ 부결"}\n`;
+      voteResult.content?.forEach(v => {
+        resultSection += `${v.memberId}: ${v.text}\n`;
       });
-      const passed = tally["찬성"] > tally["반대"];
-      resultSection += `결과: ${passed ? "✅ 가결" : "❌ 부결"}\n`;
-      resultSection += `찬성 ${tally["찬성"]} · 반대 ${tally["반대"]} · 기권 ${tally["기권"]}\n\n`;
-      resultSection += voteResult.content.map(v => `${v.memberId}: ${v.text}`).join('\n');
-    } else if (voteResult.type === "RESOLUTION") {
+    } else {
       resultSection += `공동 결의안:\n${voteResult.content}`;
     }
     resultSection += `\n`;
@@ -105,7 +101,7 @@ const formatDebateLog = (issue, history, voteResult = null) => {
     `\n------------------------------------------\n본 문서는 AI 의결 시스템에 의해 작성되었습니다.\n==========================================`;
 };
 
-// AsyncStorage 저장 (기존 그대로)
+// AsyncStorage 저장
 const saveToStorage = async (issue, history, voteResult) => {
   try {
     const existing = await AsyncStorage.getItem('debate_history');
@@ -116,7 +112,7 @@ const saveToStorage = async (issue, history, voteResult) => {
       issue,
       content: formatDebateLog(issue, history, voteResult),
       result: voteResult?.type === "VOTE"
-        ? (voteResult.content?.filter(v => v.text?.includes("찬성")).length > 
+        ? (voteResult.content?.filter(v => v.text?.includes("찬성")).length >
            voteResult.content?.filter(v => v.text?.includes("반대")).length ? "가결" : "부결")
         : "결의안",
     };
@@ -124,20 +120,18 @@ const saveToStorage = async (issue, history, voteResult) => {
   } catch (e) { console.error("저장 실패:", e); }
 };
 
-// TTS 음성 설정 (기존 그대로)
+// TTS 음성 설정
 const getVoiceSettings = async (memberId) => {
   let pitch = 1.0, rate = 0.88, volume = 1.0, voice = null;
   switch (memberId) {
-    case "gemini": pitch=1.08; rate=0.93; break;
-    case "chatgpt": pitch=0.96; rate=0.84; volume=0.98; break;
+    case "gemini":     pitch=1.08; rate=0.93; break;
+    case "chatgpt":    pitch=0.96; rate=0.84; volume=0.98; break;
     case "perplexity": pitch=1.12; rate=1.02; break;
-    case "grok": pitch=0.85; rate=0.89; break;
-    case "claude": pitch=0.91; rate=0.81; volume=0.97; break;
-    case "manus": pitch=1.03; rate=0.96; break;
-    case "deepseek": pitch=1.15; rate=1.05; volume=0.95; break;
-    case "glm5": pitch=1.14; rate=0.94; break;
-    case "llama4": pitch=0.82; rate=0.87; break;
-    case "kimi": pitch=0.97; rate=0.79; volume=0.93; break;
+    case "grok":       pitch=0.85; rate=0.89; break;
+    case "claude":     pitch=0.91; rate=0.81; volume=0.97; break;
+    case "manus":      pitch=1.03; rate=0.96; break;
+    case "deepseek":   pitch=1.15; rate=1.05; volume=0.95; break;
+    case "llama4":     pitch=0.82; rate=0.87; break;
   }
   try {
     const available = await Speech.getAvailableVoicesAsync();
@@ -151,20 +145,27 @@ const getVoiceSettings = async (memberId) => {
 };
 
 // ─── 메인 컴포넌트 ───────────────────────────
-const DebateScreen = ({ issue, duration = 40, onFinish }) => {
-  const [history, setHistory] = useState([]);
-  const [status, setStatus] = useState("서버 연결 중...");
+const DebateScreen = ({
+  issue,
+  duration = 15,
+  debateFormat = "릴레이",
+  conclusionType = "VOTE",
+  activeMembers,          // ✅ 추가: 참여 의원 ID 배열
+  onFinish,
+}) => {
+  const [history, setHistory]     = useState([]);
+  const [status, setStatus]       = useState("서버 연결 중...");
   const [ttsEnabled, setTtsEnabled] = useState(true);
   const [isFinished, setIsFinished] = useState(false);
-  const [isSaving, setIsSaving] = useState(false);
+  const [isSaving, setIsSaving]   = useState(false);
   const [roundInfo, setRoundInfo] = useState("");
 
-  const scrollRef = useRef(null);
-  const historyRef = useRef([]);
+  const scrollRef    = useRef(null);
+  const historyRef   = useRef([]);
   const ttsEnabledRef = useRef(true);
-  const ttsQueue = useRef([]);
-  const ttsRunning = useRef(false);
-  const wsRef = useRef(null);
+  const ttsQueue     = useRef([]);
+  const ttsRunning   = useRef(false);
+  const wsRef        = useRef(null);
   const voteResultRef = useRef(null);
 
   // ─── TTS 큐 처리 + ready 신호 ───
@@ -181,12 +182,10 @@ const DebateScreen = ({ issue, duration = 40, onFinish }) => {
           const { pitch, rate, volume, voice } = await getVoiceSettings(memberId);
           await speakAndWaitSafe(clean, { language: 'ko-KR', pitch, rate, volume, voice });
         } else {
-          // TTS OFF 시 자연스러운 속도로 대기
           await new Promise(r => setTimeout(r, 1800));
         }
       }
 
-      // TTS 완료 후 서버에 ready 신호 전송
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: "ready" }));
       }
@@ -199,13 +198,13 @@ const DebateScreen = ({ issue, duration = 40, onFinish }) => {
   const addLog = useCallback((data) => {
     const entry = {
       id: Date.now() + Math.random(),
-      memberId: data.memberId || "",
+      memberId:    data.memberId || "",
       displayName: data.displayName || "?",
-      text: data.text || "",
-      type: data.speechType || "NORMAL",
-      engineInfo: data.engineInfo || "",
-      color: data.color || COLORS.border,
-      avatar: data.avatar || "💬",
+      text:        data.text || "",
+      type:        data.speechType || "NORMAL",
+      engineInfo:  data.engineInfo || "",
+      color:       data.color || COLORS.border,
+      avatar:      data.avatar || "💬",
     };
 
     setHistory(prev => {
@@ -216,7 +215,6 @@ const DebateScreen = ({ issue, duration = 40, onFinish }) => {
     setStatus(`${data.displayName} 발언 완료 → 다음 의원 대기 중...`);
     setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
 
-    // TTS 큐에 추가
     ttsQueue.current.push({ text: data.text, memberId: data.memberId });
     processTtsQueue();
   }, [processTtsQueue]);
@@ -228,7 +226,14 @@ const DebateScreen = ({ issue, duration = 40, onFinish }) => {
 
     ws.onopen = () => {
       setStatus("서버 연결됨. 토론 시작 중...");
-      ws.send(JSON.stringify({ issue, duration }));
+      // ✅ activeMembers 포함하여 전송
+      ws.send(JSON.stringify({
+        issue,
+        duration,
+        debateFormat,
+        conclusionType,
+        activeMembers: activeMembers || [],
+      }));
     };
 
     ws.onmessage = (event) => {
@@ -288,7 +293,7 @@ const DebateScreen = ({ issue, duration = 40, onFinish }) => {
       ttsQueue.current = [];
       if (ws.readyState === WebSocket.OPEN) ws.close();
     };
-  }, [issue, duration, onFinish]);
+  }, [issue, duration, debateFormat, conclusionType, activeMembers, onFinish]);
 
   // ─── 파일 내보내기 ───
   const downloadDebateLog = async () => {
@@ -323,6 +328,12 @@ const DebateScreen = ({ issue, duration = 40, onFinish }) => {
     <View style={styles.container}>
       <View style={styles.statusRow}>
         <Text style={styles.status} numberOfLines={2}>{status}</Text>
+        <Text style={[styles.formatBadge, debateFormat === "자유토론" && styles.formatBadgeFree]}>
+          {debateFormat === "릴레이" ? "🔄"
+            : debateFormat === "집중토론" ? "⚡"
+            : debateFormat === "전문가패널" ? "🎓"
+            : "🌀"} {debateFormat}
+        </Text>
         <Text style={styles.durationBadge}>⏱ {duration}분</Text>
         {isFinished && (
           <TouchableOpacity
@@ -404,6 +415,8 @@ const styles = StyleSheet.create({
   statusRow: { flexDirection: "row", alignItems: "center", marginBottom: 12, gap: 6, flexWrap: "wrap" },
   status: { flex: 1, color: COLORS.accent, fontWeight: "bold", fontSize: 12, minWidth: 100 },
   durationBadge: { color: COLORS.gold, fontSize: 11, fontWeight: "700", backgroundColor: "#1a1500", borderRadius: 6, paddingHorizontal: 7, paddingVertical: 4, borderWidth: 1, borderColor: COLORS.gold + "55" },
+  formatBadge: { color: COLORS.blue, fontSize: 11, fontWeight: "700", backgroundColor: "#0d1a2e", borderRadius: 6, paddingHorizontal: 7, paddingVertical: 4, borderWidth: 1, borderColor: COLORS.blue + "55" },
+  formatBadgeFree: { color: "#9b59b6", backgroundColor: "#1a0d2e", borderColor: "#9b59b6" + "55" },
   saveBtn: { backgroundColor: COLORS.success, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6 },
   saveBtnDisabled: { backgroundColor: COLORS.textMuted },
   saveBtnText: { color: '#fff', fontSize: 11, fontWeight: "bold" },

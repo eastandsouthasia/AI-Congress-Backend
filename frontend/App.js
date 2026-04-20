@@ -1,21 +1,34 @@
 import React, { useState } from "react";
 import { View, StyleSheet, StatusBar } from "react-native";
-import { COLORS } from "./src/constants/members";
+import { COLORS, MEMBERS } from "./src/constants/members";
 import InputScreen from "./src/screens/InputScreen";
 import DebateScreen from "./src/screens/DebateScreen";
 import VotingScreen from "./src/screens/VotingScreen";
-import HistoryScreen from "./src/screens/HistoryScreen"; // 새로 만들 파일 임포트
+import HistoryScreen from "./src/screens/HistoryScreen";
 
 export default function App() {
-  const [screen, setScreen]   = useState("input");
-  const [issue, setIssue]     = useState("");
-  const [duration, setDuration] = useState(40);
-  const [result, setResult]   = useState(null);
+  const [screen, setScreen]           = useState("input");
+  const [issue, setIssue]             = useState("");
+  const [duration, setDuration]       = useState(15);
+  const [debateFormat, setDebateFormat]     = useState("릴레이");
+  const [conclusionType, setConclusionType] = useState("VOTE");
+  // ✅ 참여 의원 ID 목록 (기본: 전원)
+  const [activeMembers, setActiveMembers]   = useState(MEMBERS.map(m => m.id));
+  const [result, setResult]           = useState(null);
 
-  // ✅ duration도 함께 받아서 DebateScreen으로 전달
-  const handleStart = (submittedIssue, submittedDuration) => {
+  // ✅ activeMembers까지 5번째 파라미터로 수신
+  const handleStart = (
+    submittedIssue,
+    submittedDuration,
+    submittedFormat,
+    submittedConclusion,
+    submittedMembers,
+  ) => {
     setIssue(submittedIssue);
-    setDuration(submittedDuration || 40);
+    setDuration(submittedDuration || 15);
+    setDebateFormat(submittedFormat || "릴레이");
+    setConclusionType(submittedConclusion || "VOTE");
+    setActiveMembers(submittedMembers || MEMBERS.map(m => m.id));
     setScreen("debate");
   };
 
@@ -27,21 +40,25 @@ export default function App() {
   return (
     <View style={styles.root}>
       <StatusBar barStyle="light-content" backgroundColor={COLORS.background} />
-      
+
       {screen === "input" && (
-        <InputScreen 
-          onStart={handleStart} 
-          onShowHistory={() => setScreen("history")} // 추가
+        <InputScreen
+          onStart={handleStart}
+          onShowHistory={() => setScreen("history")}
         />
       )}
-     
+
       {screen === "debate" && (
         <DebateScreen
           issue={issue}
           duration={duration}
+          debateFormat={debateFormat}
+          conclusionType={conclusionType}
+          activeMembers={activeMembers}   // ✅ 추가
           onFinish={handleFinish}
         />
       )}
+
       {screen === "voting" && (
         <VotingScreen
           issue={issue}
@@ -49,9 +66,10 @@ export default function App() {
           onReset={() => { setResult(null); setScreen("input"); }}
         />
       )}
-     {screen === "history" && (
-        <HistoryScreen 
-          onBack={() => setScreen("input")} // 다시 메인으로 돌아오는 기능
+
+      {screen === "history" && (
+        <HistoryScreen
+          onBack={() => setScreen("input")}
         />
       )}
     </View>
