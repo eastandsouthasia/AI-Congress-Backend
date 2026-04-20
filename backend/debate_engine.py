@@ -113,8 +113,8 @@ class DebateEngine:
             avatar      = member.get("avatar", "💬"),
         )
         self.speech_count[member["id"]] = self.speech_count.get(member["id"], 0) + 1
-        # ✅ 고정 딜레이: 화면 전환 연출 시간 확보 (TTS 재생과 무관)
-        await asyncio.sleep(0.3 if skip_wait else 1.2)
+        # 고정 딜레이: 의장 사회(0.5초) vs 의원 발언(2.5초) — 발언 하나씩 천천히 표시
+        await asyncio.sleep(0.5 if skip_wait else 2.5)
 
 
     @staticmethod
@@ -418,13 +418,6 @@ class DebateEngine:
 
             prev_speaker_id = None
 
-            # ── Prefetch 패턴: 현재 발언을 전송하는 동안 다음 의원 API를 미리 호출 ──
-            # 1) 첫 번째 의원 API 호출 시작
-            next_task = asyncio.create_task(self.get_opinion(
-                order[0], chair["name"],
-                format_guide=fmt_guide, round_num=round_num,
-            )) if order else None
-
             for idx, m in enumerate(order):
                 # 지목 전송 (고정 문자열, 즉시)
                 nominate = f"{m['name']} 의원님, 발언해 주시기 바랍니다."
@@ -434,18 +427,11 @@ class DebateEngine:
                 await self.send("status",
                     message=f"[릴레이 {round_num}/{self.rounds}라운드] {m['name']} 의원 발언 준비 중...")
 
-                # 현재 의원 응답 대기 (이미 prefetch로 시작돼 있음)
-                opinion = await next_task
-
-                # 다음 의원 API를 즉시 백그라운드로 시작 (현재 발언 전송 중에 처리)
-                next_idx = idx + 1
-                if next_idx < len(order):
-                    next_task = asyncio.create_task(self.get_opinion(
-                        order[next_idx], chair["name"],
-                        format_guide=fmt_guide, round_num=round_num,
-                    ))
-                else:
-                    next_task = None
+                # ✅ 순차 처리: 이전 발언이 완전히 전송된 후 다음 API 호출
+                opinion = await self.get_opinion(
+                    m, chair["name"],
+                    format_guide=fmt_guide, round_num=round_num,
+                )
 
                 await self.send("status",
                     message=f"[릴레이 {round_num}/{self.rounds}라운드] {m['name']} 의원 발언 중...")
