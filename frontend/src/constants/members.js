@@ -1,38 +1,25 @@
 export const MEMBERS = [
-  { id: "gemini",     name: "Gemini",     lens: "국제법 및 통계 데이터 분석",           color: "#4285F4", avatar: "♊",  pitch: 1.0  },
-  { id: "chatgpt",    name: "챗지피티",    lens: "사회적 지표 및 보편적 가치 체계",         color: "#10A37F", avatar: "⚡",  pitch: 1.1  },
-  { id: "perplexity", name: "Perplexity", lens: "실시간 논문 및 최신 뉴스 근거",          color: "#20B2AA", avatar: "🔍", pitch: 0.9  },
-  { id: "grok",       name: "Grok",       lens: "실용주의 및 비판적 반론",              color: "#FFFFFF", avatar: "🏴", pitch: 1.2  },
-  { id: "claude",     name: "Claude",     lens: "윤리적 정당성 및 인권 가치 보호",         color: "#D97757", avatar: "🛡", pitch: 0.8  },
-  { id: "manus",      name: "Manus",      lens: "기술적 실무 데이터 및 공학적 실행력",       color: "#9B59B6", avatar: "⚙", pitch: 1.0  },
-  { id: "llama4",     name: "라마",    lens: "보안 데이터 및 초거대 모델 분석",         color: "#0668E1", avatar: "🦙", pitch: 1.05 },
+  { id: "gemini",   name: "Gemini",   lens: "Google 학습 기반 — 웹·학술·다국어",        color: "#4285F4", avatar: "♊",  pitch: 1.0  },
+  { id: "llama4",   name: "라마",     lens: "Meta 학습 기반 — 오픈소스·다국어·중립",     color: "#0668E1", avatar: "🦙", pitch: 1.05 },
+  { id: "mistral",  name: "Mistral",  lens: "Mistral AI 학습 기반 — 유럽·오픈소스·효율", color: "#FF7000", avatar: "🌊", pitch: 0.9  },
+  { id: "gptoss",   name: "GPT-OSS",  lens: "OpenAI 오픈소스 기반 — Apache 2.0·120B",   color: "#10A37F", avatar: "⚡",  pitch: 1.1  },
+  { id: "nemotron", name: "Nemotron", lens: "NVIDIA 학습 기반 — 하드웨어·과학·추론",     color: "#76B900", avatar: "🖥️", pitch: 0.95 },
 ];
 
 export const COLORS = {
-  // 배경 계열
   background: "#0d1117",
   bg:         "#0d1117",
-
-  // 카드/서피스 계열
-  card:     "#161b22",
-  surface:  "#161b22",
-  surface2: "#1c2128",
-
-  // 텍스트 계열
-  text:      "#c9d1d9",
-  textDim:   "#8b949e",
-  textMuted: "#484f58",
-
-  // 강조 계열
-  accent: "#58a6ff",
-  blue:   "#58a6ff",
-  gold:   "#d4a017",
-
-  // 상태 색상
-  error:   "#f85149",
-  success: "#238636",
-
-  // 경계선
-  border:  "#30363d",
-  border2: "#21262d",
+  card:       "#161b22",
+  surface:    "#161b22",
+  surface2:   "#1c2128",
+  text:       "#c9d1d9",
+  textDim:    "#8b949e",
+  textMuted:  "#484f58",
+  accent:     "#58a6ff",
+  blue:       "#58a6ff",
+  gold:       "#d4a017",
+  error:      "#f85149",
+  success:    "#238636",
+  border:     "#30363d",
+  border2:    "#21262d",
 };

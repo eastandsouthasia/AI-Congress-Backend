@@ -12,20 +12,14 @@ const OPENROUTER_API_KEY = process.env.EXPO_PUBLIC_OPENROUTER_API_KEY || "";
 // 의원별 전용 엔진 매핑
 // 각 의원이 실제로 다른 AI API를 호출
 // ─────────────────────────────────────────────
+// api.js
 export const MEMBER_ENGINE_MAP = {
-  gemini:     { engine: "gemini",     model: "gemini-2.5-flash" },
-  llama4:     { engine: "groq",       model: "meta-llama/llama-4-scout-17b-16e-instruct" },
-  chatgpt:    { engine: "groq",       model: "llama-3.3-70b-versatile" },
-  // claude-3-haiku는 openrouter 무료 경유 시 느림 → groq llama로 대체
-  claude:     { engine: "groq",       model: "llama-3.3-70b-versatile" },
-  // grok-3-mini-beta 무료 티어 응답 30~90초 → mistral-small(~5s)으로 대체
-  grok:       { engine: "openrouter", model: "mistralai/mistral-small-3.2-24b-instruct:free" },
-  perplexity: { engine: "openrouter", model: "mistralai/mistral-small-3.2-24b-instruct:free" },
-  manus:      { engine: "openrouter", model: "qwen/qwen3-8b:free" },
-  // deepseek: 무료 응답 60~120초로 제거됨
-  // glm5, kimi: 의원 목록에서 이미 제거됨
+  gemini:   { engine: "gemini",      model: "gemini-2.5-pro" },
+  llama4:   { engine: "groq",        model: "meta-llama/llama-4-scout-17b-16e-instruct" },
+  mistral:  { engine: "openrouter",  model: "mistralai/mistral-small-3.2-24b-instruct:free" },
+  gptoss:   { engine: "openrouter",  model: "openai/gpt-oss-120b:free" },       // ✅ 확정
+  nemotron: { engine: "openrouter",  model: "nvidia/llama-3.1-nemotron-ultra-253b-v1:free" }, // ✅ 확정
 };
-
 // ─────────────────────────────────────────────
 // 발언 끊김 방지: 불완전 문장 제거
 // ─────────────────────────────────────────────
@@ -242,33 +236,29 @@ export class DebateContext {
 // ─────────────────────────────────────────────
 // 의장 의사일정 생성
 // ─────────────────────────────────────────────
-export const getChairProtocol = async (chair, issue) => {
-  const allIds = MEMBERS.map(m => m.id);
+export const getChairProtocol = async (issue) => {
+  // 의장 무작위 선정
+  const chairIndex = Math.floor(Math.random() * MEMBERS.length);
+  const chair = MEMBERS[chairIndex];
+  const panelists = MEMBERS.filter((_, i) => i !== chairIndex);
+
   const memberList = MEMBERS.map(m => `- ${m.name} (id: ${m.id})`).join('\n');
   const messages = [
     {
       role: "system",
       content:
-        "당신은 의회 의장입니다. 안건 성격에 따라 최적 토론 형식과 발언 순서를 설계하세요.\n\n" +
-        "형식:\n" +
-        "릴레이: 전원 1회 발언 후 핵심 논쟁자 추가 발언\n" +
-        "집중토론: 핵심 2명만 번갈아 4~6회 공방\n" +
-        "전문가패널: 전문가 3명 먼저 → 나머지 보충\n" +
-        "자유토론: order 중간에 의장 id 삽입\n\n" +
+        `당신은 의장 ${chair.name}입니다. 안건 성격에 따라 최적 토론 형식과 발언 순서를 설계하세요.\n\n` +
         `의원 목록:\n${memberList}\n\n` +
         "순수 JSON만 반환:\n" +
-        `{"format":"릴레이|집중토론|전문가패널|자유토론","order":["id",...],"proposal":"이유","conclusionType":"VOTE|RESOLUTION"}`
+        `{"format":"릴레이|집중토론|전문가패널|자유토론","order":["id",...],"proposal":"이유","conclusionType":"VOTE|RESOLUTION","chairId":"${chair.id}"}`
     },
     {
       role: "user",
-      content:
-        `안건: "${issue}"\n` +
-        `의원 정보: ${JSON.stringify(MEMBERS.map(m => ({ id: m.id, lens: m.lens })))}\n` +
-        "최적 형식을 선택하고 order를 구성하세요."
+      content: `안건: "${issue}"\n최적 형식을 선택하고 order를 구성하세요.`
     },
   ];
   try {
-    const raw = await getChatCompletion(messages, 0.3);
+    const raw = await callMemberEngine(chair, messages, 0.3);
     const s = raw.indexOf('{'), e = raw.lastIndexOf('}');
     if (s === -1 || e === -1) throw new Error("JSON 없음");
     const parsed = JSON.parse(raw.substring(s, e + 1));
@@ -276,14 +266,23 @@ export const getChairProtocol = async (chair, issue) => {
       .filter(id => MEMBERS.some(m => m.id === id))
       .slice(0, 16);
     return {
+      chairId: chair.id,
+      chairName: chair.name,
       format: parsed.format || "릴레이",
-      order: validatedOrder.length > 2 ? validatedOrder : allIds,
+      order: validatedOrder.length > 2 ? validatedOrder : MEMBERS.map(m => m.id),
       proposal: parsed.proposal || "기본 절차에 따라 진행합니다.",
       conclusionType: parsed.conclusionType === "RESOLUTION" ? "RESOLUTION" : "VOTE",
     };
   } catch (e) {
     console.warn("의사일정 실패:", e.message);
-    return { format: "릴레이", order: allIds, proposal: "기본 절차.", conclusionType: "VOTE" };
+    return {
+      chairId: chair.id,
+      chairName: chair.name,
+      format: "릴레이",
+      order: MEMBERS.map(m => m.id),
+      proposal: "기본 절차.",
+      conclusionType: "VOTE",
+    };
   }
 };
 

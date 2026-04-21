@@ -294,21 +294,15 @@ async def call_openrouter(
 #   빠름(~5s): groq 모델, gemini-2.5-flash, mistral-small:free, qwen3-8b:free
 #   느림(30s+): deepseek-r1:free, grok-3-mini-beta → 사용 안 함
 # ─────────────────────────────────────────────
+
+# ai_caller.py
 MEMBER_ENGINE_MAP = {
-    # Gemini 엔진 (일 1500회 무료, RPM 15 → 여유 있음)
-    "gemini":     {"engine": "gemini",      "model": "gemini-2.5-flash"},
-    "claude":     {"engine": "gemini",      "model": "gemini-2.5-flash"},   # ✅ Groq→Gemini
-
-    # Groq 엔진 (llama4 단독 사용 → RPM 소진 위험 대폭 감소)
-    "llama4":     {"engine": "groq",        "model": "meta-llama/llama-4-scout-17b-16e-instruct"},
-
-    # OpenRouter 엔진 (mistral-small 빠름, qwen3-8b 빠름)
-    "chatgpt":    {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},  # ✅ Groq→OpenRouter
-    "grok":       {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},
-    "perplexity": {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},
-    "manus":      {"engine": "openrouter",  "model": "qwen/qwen3-8b:free"},
+    "gemini":   {"engine": "gemini",      "model": "gemini-2.5-pro"},
+    "llama4":   {"engine": "groq",        "model": "meta-llama/llama-4-scout-17b-16e-instruct"},
+    "mistral":  {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},
+    "gptoss":   {"engine": "openrouter",  "model": "openai/gpt-oss-120b:free"},       # ✅ 확정
+    "nemotron": {"engine": "openrouter",  "model": "nvidia/llama-3.1-nemotron-ultra-253b-v1:free"}, # ✅ 확정
 }
-
 # ─────────────────────────────────────────────
 # 엔진별 교차 폴백 순서
 # 1차 실패 시 → 다른 엔진으로 교차 시도 (Groq 단일 폴백 제거)

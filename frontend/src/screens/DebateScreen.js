@@ -129,16 +129,13 @@ let _cachedKoreanVoices = null;
 const getVoiceSettings = async (memberId) => {
   let pitch = 1.0, rate = 0.88, volume = 1.0, voice = null;
   switch (memberId) {
-    case "gemini":     pitch=1.08; rate=0.93; break;
-    case "chatgpt":    pitch=0.96; rate=0.84; volume=0.98; break;
-    case "perplexity": pitch=1.12; rate=1.02; break;
-    case "grok":       pitch=0.85; rate=0.89; break;
-    case "claude":     pitch=0.91; rate=0.81; volume=0.97; break;
-    case "manus":      pitch=1.03; rate=0.96; break;
-    case "llama4":     pitch=0.82; rate=0.87; break;
+    case "gemini":   pitch=1.08; rate=0.93; break;
+    case "llama4":   pitch=0.82; rate=0.87; break;
+    case "mistral":  pitch=1.12; rate=1.02; break;
+    case "gptoss":   pitch=0.96; rate=0.84; volume=0.98; break;
+    case "nemotron": pitch=0.91; rate=0.81; volume=0.97; break;
   }
   try {
-    // ✅ 캐시: 첫 호출 때만 조회, 이후엔 즉시 반환
     if (_cachedKoreanVoices === null) {
       const available = await Speech.getAvailableVoicesAsync();
       _cachedKoreanVoices = available.filter(
@@ -289,12 +286,11 @@ const DebateScreen = ({
 
       const clean = converted
         .replace(/\[REFUTE\]|\[ADMIT\]|\[DATA\]|\[GRAPHIC\]/g, "")
-        .replace(/ChatGPT/gi, "챗지피티")
-        .replace(/Llama4?/gi, "라마")
         .replace(/Gemini/gi, "제미나이")
-        .replace(/Perplexity/gi, "퍼플렉시티")
-        .replace(/Manus/gi, "마누스")
-        .replace(/Grok/gi, "그록")
+        .replace(/Llama4?/gi, "라마")
+        .replace(/Mistral/gi, "미스트랄")
+        .replace(/GPT.?OSS/gi, "지피티오에스에스")
+        .replace(/Nemotron/gi, "네모트론")
         .replace(/[\u4E00-\u9FFF\u3400-\u4DBF]+/g, "") // 미등록 한자 전체 제거
         .replace(/\uFE0F/g, '')
         .replace(/(?:^|\n)\s*-\s*/g, '\n')
