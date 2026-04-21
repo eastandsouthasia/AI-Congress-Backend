@@ -1,9 +1,9 @@
 export const MEMBERS = [
-  { id: "gemini",   name: "Gemini",   lens: "Google 학습 기반 — 웹·학술·다국어",        color: "#4285F4", avatar: "♊",  pitch: 1.0  },
+  { id: "gemini",   name: "제미나이", lens: "Google 학습 기반 — 웹·학술·다국어",        color: "#4285F4", avatar: "♊",  pitch: 1.0  },
   { id: "llama4",   name: "라마",     lens: "Meta 학습 기반 — 오픈소스·다국어·중립",     color: "#0668E1", avatar: "🦙", pitch: 1.05 },
-  { id: "mistral",  name: "Mistral",  lens: "Mistral AI 학습 기반 — 유럽·오픈소스·효율", color: "#FF7000", avatar: "🌊", pitch: 0.9  },
-  { id: "gptoss",   name: "GPT-OSS",  lens: "OpenAI 오픈소스 기반 — Apache 2.0·120B",   color: "#10A37F", avatar: "⚡",  pitch: 1.1  },
-  { id: "nemotron", name: "Nemotron", lens: "NVIDIA 학습 기반 — 하드웨어·과학·추론",     color: "#76B900", avatar: "🖥️", pitch: 0.95 },
+  { id: "mistral",  name: "미스트랄", lens: "Mistral AI 학습 기반 — 유럽·오픈소스·효율", color: "#FF7000", avatar: "🌊", pitch: 0.9  },
+  { id: "gptoss",   name: "지피티",   lens: "OpenAI 오픈소스 기반 — Apache 2.0·120B",   color: "#10A37F", avatar: "⚡",  pitch: 1.1  },
+  { id: "nemotron", name: "엔비디아", lens: "NVIDIA 학습 기반 — 하드웨어·과학·추론",     color: "#76B900", avatar: "🖥️", pitch: 0.95 },
 ];
 
 export const COLORS = {

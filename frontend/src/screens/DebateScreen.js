@@ -22,32 +22,37 @@ const BACKEND_WS_URL =
 const parseSegments = (text) => {
   const lines = text.split('\n');
   const segments = [];
-  let graphicBuffer = [], inGraphic = false;
+  let buffer = [], inBlock = null; // inBlock: 'graphic' | 'table' | null
+
+  const flushBlock = () => {
+    if (inBlock && buffer.length > 0) {
+      segments.push({ type: inBlock, content: buffer.join('\n') });
+    }
+    buffer = []; inBlock = null;
+  };
 
   lines.forEach(line => {
     if (line.startsWith('[GRAPHIC]')) {
-      inGraphic = true; graphicBuffer = [];
-    } else if (inGraphic) {
-      if (line.trim() === '' && graphicBuffer.length > 0) {
-        segments.push({ type: 'graphic', content: graphicBuffer.join('\n') });
-        inGraphic = false; graphicBuffer = [];
+      flushBlock();
+      inBlock = 'graphic'; buffer = [];
+    } else if (line.startsWith('[TABLE]')) {
+      flushBlock();
+      inBlock = 'table'; buffer = [];
+    } else if (inBlock) {
+      // 빈 줄이면 블록 종료
+      if (line.trim() === '' && buffer.length > 0) {
+        flushBlock();
       } else {
-        graphicBuffer.push(line);
+        buffer.push(line);
       }
     } else if (line.startsWith('[DATA]')) {
-      if (inGraphic) {
-        segments.push({ type: 'graphic', content: graphicBuffer.join('\n') });
-        inGraphic = false;
-      }
       segments.push({ type: 'data', content: line.replace('[DATA]', '').trim() });
     } else {
       segments.push({ type: 'text', content: line });
     }
   });
 
-  if (inGraphic && graphicBuffer.length > 0) {
-    segments.push({ type: 'graphic', content: graphicBuffer.join('\n') });
-  }
+  flushBlock(); // 파일 끝에 블록이 열려 있으면 닫기
   return segments.filter(s => s.content.trim() !== '');
 };
 
@@ -169,8 +174,6 @@ const DebateScreen = ({
   const scrollRef     = useRef(null);
   const historyRef    = useRef([]);
   const ttsEnabledRef = useRef(true);
-  const ttsQueue      = useRef([]);
-  const ttsRunning    = useRef(false);
   const wsRef         = useRef(null);
   const voteResultRef = useRef(null);
   const speechQueue   = useRef([]);   // 발언 표시 큐
@@ -230,12 +233,71 @@ const DebateScreen = ({
 
       // 마지막 줄 표시 후 최소 대기 (짧은 발언도 읽을 시간 확보)
       const lastLineLen = lines.length > 0 ? lines[lines.length - 1].length : 10;
-      await new Promise(r => setTimeout(r, Math.max(800, lastLineLen * 22)));
+      await new Promise(r => setTimeout(r, Math.max(400, lastLineLen * 10)));
       setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
 
-      // TTS 큐에 추가 (표시와 독립적으로 재생)
-      ttsQueue.current.push({ text: fullText, memberId: data.memberId, displayName: data.displayName });
-      processTtsQueue();
+      // TTS: 텍스트 표시 완료 후 즉시 실행하고 완료까지 대기
+      // → 다음 발언 텍스트가 TTS보다 먼저 나오는 현상 방지
+      if (ttsEnabledRef.current && fullText) {
+        const hanjaMap = {
+          '愼重|慎重': '신중', '重要': '중요', '重大': '중대',
+          '必要': '필요', '可能': '가능', '不可能': '불가능',
+          '現在': '현재', '現實': '현실', '未來': '미래',
+          '社會': '사회', '國家': '국가', '政府': '정부',
+          '經濟': '경제', '政策': '정책', '制度': '제도',
+          '問題': '문제', '解決': '해결', '方法': '방법',
+          '結果': '결과', '原因': '원인', '根據': '근거',
+          '主張': '주장', '反對': '반대', '贊成': '찬성',
+          '分析': '분석', '判斷': '판단', '決定': '결정',
+          '效率': '효율', '效果': '효과', '影響': '영향',
+          '基準': '기준', '原則': '원칙', '價値': '가치',
+          '自由': '자유', '平等': '평등', '正義': '정의',
+          '安全': '안전', '危險': '위험', '保護': '보호',
+          '發展': '발전', '成長': '성장', '改善': '개선',
+          '統計': '통계', '資料': '자료', '報告': '보고',
+          '議員': '의원', '議長': '의장', '本議員': '본의원',
+          '贊反': '찬반', '論議': '논의', '討論': '토론',
+          '强調': '강조', '指摘': '지적', '提示': '제시',
+          '具體': '구체', '抽象': '추상', '複雜': '복잡',
+          '簡單': '간단', '明確': '명확', '不明確': '불명확',
+        };
+        let converted = fullText;
+        Object.entries(hanjaMap).forEach(([hanja, hangul]) => {
+          converted = converted.replace(new RegExp(hanja, 'g'), hangul);
+        });
+        const clean = converted
+          .replace(/\[REFUTE\]|\[ADMIT\]|\[DATA\]|\[GRAPHIC\]|\[TABLE\]/g, "")
+          .replace(/Gemini/gi, "제미나이")
+          .replace(/Llama4?/gi, "라마")
+          .replace(/Mistral/gi, "미스트랄")
+          .replace(/GPT.?OSS/gi, "지피티")
+          .replace(/Nemotron/gi, "엔비디아")
+          // 수학기호 → 한글 (TTS 오독 방지)
+          .replace(/≥/g, "이상")
+          .replace(/≤/g, "이하")
+          .replace(/>/g,  "초과")
+          .replace(/</g,  "미만")
+          .replace(/={2,}/g, "동일")
+          .replace(/\*{2}/g, "")           // **별표별표** 제거
+          .replace(/\*/g,   "")            // 단독 별표 제거
+          .replace(/[\u4E00-\u9FFF\u3400-\u4DBF]+/g, "")
+          .replace(/\uFE0F/g, '')
+          .replace(/(?:^|\n)\s*-\s*/g, '\n')
+          // 테이블 구분선 제거 (|---|---|)
+          .replace(/\|[-:| ]+\|/g, "")
+          // 테이블 셀 구분자 → 쉼표로 (| A | B | → A, B)
+          .replace(/\|/g, " ")
+          .trim();
+        if (clean) {
+          const { pitch, rate, volume, voice } = await getVoiceSettings(data.memberId);
+          await speakAndWaitSafe(clean, { language: 'ko-KR', pitch, rate, volume, voice });
+        }
+      } else if (!ttsEnabledRef.current) {
+        // TTS 꺼져 있어도 발언 간격은 유지
+        await new Promise(r => setTimeout(r, 600));
+      }
+
+      setStatus("다음 발언 준비 중...");
 
       // 발언 카드 간 여백
       await new Promise(r => setTimeout(r, 600));
@@ -243,74 +305,6 @@ const DebateScreen = ({
 
     speechBusy.current = false;
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // ─── TTS 큐 처리 ───
-  const processTtsQueue = useCallback(async () => {
-    if (ttsRunning.current) return;
-    ttsRunning.current = true;
-
-    while (ttsQueue.current.length > 0) {
-      const { text, memberId, displayName } = ttsQueue.current.shift();
-
-      // ── 한자 → 한글 변환 (TTS 오독 방지) ──
-      const hanjaMap = {
-        // 토론에서 자주 나오는 한자
-        '愼重|慎重': '신중', '重要': '중요', '重大': '중대',
-        '必要': '필요', '可能': '가능', '不可能': '불가능',
-        '現在': '현재', '現實': '현실', '未來': '미래',
-        '社會': '사회', '國家': '국가', '政府': '정부',
-        '經濟': '경제', '政策': '정책', '制度': '제도',
-        '問題': '문제', '解決': '해결', '方法': '방법',
-        '結果': '결과', '原因': '원인', '根據': '근거',
-        '主張': '주장', '反對': '반대', '贊成': '찬성',
-        '分析': '분석', '判斷': '판단', '決定': '결정',
-        '效率': '효율', '效果': '효과', '影響': '영향',
-        '基準': '기준', '原則': '원칙', '價値': '가치',
-        '自由': '자유', '平等': '평등', '正義': '정의',
-        '安全': '안전', '危險': '위험', '保護': '보호',
-        '發展': '발전', '成長': '성장', '改善': '개선',
-        '統計': '통계', '資料': '자료', '報告': '보고',
-        '議員': '의원', '議長': '의장', '本議員': '본의원',
-        '贊反': '찬반', '論議': '논의', '討論': '토론',
-        '强調': '강조', '指摘': '지적', '提示': '제시',
-        '具體': '구체', '抽象': '추상', '複雜': '복잡',
-        '簡單': '간단', '明確': '명확', '不明確': '불명확',
-      };
-
-      let converted = text;
-      Object.entries(hanjaMap).forEach(([hanja, hangul]) => {
-        const pattern = new RegExp(hanja, 'g');
-        converted = converted.replace(pattern, hangul);
-      });
-
-      const clean = converted
-        .replace(/\[REFUTE\]|\[ADMIT\]|\[DATA\]|\[GRAPHIC\]/g, "")
-        .replace(/Gemini/gi, "제미나이")
-        .replace(/Llama4?/gi, "라마")
-        .replace(/Mistral/gi, "미스트랄")
-        .replace(/GPT.?OSS/gi, "지피티오에스에스")
-        .replace(/Nemotron/gi, "네모트론")
-        .replace(/[\u4E00-\u9FFF\u3400-\u4DBF]+/g, "") // 미등록 한자 전체 제거
-        .replace(/\uFE0F/g, '')
-        .replace(/(?:^|\n)\s*-\s*/g, '\n')
-        .trim();
-
-      if (clean) {
-        if (ttsEnabledRef.current) {
-          const { pitch, rate, volume, voice } = await getVoiceSettings(memberId);
-          await speakAndWaitSafe(clean, { language: 'ko-KR', pitch, rate, volume, voice });
-        } else {
-          await new Promise(r => setTimeout(r, 400));
-        }
-      }
-      // TTS 완료 후 status를 비워서 백엔드 status 메시지가 잘 보이게
-      if (ttsQueue.current.length === 0) {
-        setStatus("다음 발언 준비 중...");
-      }
-    }
-
-    ttsRunning.current = false;
   }, []);
 
   // ─── 발언 추가: speechQueue에 넣고 순차 처리 ───
@@ -357,6 +351,9 @@ const DebateScreen = ({
           case "result":
             const voteResult = { type: msg.resultType, content: msg.content };
             voteResultRef.current = voteResult;
+            // 남은 발언 큐 비우기 — 의결 후 발언이 이어지지 않도록
+            speechQueue.current = [];
+            Speech.stop();
             saveToStorage(issue, historyRef.current, voteResult);
             onFinish({
               type: msg.resultType,
@@ -390,7 +387,7 @@ const DebateScreen = ({
 
     return () => {
       Speech.stop();
-      ttsQueue.current = [];
+      speechQueue.current = [];
       if (ws.readyState === WebSocket.OPEN) ws.close();
     };
   }, [issue, duration, debateFormat, conclusionType, activeMembers, onFinish]);
@@ -451,7 +448,6 @@ const DebateScreen = ({
             const next = !ttsEnabled;
             setTtsEnabled(next);
             ttsEnabledRef.current = next;
-            if (!next) ttsQueue.current = [];
           }}
         >
           <Text style={styles.ttsBtnText}>{ttsEnabled ? "🔊" : "🔇"}</Text>
@@ -499,6 +495,11 @@ const DebateScreen = ({
                     <Text style={styles.graphicText}>{seg.content}</Text>
                   </View>
                 );
+                if (seg.type === 'table') return (
+                  <View key={si} style={styles.tableBox}>
+                    <Text style={styles.tableText}>{seg.content}</Text>
+                  </View>
+                );
                 return <Text key={si} style={styles.text}>{seg.content}</Text>;
               })}
             </View>
@@ -542,6 +543,8 @@ const styles = StyleSheet.create({
   dataText: { flex: 1, color: COLORS.accent, fontSize: 12, fontFamily: 'monospace' },
   graphicBox: { backgroundColor: '#0a1a0a', borderRadius: 6, padding: 10, marginVertical: 4, borderWidth: 1, borderColor: COLORS.success },
   graphicText: { color: '#39d353', fontSize: 12, fontFamily: 'monospace' },
+  tableBox: { backgroundColor: '#0d1a2e', borderRadius: 6, padding: 10, marginVertical: 4, borderWidth: 1, borderColor: COLORS.accent + "66" },
+  tableText: { color: COLORS.text, fontSize: 11, fontFamily: 'monospace', lineHeight: 18 },
 });
 
 export default DebateScreen;
