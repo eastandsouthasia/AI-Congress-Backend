@@ -24,7 +24,7 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 # 엔진별 동시 호출 제한
 # ─────────────────────────────────────────────
 _ENGINE_SEMAPHORES = {
-    "groq":       asyncio.Semaphore(1),
+    "groq":       asyncio.Semaphore(2),  # llama4 + nemotron 동시 처리
     "gemini":     asyncio.Semaphore(1),
     "openrouter": asyncio.Semaphore(1),  # 2→1: openrouter도 순차처리로 안정화
 }
@@ -300,8 +300,8 @@ MEMBER_ENGINE_MAP = {
     "gemini":   {"engine": "gemini",      "model": "gemini-2.5-pro"},
     "llama4":   {"engine": "groq",        "model": "meta-llama/llama-4-scout-17b-16e-instruct"},
     "mistral":  {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},
-    "gptoss":   {"engine": "openrouter",  "model": "openai/gpt-oss-120b:free"},       # ✅ 확정
-    "nemotron": {"engine": "openrouter",  "model": "nvidia/llama-3.1-nemotron-ultra-253b-v1:free"}, # ✅ 확정
+    "gptoss":   {"engine": "openrouter",  "model": "qwen/qwen3-8b:free"},             # gpt-oss-120b 불안정 → qwen3-8b (빠름)
+    "nemotron": {"engine": "groq",        "model": "llama-3.3-70b-versatile"},        # nemotron-253b 타임아웃 → groq llama (빠름)
 }
 # ─────────────────────────────────────────────
 # 엔진별 교차 폴백 순서

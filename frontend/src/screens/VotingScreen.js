@@ -75,7 +75,7 @@ const VotingScreen = ({ issue, result, onReset }) => {
     setIsSaving(true);
     try {
       const voteResult = { type: result.type, content: result.content };
-      const logText = formatDebateLog(issue, result.history || [], voteResult);
+      const logText = formatDebateLog(issue, result?.history || [], voteResult);
       const fileName = `AI_Congress_${Date.now()}.txt`;
       const fileUri = (FileSystem.documentDirectory || FileSystem.cacheDirectory) + fileName;
       await FileSystem.writeAsStringAsync(fileUri, logText, { encoding: FileSystem.EncodingType.UTF8 });
@@ -93,7 +93,7 @@ const VotingScreen = ({ issue, result, onReset }) => {
   };
 
   // 데이터 지표 집계
-  const dataStats = analyzeDataPoints(result.history);
+  const dataStats = analyzeDataPoints(result?.history || []);
 
   // 표결 집계
   const tally = { 찬성: 0, 반대: 0, 기권: 0 };
@@ -202,7 +202,7 @@ const VotingScreen = ({ issue, result, onReset }) => {
           </TouchableOpacity>
         </View>
         <TouchableOpacity style={[styles.btn, styles.btnPrimary]} onPress={onReset} activeOpacity={0.8}>
-          <Text style={styles.btnText}>⚖ 새 안건 상정</Text>
+          <Text style={[styles.btnText, styles.btnTextPrimary]}>⚖  새 안건 상정</Text>
         </TouchableOpacity>
       </View>
 
@@ -216,7 +216,7 @@ const VotingScreen = ({ issue, result, onReset }) => {
             </TouchableOpacity>
           </View>
           <ScrollView style={styles.modalScroll} contentContainerStyle={{ padding: 16 }}>
-            {(result.history || []).map((h, i) => {
+            {(result?.history || []).map((h, i) => {
               const member = MEMBERS.find(m => m.id === h.memberId);
               const color = h.color || member?.color || COLORS.border;
               return (
@@ -236,90 +236,85 @@ const VotingScreen = ({ issue, result, onReset }) => {
     </SafeAreaView>
   );
 };
+const GOLD  = "#c9a84c";
+const GOLD2 = "#e8cc7a";
+const NAVY  = "#0a0e1a";
+const PANEL = "#141928";
+
 const styles = StyleSheet.create({
-  safe:        { flex: 1, backgroundColor: COLORS.background },
-  container:   { flex: 1, padding: 20 },
+  safe:      { flex: 1, backgroundColor: NAVY },
+  container: { flex: 1, paddingHorizontal: 20, paddingTop: 16 },
+
   title: {
-    color: COLORS.text, fontSize: 20, fontWeight: "bold",
-    marginVertical: 16, textAlign: "center",
+    color: GOLD2, fontSize: 20, fontWeight: "900",
+    textAlign: "center", letterSpacing: 4,
+    marginBottom: 14,
   },
   issueCard: {
-    backgroundColor: COLORS.card,
-    borderRadius: 10, padding: 14, marginBottom: 16,
-    borderWidth: 1, borderColor: COLORS.border2,
+    backgroundColor: PANEL, borderRadius: 10, padding: 14, marginBottom: 14,
+    borderWidth: 1, borderColor: GOLD + "44",
+    borderLeftWidth: 3, borderLeftColor: GOLD,
   },
-  issueLabel: { fontSize: 10, color: COLORS.textMuted, letterSpacing: 2, marginBottom: 4 },
-  issueText:  { color: COLORS.accent, fontSize: 14, textAlign: "center", lineHeight: 20 },
-// 💡 여기에 붙여넣으세요
+  issueLabel: { fontSize: 9, color: GOLD + "99", letterSpacing: 3, marginBottom: 4 },
+  issueText:  { color: GOLD2, fontSize: 14, textAlign: "center", lineHeight: 20 },
+
   reportCard: {
-    backgroundColor: "#161b22",
-    borderRadius: 12, padding: 16, marginBottom: 16,
-    borderWidth: 1, borderColor: COLORS.border2
+    backgroundColor: PANEL, borderRadius: 12, padding: 16, marginBottom: 14,
+    borderWidth: 1, borderColor: GOLD + "33",
   },
-  reportTitle: { color: COLORS.accent, fontSize: 13, fontWeight: "bold", marginBottom: 12 },
+  reportTitle:{ color: GOLD2, fontSize: 12, fontWeight: "bold", marginBottom: 12, letterSpacing: 2 },
   reportGrid: { flexDirection: "row", justifyContent: "space-between", marginBottom: 12 },
   reportItem: { alignItems: "center", flex: 1 },
-  reportVal: { color: COLORS.text, fontSize: 18, fontWeight: "bold" },
-  reportLab: { color: COLORS.textMuted, fontSize: 10, marginTop: 2 },
-  reportDesc: { color: COLORS.textDim, fontSize: 11, lineHeight: 16, borderTopWidth: 1, borderTopColor: "#30363d", paddingTop: 8 },
+  reportVal:  { color: "#e8e8e8", fontSize: 22, fontWeight: "bold" },
+  reportLab:  { color: COLORS.textMuted, fontSize: 10, marginTop: 2 },
+  reportDesc: { color: COLORS.textMuted, fontSize: 11, lineHeight: 16, borderTopWidth: 1, borderTopColor: GOLD + "22", paddingTop: 8 },
+
   scroll: { flex: 1 },
 
-  // 결의안
-  resCard:    { backgroundColor: COLORS.card, padding: 20, borderRadius: 12 },
-  resTitle:   { color: COLORS.accent, fontWeight: "bold", marginBottom: 10, fontSize: 15 },
-  resContent: { color: COLORS.text, lineHeight: 24, fontSize: 14 },
+  resCard:    { backgroundColor: PANEL, padding: 20, borderRadius: 12, borderWidth: 1, borderColor: GOLD + "33" },
+  resTitle:   { color: GOLD2, fontWeight: "bold", marginBottom: 10, fontSize: 14, letterSpacing: 2 },
+  resContent: { color: "#e8e8e8", lineHeight: 24, fontSize: 14 },
 
-  // 가결/부결
   verdictBanner: {
-    borderWidth: 1.5, borderRadius: 10,
-    padding: 14, alignItems: "center", marginBottom: 12,
-    backgroundColor: COLORS.card,
+    borderWidth: 1.5, borderRadius: 10, padding: 16,
+    alignItems: "center", marginBottom: 12, backgroundColor: PANEL,
   },
-  verdictText: { fontSize: 18, fontWeight: "800", marginBottom: 4 },
-  tallyText:   { fontSize: 13, color: COLORS.textDim },
+  verdictText: { fontSize: 20, fontWeight: "900", marginBottom: 4, letterSpacing: 2 },
+  tallyText:   { fontSize: 13, color: COLORS.textMuted },
 
-  // 게이지
-  gaugeWrap:  { flexDirection: "row", height: 8, borderRadius: 4, overflow: "hidden", marginBottom: 20 },
-  gaugeBar:   { height: "100%" },
+  gaugeWrap: { flexDirection: "row", height: 6, borderRadius: 3, overflow: "hidden", marginBottom: 20 },
+  gaugeBar:  { height: "100%" },
 
-  sectionLabel: { fontSize: 10, color: COLORS.blue, letterSpacing: 3, marginBottom: 10 },
+  sectionLabel: { fontSize: 9, color: GOLD + "99", letterSpacing: 4, marginBottom: 10 },
 
-  // 의원 투표
   voteItem: {
-    backgroundColor: COLORS.card,
-    padding: 14, marginBottom: 10,
+    backgroundColor: PANEL, padding: 14, marginBottom: 10,
     borderRadius: 10, borderLeftWidth: 3,
+    borderWidth: 1, borderColor: GOLD + "22",
   },
-  voteHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 },
-  voteMember: { fontWeight: "bold", fontSize: 13 },
-  voteLabelBadge: {
-    borderWidth: 1, borderRadius: 6,
-    paddingHorizontal: 8, paddingVertical: 2,
-  },
-  voteLabelText: { fontSize: 11, fontWeight: "700" },
-  voteReason:   { color: COLORS.textDim, fontSize: 12, lineHeight: 18 },
+  voteHeader:     { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 },
+  voteMember:     { fontWeight: "bold", fontSize: 13 },
+  voteLabelBadge: { borderWidth: 1, borderRadius: 5, paddingHorizontal: 8, paddingVertical: 2 },
+  voteLabelText:  { fontSize: 11, fontWeight: "700" },
+  voteReason:     { color: COLORS.textMuted, fontSize: 12, lineHeight: 18 },
 
-  // 버튼
-  btnRow: { flexDirection: "row", gap: 8, marginTop: 12 },
-  btn: {
-    padding: 14, borderRadius: 12,
-    alignItems: "center", flex: 1,
-  },
-  btnPrimary:   { backgroundColor: COLORS.blue, marginTop: 8, flex: 0, width: "100%" },
-  btnSecondary: { backgroundColor: COLORS.surface2 || "#1c2128", borderWidth: 1, borderColor: COLORS.border2 },
-  btnDisabled:  { opacity: 0.5 },
-  btnText: { color: "#fff", fontWeight: "bold", fontSize: 13, letterSpacing: 0.5 },
+  btnRow:       { flexDirection: "row", gap: 8, marginTop: 12 },
+  btn:          { padding: 14, borderRadius: 10, alignItems: "center", flex: 1 },
+  btnPrimary:   { backgroundColor: GOLD, marginTop: 8, flex: 0, width: "100%" },
+  btnSecondary: { backgroundColor: PANEL, borderWidth: 1, borderColor: GOLD + "44" },
+  btnDisabled:  { opacity: 0.4 },
+  btnText:      { color: GOLD2, fontWeight: "bold", fontSize: 13, letterSpacing: 1 },
+  btnTextPrimary: { color: NAVY, fontWeight: "900", fontSize: 14, letterSpacing: 2 },
 
-  // 모달
-  modalSafe:    { flex: 1, backgroundColor: COLORS.background },
-  modalHeader:  { flexDirection: "row", justifyContent: "space-between", alignItems: "center", padding: 16, borderBottomWidth: 1, borderBottomColor: COLORS.border2 },
-  modalTitle:   { color: COLORS.text, fontSize: 16, fontWeight: "bold" },
-  modalClose:   { padding: 8 },
-  modalCloseText: { color: COLORS.accent, fontSize: 14 },
-  modalScroll:  { flex: 1 },
-  histCard:     { backgroundColor: COLORS.card, padding: 12, marginBottom: 10, borderRadius: 8, borderLeftWidth: 3 },
-  histName:     { fontSize: 11, fontWeight: "bold", marginBottom: 6 },
-  histText:     { color: COLORS.text, fontSize: 13, lineHeight: 20 },
+  modalSafe:      { flex: 1, backgroundColor: NAVY },
+  modalHeader:    { flexDirection: "row", justifyContent: "space-between", alignItems: "center", padding: 16, paddingTop: 52, borderBottomWidth: 1, borderBottomColor: GOLD + "33", backgroundColor: PANEL },
+  modalTitle:     { color: GOLD2, fontSize: 15, fontWeight: "bold", letterSpacing: 1 },
+  modalClose:     { padding: 8 },
+  modalCloseText: { color: GOLD, fontSize: 18, fontWeight: "bold" },
+  modalScroll:    { flex: 1 },
+  histCard:       { backgroundColor: PANEL, padding: 12, marginBottom: 10, borderRadius: 8, borderLeftWidth: 3, borderWidth: 1, borderColor: GOLD + "22" },
+  histName:       { fontSize: 11, fontWeight: "bold", marginBottom: 6 },
+  histText:       { color: "#ccc", fontSize: 13, lineHeight: 20 },
 });
 
 export default VotingScreen;

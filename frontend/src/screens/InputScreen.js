@@ -1,16 +1,3 @@
-/**
- * InputScreen.js - 토론 시간 60분으로 확장
- *
- * 변경사항:
- * - DURATIONS: 최대 30분 → 60분으로 확장
- * - 기본값: 15분 유지
- * - 안건 입력, 형식 선택, 의원 선택 기존 로직 유지
- *
- * ⚠️ 이 파일은 원본 InputScreen.js를 대체합니다.
- *    원본에서 MEMBERS import 및 스타일 부분은 그대로 유지하고
- *    DURATIONS 배열과 관련 UI 텍스트만 아래와 같이 수정하세요.
- */
-
 import React, { useState } from "react";
 import {
   View, Text, TextInput, TouchableOpacity,
@@ -18,10 +5,7 @@ import {
 } from "react-native";
 import { COLORS, MEMBERS } from "../constants/members";
 
-// ✅ 60분까지 확장
 const DURATIONS = [10, 15, 20, 30, 45, 60];
-// ✅ 백엔드 debate_engine dispatch 키와 정확히 일치해야 함
-// 기존 "찬반"→미지원, "자유"→"자유토론" 으로 수정
 const FORMATS   = ["릴레이", "집중토론", "전문가패널", "자유토론"];
 const CONCLUSIONS = [
   { id: "VOTE",       label: "🗳 표결" },
@@ -53,15 +37,25 @@ export default function InputScreen({ onStart, onShowHistory }) {
 
   return (
     <SafeAreaView style={styles.safe}>
+      {/* 의회장 헤더 */}
+      <View style={styles.heroHeader}>
+        <View style={styles.heroTop}>
+          <Text style={styles.pillars}>⬛  ⬛  ⬛  ⬛  ⬛</Text>
+        </View>
+        <Text style={styles.heroTitle}>🏛 AI 의회</Text>
+        <Text style={styles.heroSub}>ARTIFICIAL INTELLIGENCE CONGRESS</Text>
+        <View style={styles.heroDivider} />
+      </View>
+
       <ScrollView style={styles.scroll} contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled">
 
-        <Text style={styles.title}>🏛 AI 의회</Text>
-        <Text style={styles.sub}>안건을 입력하고 토론을 시작하세요</Text>
-
         {/* 안건 입력 */}
         <View style={styles.section}>
-          <Text style={styles.label}>📋 안건</Text>
+          <View style={styles.sectionHeader}>
+            <View style={styles.sectionDot} />
+            <Text style={styles.label}>안  건</Text>
+          </View>
           <TextInput
             style={styles.input}
             placeholder="토론할 안건을 입력하세요..."
@@ -73,9 +67,12 @@ export default function InputScreen({ onStart, onShowHistory }) {
           />
         </View>
 
-        {/* 토론 시간 — 최대 60분 */}
+        {/* 토론 시간 */}
         <View style={styles.section}>
-          <Text style={styles.label}>⏱ 토론 시간 (최대 60분)</Text>
+          <View style={styles.sectionHeader}>
+            <View style={styles.sectionDot} />
+            <Text style={styles.label}>토론 시간</Text>
+          </View>
           <View style={styles.row}>
             {DURATIONS.map(d => (
               <TouchableOpacity
@@ -93,7 +90,10 @@ export default function InputScreen({ onStart, onShowHistory }) {
 
         {/* 토론 형식 */}
         <View style={styles.section}>
-          <Text style={styles.label}>🎙 토론 형식</Text>
+          <View style={styles.sectionHeader}>
+            <View style={styles.sectionDot} />
+            <Text style={styles.label}>토론 형식</Text>
+          </View>
           <View style={styles.row}>
             {FORMATS.map(f => (
               <TouchableOpacity
@@ -109,7 +109,10 @@ export default function InputScreen({ onStart, onShowHistory }) {
 
         {/* 결론 방식 */}
         <View style={styles.section}>
-          <Text style={styles.label}>⚖ 결론 방식</Text>
+          <View style={styles.sectionHeader}>
+            <View style={styles.sectionDot} />
+            <Text style={styles.label}>결론 방식</Text>
+          </View>
           <View style={styles.row}>
             {CONCLUSIONS.map(c => (
               <TouchableOpacity
@@ -127,20 +130,28 @@ export default function InputScreen({ onStart, onShowHistory }) {
 
         {/* 참여 의원 선택 */}
         <View style={styles.section}>
-          <Text style={styles.label}>🧑‍💼 참여 의원 ({activeMembers.length}/{MEMBERS.length}명)</Text>
-          {MEMBERS.map(m => (
-            <View key={m.id} style={styles.memberRow}>
-              <Text style={[styles.memberName, { color: m.color }]}>
-                {m.avatar} {m.name}
-              </Text>
-              <Switch
-                value={memberFlags[m.id]}
-                onValueChange={() => toggleMember(m.id)}
-                trackColor={{ false: COLORS.border, true: COLORS.blue }}
-                thumbColor={memberFlags[m.id] ? COLORS.accent : COLORS.textMuted}
-              />
-            </View>
-          ))}
+          <View style={styles.sectionHeader}>
+            <View style={styles.sectionDot} />
+            <Text style={styles.label}>참여 의원  <Text style={styles.labelCount}>{activeMembers.length}/{MEMBERS.length}명</Text></Text>
+          </View>
+          <View style={styles.memberGrid}>
+            {MEMBERS.map(m => (
+              <TouchableOpacity
+                key={m.id}
+                style={[styles.memberCard, memberFlags[m.id] && { borderColor: m.color, backgroundColor: m.color + "18" }]}
+                onPress={() => toggleMember(m.id)}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.memberAvatar}>{m.avatar}</Text>
+                <Text style={[styles.memberName, { color: memberFlags[m.id] ? m.color : COLORS.textMuted }]}>
+                  {m.name}
+                </Text>
+                <View style={[styles.memberCheck, memberFlags[m.id] && { backgroundColor: m.color }]}>
+                  {memberFlags[m.id] && <Text style={styles.memberCheckText}>✓</Text>}
+                </View>
+              </TouchableOpacity>
+            ))}
+          </View>
         </View>
 
         {/* 시작 버튼 */}
@@ -150,12 +161,15 @@ export default function InputScreen({ onStart, onShowHistory }) {
           activeOpacity={0.8}
           disabled={!issue.trim() || activeMembers.length < 2}
         >
-          <Text style={styles.startText}>🏛 토론 시작</Text>
+          <View style={styles.startBtnInner}>
+            <Text style={styles.startGavel}>⚖</Text>
+            <Text style={styles.startText}>토론 개회</Text>
+          </View>
         </TouchableOpacity>
 
         {/* 기록 보기 */}
         <TouchableOpacity style={styles.historyBtn} onPress={onShowHistory}>
-          <Text style={styles.historyText}>📂 토론 기록 보기</Text>
+          <Text style={styles.historyText}>📂  토론 보관함</Text>
         </TouchableOpacity>
 
         <View style={{ height: 40 }} />
@@ -164,49 +178,80 @@ export default function InputScreen({ onStart, onShowHistory }) {
   );
 }
 
+const GOLD   = "#c9a84c";
+const GOLD2  = "#e8cc7a";
+const NAVY   = "#0a0e1a";
+const NAVY2  = "#0f1420";
+const PANEL  = "#141928";
+
 const styles = StyleSheet.create({
-  safe:    { flex: 1, backgroundColor: COLORS.background },
+  safe: { flex: 1, backgroundColor: NAVY },
+
+  /* ── 헤더 ── */
+  heroHeader: {
+    backgroundColor: NAVY,
+    alignItems: "center",
+    paddingTop: 10,
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: GOLD + "44",
+  },
+  heroTop:    { marginBottom: 4 },
+  pillars:    { fontSize: 10, color: GOLD + "66", letterSpacing: 6 },
+  heroTitle:  { fontSize: 28, fontWeight: "900", color: GOLD2, letterSpacing: 4 },
+  heroSub:    { fontSize: 9, color: GOLD + "88", letterSpacing: 5, marginTop: 2 },
+  heroDivider:{ width: 80, height: 1, backgroundColor: GOLD + "55", marginTop: 10 },
+
   scroll:  { flex: 1 },
   content: { padding: 20 },
-  title:   { color: COLORS.text, fontSize: 26, fontWeight: "900", textAlign: "center", marginTop: 10 },
-  sub:     { color: COLORS.textMuted, fontSize: 13, textAlign: "center", marginBottom: 24 },
 
-  section: { marginBottom: 20 },
-  label:   { color: COLORS.textDim, fontSize: 11, letterSpacing: 2, marginBottom: 8 },
+  /* ── 섹션 ── */
+  section:       { marginBottom: 22 },
+  sectionHeader: { flexDirection: "row", alignItems: "center", marginBottom: 10 },
+  sectionDot:    { width: 3, height: 14, backgroundColor: GOLD, borderRadius: 2, marginRight: 8 },
+  label:         { color: GOLD2, fontSize: 12, fontWeight: "700", letterSpacing: 3 },
+  labelCount:    { color: COLORS.textMuted, fontSize: 11, fontWeight: "400" },
 
   input: {
-    backgroundColor: COLORS.card,
-    color: COLORS.text,
-    borderRadius: 10, padding: 14,
-    borderWidth: 1, borderColor: COLORS.border2,
+    backgroundColor: PANEL,
+    color: "#e8e8e8",
+    borderRadius: 8, padding: 14,
+    borderWidth: 1, borderColor: GOLD + "44",
     fontSize: 14, minHeight: 80, textAlignVertical: "top",
   },
 
-  row:          { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  chip:         {
-    paddingHorizontal: 14, paddingVertical: 8,
-    borderRadius: 20, borderWidth: 1,
-    borderColor: COLORS.border2, backgroundColor: COLORS.card,
-  },
-  chipActive:   { backgroundColor: COLORS.blue, borderColor: COLORS.blue },
-  chipText:     { color: COLORS.textDim, fontSize: 13 },
-  chipTextActive: { color: "#fff", fontWeight: "700" },
+  /* ── 칩 ── */
+  row:            { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  chip:           { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 6, borderWidth: 1, borderColor: GOLD + "44", backgroundColor: PANEL },
+  chipActive:     { backgroundColor: GOLD, borderColor: GOLD },
+  chipText:       { color: GOLD + "cc", fontSize: 13 },
+  chipTextActive: { color: NAVY, fontWeight: "800" },
 
-  memberRow: {
-    flexDirection: "row", justifyContent: "space-between",
-    alignItems: "center", paddingVertical: 8,
-    borderBottomWidth: 1, borderBottomColor: COLORS.border,
+  /* ── 의원 그리드 ── */
+  memberGrid: { flexDirection: "row", flexWrap: "wrap", gap: 10 },
+  memberCard: {
+    width: "47%", flexDirection: "row", alignItems: "center",
+    backgroundColor: PANEL, borderRadius: 8,
+    borderWidth: 1, borderColor: "#ffffff11",
+    paddingHorizontal: 10, paddingVertical: 10, gap: 8,
   },
-  memberName: { fontSize: 14, fontWeight: "600" },
+  memberAvatar:    { fontSize: 20 },
+  memberName:      { flex: 1, fontSize: 12, fontWeight: "600" },
+  memberCheck:     { width: 18, height: 18, borderRadius: 9, borderWidth: 1, borderColor: "#ffffff33", alignItems: "center", justifyContent: "center" },
+  memberCheckText: { color: "#fff", fontSize: 11, fontWeight: "900" },
 
+  /* ── 시작 버튼 ── */
   startBtn: {
-    backgroundColor: COLORS.blue,
-    padding: 18, borderRadius: 14,
-    alignItems: "center", marginTop: 8,
+    borderRadius: 10, marginTop: 8, overflow: "hidden",
+    backgroundColor: GOLD,
+    borderWidth: 1, borderColor: GOLD2,
   },
-  startBtnDisabled: { opacity: 0.4 },
-  startText: { color: "#fff", fontWeight: "900", fontSize: 16, letterSpacing: 1 },
+  startBtnDisabled: { opacity: 0.35 },
+  startBtnInner:    { flexDirection: "row", alignItems: "center", justifyContent: "center", padding: 18, gap: 10 },
+  startGavel:       { fontSize: 20 },
+  startText:        { color: NAVY, fontWeight: "900", fontSize: 17, letterSpacing: 3 },
 
-  historyBtn: { alignItems: "center", marginTop: 14, padding: 10 },
-  historyText: { color: COLORS.textMuted, fontSize: 13 },
+  /* ── 보관함 버튼 ── */
+  historyBtn:  { alignItems: "center", marginTop: 14, padding: 12, borderRadius: 8, borderWidth: 1, borderColor: GOLD + "33" },
+  historyText: { color: GOLD + "99", fontSize: 13, letterSpacing: 2 },
 });

@@ -1,87 +1,116 @@
 import React, { useState, useEffect } from 'react';
 import {
   View, Text, FlatList, TouchableOpacity,
-  StyleSheet, Alert, Share,
+  StyleSheet, Alert, Share, Modal, ScrollView,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { COLORS } from '../constants/members';
+import { COLORS, MEMBERS } from '../constants/members';
+
+const GOLD  = "#c9a84c";
+const GOLD2 = "#e8cc7a";
+const NAVY  = "#0a0e1a";
+const PANEL = "#141928";
 
 export default function HistoryScreen({ onBack }) {
-  const [historyList, setHistoryList] = useState([]);
+  const [historyList, setHistoryList]   = useState([]);
+  const [viewItem,    setViewItem]      = useState(null); // 다시보기 모달
 
-  // ─── 데이터 불러오기 ───
   const loadHistory = async () => {
     try {
-      const savedData = await AsyncStorage.getItem('debate_history');
-      if (savedData) {
-        // 저장된 순서 그대로 사용 (이미 최신순으로 저장됨)
-        setHistoryList(JSON.parse(savedData));
-      }
+      const saved = await AsyncStorage.getItem('debate_history');
+      if (saved) setHistoryList(JSON.parse(saved));
     } catch (e) {
       Alert.alert("오류", "기록을 불러오지 못했습니다.");
     }
   };
-
   useEffect(() => { loadHistory(); }, []);
 
-  // ─── 삭제 기능 (버그 수정) ───
+  /* 삭제 */
   const deleteEntry = async (id) => {
     Alert.alert("삭제", "이 기록을 삭제하시겠습니까?", [
       { text: "취소", style: "cancel" },
       {
-        text: "삭제",
-        style: "destructive",
+        text: "삭제", style: "destructive",
         onPress: async () => {
-          try {
-            // ✅ filter 후 새 배열을 만들어 저장 (reverse() 제거 — 원본 배열 변형 버그 수정)
-            const updated = historyList.filter(item => item.id !== id);
-            setHistoryList(updated);
-            await AsyncStorage.setItem('debate_history', JSON.stringify(updated));
-          } catch (e) {
-            Alert.alert("오류", "삭제에 실패했습니다.");
-          }
+          const updated = historyList.filter(item => item.id !== id);
+          setHistoryList(updated);
+          await AsyncStorage.setItem('debate_history', JSON.stringify(updated));
         }
       }
     ]);
   };
 
-  // ─── 전체 기록 삭제 ───
+  /* 전체 삭제 */
   const clearAll = async () => {
     Alert.alert("전체 삭제", "모든 토론 기록을 삭제하시겠습니까?", [
       { text: "취소", style: "cancel" },
       {
-        text: "전체 삭제",
-        style: "destructive",
+        text: "전체 삭제", style: "destructive",
         onPress: async () => {
-          try {
-            await AsyncStorage.removeItem('debate_history');
-            setHistoryList([]);
-          } catch (e) {
-            Alert.alert("오류", "삭제에 실패했습니다.");
-          }
+          await AsyncStorage.removeItem('debate_history');
+          setHistoryList([]);
         }
       }
     ]);
   };
 
-  // ─── 공유하기 ───
+  /* 공유 */
   const shareEntry = async (item) => {
     try {
-      await Share.share({
-        message: item.content,
-        title:   `AI 의회 토론 기록: ${item.issue}`,
-      });
+      await Share.share({ message: item.content, title: `AI 의회: ${item.issue}` });
     } catch (e) {
       Alert.alert("오류", "공유할 수 없습니다.");
     }
   };
 
-  // ─── 결과 배지 색상 ───
   const getResultColor = (result) => {
-    if (result === "가결")  return COLORS.success;
-    if (result === "부결")  return COLORS.error;
+    if (result === "가결")   return COLORS.success;
+    if (result === "부결")   return COLORS.error;
     if (result === "결의안") return COLORS.accent;
     return COLORS.textMuted;
+  };
+
+  /* 다시보기 — 텍스트를 줄 단위로 파싱해서 카드 형태로 표시 */
+  const renderViewModal = () => {
+    if (!viewItem) return null;
+    const lines = (viewItem.content || "").split('\n');
+    return (
+      <Modal visible animationType="slide" onRequestClose={() => setViewItem(null)}>
+        <View style={styles.modalSafe}>
+          <View style={styles.modalHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.modalTitle}>📜 토론 기록 다시보기</Text>
+              <Text style={styles.modalIssue} numberOfLines={1}>{viewItem.issue}</Text>
+            </View>
+            <TouchableOpacity onPress={() => setViewItem(null)} style={styles.modalCloseBtn}>
+              <Text style={styles.modalCloseText}>✕</Text>
+            </TouchableOpacity>
+          </View>
+          <ScrollView style={styles.modalScroll} contentContainerStyle={{ padding: 16 }}>
+            {lines.map((line, i) => {
+              if (!line.trim()) return <View key={i} style={{ height: 6 }} />;
+              const isHeader = line.startsWith('===') || line.startsWith('---');
+              const isSpeaker = line.match(/^\[\d+\]/);
+              const isResult  = line.startsWith('최종 의결') || line.startsWith('찬성') || line.startsWith('결과:');
+              return (
+                <Text
+                  key={i}
+                  style={[
+                    styles.modalLine,
+                    isHeader   && styles.modalLineHeader,
+                    isSpeaker  && styles.modalLineSpeaker,
+                    isResult   && styles.modalLineResult,
+                  ]}
+                >
+                  {line}
+                </Text>
+              );
+            })}
+            <View style={{ height: 40 }} />
+          </ScrollView>
+        </View>
+      </Modal>
+    );
   };
 
   return (
@@ -91,7 +120,7 @@ export default function HistoryScreen({ onBack }) {
         <TouchableOpacity onPress={onBack} style={styles.backBtn}>
           <Text style={styles.backText}>← 뒤로</Text>
         </TouchableOpacity>
-        <Text style={styles.title}>📂 토론 보관함</Text>
+        <Text style={styles.title}>📂  토론 보관함</Text>
         {historyList.length > 0 && (
           <TouchableOpacity onPress={clearAll} style={styles.clearBtn}>
             <Text style={styles.clearText}>전체삭제</Text>
@@ -99,9 +128,7 @@ export default function HistoryScreen({ onBack }) {
         )}
       </View>
 
-      <Text style={styles.countText}>
-        총 {historyList.length}건 저장됨
-      </Text>
+      <Text style={styles.countText}>총 {historyList.length}건 저장됨</Text>
 
       <FlatList
         data={historyList}
@@ -110,7 +137,6 @@ export default function HistoryScreen({ onBack }) {
           <View style={styles.card}>
             <View style={styles.cardTop}>
               <Text style={styles.date}>{item.date}</Text>
-              {/* ✅ 가결/부결/결의안 배지 */}
               {item.result && (
                 <View style={[styles.resultBadge, { borderColor: getResultColor(item.result) }]}>
                   <Text style={[styles.resultText, { color: getResultColor(item.result) }]}>
@@ -120,17 +146,16 @@ export default function HistoryScreen({ onBack }) {
               )}
             </View>
             <Text style={styles.issue} numberOfLines={2}>{item.issue}</Text>
+
+            {/* 버튼 3개 */}
             <View style={styles.actions}>
-              <TouchableOpacity
-                onPress={() => shareEntry(item)}
-                style={styles.btn}
-              >
-                <Text style={styles.btnText}>📤 공유/보기</Text>
+              <TouchableOpacity style={styles.btn} onPress={() => setViewItem(item)}>
+                <Text style={styles.btnText}>👁 다시보기</Text>
               </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => deleteEntry(item.id)}
-                style={[styles.btn, styles.delBtn]}
-              >
+              <TouchableOpacity style={styles.btn} onPress={() => shareEntry(item)}>
+                <Text style={styles.btnText}>📤 공유</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.btn, styles.delBtn]} onPress={() => deleteEntry(item.id)}>
                 <Text style={styles.btnText}>🗑 삭제</Text>
               </TouchableOpacity>
             </View>
@@ -144,48 +169,64 @@ export default function HistoryScreen({ onBack }) {
           </View>
         }
       />
+
+      {renderViewModal()}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: COLORS.background, padding: 16 },
-  header:    {
-    flexDirection: 'row', alignItems: 'center',
-    marginBottom: 8, marginTop: 44,
-  },
-  backBtn:   { paddingVertical: 8, paddingRight: 12 },
-  backText:  { color: COLORS.accent, fontSize: 16 },
-  title:     { flex: 1, fontSize: 18, fontWeight: 'bold', color: COLORS.text },
-  clearBtn:  { paddingVertical: 6, paddingHorizontal: 10, backgroundColor: COLORS.error + "33", borderRadius: 6 },
-  clearText: { color: COLORS.error, fontSize: 12, fontWeight: "600" },
-  countText: { color: COLORS.textMuted, fontSize: 12, marginBottom: 12 },
+  container: { flex: 1, backgroundColor: NAVY, paddingHorizontal: 16 },
+
+  header: { flexDirection: 'row', alignItems: 'center', marginBottom: 8, marginTop: 50, paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: GOLD + "33" },
+  backBtn:  { paddingVertical: 8, paddingRight: 12 },
+  backText: { color: GOLD, fontSize: 15, fontWeight: "600" },
+  title:    { flex: 1, fontSize: 17, fontWeight: 'bold', color: GOLD2, letterSpacing: 2 },
+  clearBtn: { paddingVertical: 6, paddingHorizontal: 10, backgroundColor: COLORS.error + "22", borderRadius: 6, borderWidth: 1, borderColor: COLORS.error + "44" },
+  clearText:{ color: COLORS.error, fontSize: 11, fontWeight: "700" },
+  countText:{ color: COLORS.textMuted, fontSize: 11, marginBottom: 12, letterSpacing: 1 },
 
   card: {
-    backgroundColor: COLORS.card,
-    padding: 14, borderRadius: 10,
-    marginBottom: 10,
-    borderWidth: 1, borderColor: COLORS.border2,
+    backgroundColor: PANEL,
+    padding: 14, borderRadius: 10, marginBottom: 10,
+    borderWidth: 1, borderColor: GOLD + "22",
+    borderLeftWidth: 3, borderLeftColor: GOLD + "66",
   },
-  cardTop:   { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
-  date:      { color: COLORS.textMuted, fontSize: 11 },
-  resultBadge: {
-    borderWidth: 1, borderRadius: 6,
-    paddingHorizontal: 7, paddingVertical: 2,
-  },
-  resultText: { fontSize: 11, fontWeight: "700" },
-  issue:     { color: COLORS.text, fontSize: 15, fontWeight: '600', marginBottom: 12 },
-  actions:   { flexDirection: 'row', gap: 8 },
-  btn:       {
-    flex: 1, backgroundColor: COLORS.surface2,
-    padding: 9, borderRadius: 7, alignItems: 'center',
-    borderWidth: 1, borderColor: COLORS.border,
-  },
-  delBtn:    { backgroundColor: COLORS.error + '22', borderColor: COLORS.error + '55' },
-  btnText:   { color: COLORS.text, fontSize: 12, fontWeight: '600' },
+  cardTop:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
+  date:        { color: COLORS.textMuted, fontSize: 11 },
+  resultBadge: { borderWidth: 1, borderRadius: 5, paddingHorizontal: 7, paddingVertical: 2 },
+  resultText:  { fontSize: 11, fontWeight: "700" },
+  issue:       { color: "#e8e8e8", fontSize: 14, fontWeight: '600', marginBottom: 12, lineHeight: 20 },
 
-  emptyWrap: { alignItems: 'center', marginTop: 60 },
-  emptyIcon: { fontSize: 40, marginBottom: 12 },
+  actions: { flexDirection: 'row', gap: 7 },
+  btn: {
+    flex: 1, backgroundColor: "#1c2235",
+    padding: 9, borderRadius: 7, alignItems: 'center',
+    borderWidth: 1, borderColor: GOLD + "33",
+  },
+  delBtn:  { backgroundColor: COLORS.error + '18', borderColor: COLORS.error + '44' },
+  btnText: { color: GOLD2, fontSize: 11, fontWeight: '700' },
+
+  emptyWrap: { alignItems: 'center', marginTop: 80 },
+  emptyIcon: { fontSize: 44, marginBottom: 14 },
   empty:     { color: COLORS.textMuted, fontSize: 16, fontWeight: '600' },
   emptySub:  { color: COLORS.textMuted, fontSize: 12, marginTop: 6 },
+
+  /* 다시보기 모달 */
+  modalSafe:    { flex: 1, backgroundColor: NAVY },
+  modalHeader:  {
+    flexDirection: 'row', alignItems: 'center',
+    padding: 16, paddingTop: 52,
+    borderBottomWidth: 1, borderBottomColor: GOLD + "33",
+    backgroundColor: PANEL,
+  },
+  modalTitle:    { color: GOLD2, fontSize: 15, fontWeight: "bold", letterSpacing: 1 },
+  modalIssue:    { color: COLORS.textMuted, fontSize: 11, marginTop: 2 },
+  modalCloseBtn: { padding: 8, marginLeft: 8 },
+  modalCloseText:{ color: GOLD, fontSize: 18, fontWeight: "bold" },
+  modalScroll:   { flex: 1 },
+  modalLine:     { color: "#ccc", fontSize: 13, lineHeight: 22, marginBottom: 2 },
+  modalLineHeader:  { color: GOLD + "88", fontSize: 10, letterSpacing: 1 },
+  modalLineSpeaker: { color: GOLD2, fontWeight: "700", fontSize: 13, marginTop: 8 },
+  modalLineResult:  { color: COLORS.success, fontWeight: "700" },
 });

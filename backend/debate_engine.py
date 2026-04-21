@@ -544,11 +544,18 @@ class DebateEngine:
         except:
             return "의원들의 충분한 논의를 바탕으로 본 안건을 검토하였다."
 
-    async def run_conclusion(self, chair: dict):
+    async def run_conclusion(self, chair: dict, timed_out: bool = False):
         """최종 의결 공통 처리"""
         await asyncio.sleep(3.0)  # 마지막 발언 완전 전달 대기
 
-        if self.debate_format == "자유토론":
+        elapsed = int(self._elapsed_minutes())
+        if timed_out:
+            close_instruction = (
+                f"토론 시간 {elapsed}분이 경과하였습니다. "
+                "예정된 토론 시간이 종료되어 더 이상의 발언을 받지 않겠습니다. "
+                f"지금까지의 논의를 바탕으로 {'찬반 표결' if self.conclusion_type == 'VOTE' else '공동 결의안 채택'}을 실시하겠습니다."
+            )
+        elif self.debate_format == "자유토론":
             close_instruction = (
                 f"자유토론이 종료되었습니다. "
                 f"{'찬반 표결' if self.conclusion_type == 'VOTE' else '공동 결의안 채택'}을 실시하겠습니다."
@@ -627,7 +634,7 @@ class DebateEngine:
 
             if self._time_over():
                 print(f"[Engine] 릴레이 시간 초과 ({self._elapsed_minutes():.1f}분) — 의결로 이동")
-                await self.run_conclusion(chair)
+                await self.run_conclusion(chair, timed_out=True)
                 return
 
             # 라운드 선언 (AI 자율 생성)
@@ -641,7 +648,7 @@ class DebateEngine:
 
             for m in order:
                 if self._time_over():
-                    await self.run_conclusion(chair)
+                    await self.run_conclusion(chair, timed_out=True)
                     return
 
                 # 지목 발언
@@ -675,20 +682,25 @@ class DebateEngine:
                     self.ctx.push(f"[의장 {chair['name']}]", final_text)
                     await self.send_speech(chair, final_text, "NORMAL", True)
 
+                    _final_timed_out = False
                     for fm in final_order:
                         if self._time_over():
+                            _final_timed_out = True
                             break
                         fn = f"{fm['name']} 의원님, 발언해 주시기 바랍니다."
                         self.ctx.push(f"[의장 {chair['name']}]", fn)
                         await self.send_speech(chair, fn, "NORMAL", True, skip_wait=True)
                         await self.do_speech(chair, fm, fmt_guide, self.rounds, non_chair)
+                    if _final_timed_out:
+                        await self.run_conclusion(chair, timed_out=True)
+                        return
                     break
                 else:
                     transition = await self.chair_transition_round(chair, round_num)
                     self.ctx.push(f"[의장 {chair['name']}]", transition)
                     await self.send_speech(chair, transition, "NORMAL", True)
 
-        await self.run_conclusion(chair)
+        await self.run_conclusion(chair, timed_out=self._time_over())
 
     # ══════════════════════════════════════════════
     # 2. 집중토론
@@ -727,7 +739,7 @@ class DebateEngine:
             self.current_round = round_num
 
             if self._time_over():
-                await self.run_conclusion(chair)
+                await self.run_conclusion(chair, timed_out=True)
                 return
 
             round_text = await self.chair_announce_round(chair, round_num)
@@ -760,15 +772,17 @@ class DebateEngine:
             await self.send_speech(chair, qa_open, "NORMAL", True)
 
             random.shuffle(observers)
+            _obs_timed_out = False
             for m in observers:
                 if self._time_over():
+                    _obs_timed_out = True
                     break
                 nominate = f"{m['name']} 의원님, 질의해 주십시오."
                 self.ctx.push(f"[의장 {chair['name']}]", nominate)
                 await self.send_speech(chair, nominate, "NORMAL", True, skip_wait=True)
                 await self.do_speech(chair, m, fmt_guide, 2, non_chair)
 
-        await self.run_conclusion(chair)
+        await self.run_conclusion(chair, timed_out=_obs_timed_out if observers else False)
 
     # ══════════════════════════════════════════════
     # 3. 전문가패널
@@ -809,7 +823,7 @@ class DebateEngine:
 
         for m in panels:
             if self._time_over():
-                await self.run_conclusion(chair)
+                await self.run_conclusion(chair, timed_out=True)
                 return
             nominate = f"패널 {m['name']} 의원님, 전문가 발언을 시작해 주십시오."
             self.ctx.push(f"[의장 {chair['name']}]", nominate)
@@ -855,7 +869,7 @@ class DebateEngine:
                 await self.send_speech(chair, nominate, "NORMAL", True, skip_wait=True)
                 await self.do_speech(chair, p, fmt_guide, 2, non_chair)
 
-        await self.run_conclusion(chair)
+        await self.run_conclusion(chair, timed_out=self._time_over())
 
     # ══════════════════════════════════════════════
     # 4. 자유토론
@@ -948,4 +962,4 @@ class DebateEngine:
                 await self.send_speech(chair, inter, "NORMAL", True, skip_wait=True)
 
         print(f"[Engine] 자유토론 종료: {turn}회 발언 / {self._elapsed_minutes():.1f}분 경과")
-        await self.run_conclusion(chair)
+        await self.run_conclusion(chair, timed_out=self._time_over())

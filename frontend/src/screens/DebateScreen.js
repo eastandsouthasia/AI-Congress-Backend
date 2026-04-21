@@ -81,6 +81,11 @@ const speakAndWaitSafe = (text, options) => new Promise((resolve) => {
   }
 });
 
+// 글자 수 기반 TTS 낭독 예상 시간 (ms) — 텍스트 타이핑 속도 맞추기용
+// 한국어 평균: 글자당 약 70ms / rate
+const estimateTTSDuration = (text, rate = 0.88) =>
+  Math.min(12000, Math.max(1500, ((text || "").length * 70) / rate));
+
 // 회의록 포맷
 const formatDebateLog = (issue, history, voteResult = null) => {
   if (!history || history.length === 0) return "기록된 발언이 없습니다.";
@@ -223,22 +228,85 @@ const DebateScreen = ({
       setStatus(`🎙 ${data.displayName} 발언 중...`);
       setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 60);
 
-      // 줄 하나씩 순서대로 표시 (await → 다음 발언 차단)
-      let accumulated = "";
-      for (let i = 0; i < lines.length; i++) {
-        if (i > 0) {
-          // 줄 길이에 비례한 딜레이 (읽는 속도 흉내)
-          await new Promise(r => setTimeout(r, Math.max(200, lines[i-1].length * 22)));
-        }
-        accumulated += (i === 0 ? "" : "\n") + lines[i];
-        const snap = accumulated;
-        setHistory(prev => {
-          const next = prev.map(h => h.id === baseId ? { ...h, text: snap } : h);
-          historyRef.current = next;
-          return next;
+      // ── TTS 텍스트 미리 정제 (화면 표시와 동시 시작하기 위해) ──
+      const hanjaMap = {
+        '愼重|慎重': '신중', '重要': '중요', '重大': '중대',
+        '必要': '필요', '可能': '가능', '不可能': '불가능',
+        '現在': '현재', '現實': '현실', '未來': '미래',
+        '社會': '사회', '國家': '국가', '政府': '정부',
+        '經濟': '경제', '政策': '정책', '制度': '제도',
+        '問題': '문제', '解決': '해결', '方法': '방법',
+        '結果': '결과', '原因': '원인', '根據': '근거',
+        '主張': '주장', '反對': '반대', '贊成': '찬성',
+        '分析': '분석', '判斷': '판단', '決定': '결정',
+        '效率': '효율', '效果': '효과', '影響': '영향',
+        '基準': '기준', '原則': '원칙', '價値': '가치',
+        '自由': '자유', '平等': '평등', '正義': '정의',
+        '安全': '안전', '危險': '위험', '保護': '보호',
+        '發展': '발전', '成長': '성장', '改善': '개선',
+        '統計': '통계', '資料': '자료', '報告': '보고',
+        '議員': '의원', '議長': '의장', '本議員': '본의원',
+        '贊反': '찬반', '論議': '논의', '討論': '토론',
+        '强調': '강조', '指摘': '지적', '提示': '제시',
+        '具體': '구체', '抽象': '추상', '複雜': '복잡',
+        '簡單': '간단', '明確': '명확', '不明確': '불명확',
+      };
+      let ttsClean = "";
+      if (ttsEnabledRef.current && fullText) {
+        let conv = fullText;
+        Object.entries(hanjaMap).forEach(([k, v]) => {
+          conv = conv.replace(new RegExp(k, 'g'), v);
         });
+        ttsClean = conv
+          .replace(/\[REFUTE\]|\[ADMIT\]|\[DATA\]|\[GRAPHIC\]|\[TABLE\]/g, "")
+          .replace(/Gemini/gi, "제미나이")
+          .replace(/Llama4?/gi, "라마")
+          .replace(/Mistral/gi, "미스트랄")
+          .replace(/GPT.?OSS/gi, "지피티")
+          .replace(/Nemotron/gi, "엔비디아")
+          .replace(/≥/g, "이상").replace(/≤/g, "이하")
+          .replace(/>/g, "초과").replace(/</g, "미만")
+          .replace(/={2,}/g, "동일")
+          .replace(/\*{2}/g, "").replace(/\*/g, "")
+          .replace(/[\u4E00-\u9FFF\u3400-\u4DBF]+/g, "")
+          .replace(/\uFE0F/g, "")
+          .replace(/(?:^|\n)\s*-\s*/g, "\n")
+          .replace(/\|[-:| ]+\|/g, "")
+          .replace(/\|/g, " ")
+          .trim();
       }
-      if (lines.length === 0) {
+
+      // ── TTS와 텍스트 타이핑 동시 시작 ──
+      const voiceSettings = await getVoiceSettings(data.memberId);
+      const { pitch, rate, volume, voice } = voiceSettings;
+      const ttsDurationMs = estimateTTSDuration(ttsClean || fullText, rate);
+
+      // TTS를 await 없이 fire → Promise만 보관
+      let ttsPromise = Promise.resolve();
+      if (ttsEnabledRef.current && ttsClean) {
+        ttsPromise = speakAndWaitSafe(ttsClean, { language: 'ko-KR', pitch, rate, volume, voice });
+      }
+
+      // 텍스트 타이핑: TTS 낭독 시간 비율에 맞춰 줄 단위로 표시
+      if (lines.length > 0) {
+        const totalChars = lines.reduce((s, l) => s + l.length, 0) || 1;
+        let accumulated = "";
+        for (let i = 0; i < lines.length; i++) {
+          accumulated += (i === 0 ? "" : "\n") + lines[i];
+          const snap = accumulated;
+          setHistory(prev => {
+            const next = prev.map(h => h.id === baseId ? { ...h, text: snap } : h);
+            historyRef.current = next;
+            return next;
+          });
+          // 다음 줄까지 대기: 이 줄의 글자 비율 × 총 낭독시간 (마지막 줄 제외)
+          if (i < lines.length - 1) {
+            const lineRatio = lines[i].length / totalChars;
+            const lineDelay = Math.max(150, ttsDurationMs * lineRatio);
+            await new Promise(r => setTimeout(r, lineDelay));
+          }
+        }
+      } else {
         setHistory(prev => {
           const next = prev.map(h => h.id === baseId ? { ...h, text: fullText } : h);
           historyRef.current = next;
@@ -246,69 +314,13 @@ const DebateScreen = ({
         });
       }
 
-      // 마지막 줄 표시 후 최소 대기 (짧은 발언도 읽을 시간 확보)
-      const lastLineLen = lines.length > 0 ? lines[lines.length - 1].length : 10;
-      await new Promise(r => setTimeout(r, Math.max(400, lastLineLen * 10)));
       setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
 
-      // TTS: 텍스트 표시 완료 후 즉시 실행하고 완료까지 대기
-      // → 다음 발언 텍스트가 TTS보다 먼저 나오는 현상 방지
-      if (ttsEnabledRef.current && fullText) {
-        const hanjaMap = {
-          '愼重|慎重': '신중', '重要': '중요', '重大': '중대',
-          '必要': '필요', '可能': '가능', '不可能': '불가능',
-          '現在': '현재', '現實': '현실', '未來': '미래',
-          '社會': '사회', '國家': '국가', '政府': '정부',
-          '經濟': '경제', '政策': '정책', '制度': '제도',
-          '問題': '문제', '解決': '해결', '方法': '방법',
-          '結果': '결과', '原因': '원인', '根據': '근거',
-          '主張': '주장', '反對': '반대', '贊成': '찬성',
-          '分析': '분석', '判斷': '판단', '決定': '결정',
-          '效率': '효율', '效果': '효과', '影響': '영향',
-          '基準': '기준', '原則': '원칙', '價値': '가치',
-          '自由': '자유', '平等': '평등', '正義': '정의',
-          '安全': '안전', '危險': '위험', '保護': '보호',
-          '發展': '발전', '成長': '성장', '改善': '개선',
-          '統計': '통계', '資料': '자료', '報告': '보고',
-          '議員': '의원', '議長': '의장', '本議員': '본의원',
-          '贊反': '찬반', '論議': '논의', '討論': '토론',
-          '强調': '강조', '指摘': '지적', '提示': '제시',
-          '具體': '구체', '抽象': '추상', '複雜': '복잡',
-          '簡單': '간단', '明確': '명확', '不明確': '불명확',
-        };
-        let converted = fullText;
-        Object.entries(hanjaMap).forEach(([hanja, hangul]) => {
-          converted = converted.replace(new RegExp(hanja, 'g'), hangul);
-        });
-        const clean = converted
-          .replace(/\[REFUTE\]|\[ADMIT\]|\[DATA\]|\[GRAPHIC\]|\[TABLE\]/g, "")
-          .replace(/Gemini/gi, "제미나이")
-          .replace(/Llama4?/gi, "라마")
-          .replace(/Mistral/gi, "미스트랄")
-          .replace(/GPT.?OSS/gi, "지피티")
-          .replace(/Nemotron/gi, "엔비디아")
-          // 수학기호 → 한글 (TTS 오독 방지)
-          .replace(/≥/g, "이상")
-          .replace(/≤/g, "이하")
-          .replace(/>/g,  "초과")
-          .replace(/</g,  "미만")
-          .replace(/={2,}/g, "동일")
-          .replace(/\*{2}/g, "")           // **별표별표** 제거
-          .replace(/\*/g,   "")            // 단독 별표 제거
-          .replace(/[\u4E00-\u9FFF\u3400-\u4DBF]+/g, "")
-          .replace(/\uFE0F/g, '')
-          .replace(/(?:^|\n)\s*-\s*/g, '\n')
-          // 테이블 구분선 제거 (|---|---|)
-          .replace(/\|[-:| ]+\|/g, "")
-          // 테이블 셀 구분자 → 쉼표로 (| A | B | → A, B)
-          .replace(/\|/g, " ")
-          .trim();
-        if (clean) {
-          const { pitch, rate, volume, voice } = await getVoiceSettings(data.memberId);
-          await speakAndWaitSafe(clean, { language: 'ko-KR', pitch, rate, volume, voice });
-        }
-      } else if (!ttsEnabledRef.current) {
-        // TTS 꺼져 있어도 발언 간격은 유지
+      // 텍스트가 먼저 끝난 경우 TTS 완료까지 대기 (다음 발언 차단)
+      await ttsPromise;
+
+      // TTS 꺼져 있으면 최소 간격 유지
+      if (!ttsEnabledRef.current) {
         await new Promise(r => setTimeout(r, 600));
       }
 
