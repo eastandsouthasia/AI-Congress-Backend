@@ -327,7 +327,14 @@ const DebateScreen = ({
       setStatus("다음 발언 준비 중...");
 
       // 발언 카드 간 여백
-      await new Promise(r => setTimeout(r, 600));
+      await new Promise(r => setTimeout(r, 400));
+
+      // 백엔드에 ACK 전송 — 다음 발언을 보내도 좋다는 신호
+      try {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: "ready" }));
+        }
+      } catch (e) { console.warn("[ACK] 전송 실패:", e); }
     }
 
     speechBusy.current = false;

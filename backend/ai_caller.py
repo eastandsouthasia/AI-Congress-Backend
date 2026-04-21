@@ -297,8 +297,8 @@ async def call_openrouter(
 
 # ai_caller.py
 MEMBER_ENGINE_MAP = {
-    "gemini":   {"engine": "gemini",      "model": "gemini-2.5-pro"},
-    "llama4":   {"engine": "groq",        "model": "meta-llama/llama-4-scout-17b-16e-instruct"},
+    "gemini":   {"engine": "gemini",      "model": "gemini-2.5-flash"},
+    "llama4":   {"engine": "groq",        "model": "llama-3.3-70b-versatile"},
     "mistral":  {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},
     "gptoss":   {"engine": "openrouter",  "model": "qwen/qwen3-8b:free"},             # gpt-oss-120b 불안정 → qwen3-8b (빠름)
     "nemotron": {"engine": "groq",        "model": "llama-3.3-70b-versatile"},        # nemotron-253b 타임아웃 → groq llama (빠름)
