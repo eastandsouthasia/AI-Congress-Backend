@@ -66,12 +66,19 @@ const speakAndWaitSafe = (text, options) => new Promise((resolve) => {
   const estimatedMs = Math.min(12000, Math.max(1500, (text.length * 70) / rate));
   const finish = () => { if (!done) { done = true; resolve(); } };
   const timeout = setTimeout(finish, estimatedMs);
-  Speech.speak(text, {
-    ...options,
-    onDone:    () => { clearTimeout(timeout); finish(); },
-    onStopped: () => { clearTimeout(timeout); finish(); },
-    onError:   () => { clearTimeout(timeout); finish(); },
-  });
+  try {
+    Speech.speak(text, {
+      ...options,
+      onDone:    () => { clearTimeout(timeout); finish(); },
+      onStopped: () => { clearTimeout(timeout); finish(); },
+      onError:   () => { clearTimeout(timeout); finish(); },
+    });
+  } catch (e) {
+    // Android Activity가 종료된 경우 (ExpoKeepAwake.activate 거부 등)
+    console.warn("[TTS] Speech.speak 실패 (activity 종료):", e?.message);
+    clearTimeout(timeout);
+    finish();
+  }
 });
 
 // 회의록 포맷
@@ -178,6 +185,13 @@ const DebateScreen = ({
   const voteResultRef = useRef(null);
   const speechQueue   = useRef([]);   // 발언 표시 큐
   const speechBusy    = useRef(false);// 발언 표시 중 여부
+  const isMountedRef  = useRef(true); // 언마운트 후 TTS 호출 방지
+
+  // 컴포넌트 언마운트 시 플래그 해제
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => { isMountedRef.current = false; };
+  }, []);
 
   // ─── 발언 표시 큐 처리: 한 번에 한 발언씩 순서대로 표시 ───
   const processSpeechQueue = useCallback(async () => {
@@ -185,6 +199,7 @@ const DebateScreen = ({
     speechBusy.current = true;
 
     while (speechQueue.current.length > 0) {
+      if (!isMountedRef.current) break; // 언마운트 후 큐 처리 중단
       const data = speechQueue.current.shift();
       const baseId   = Date.now() + Math.random();
       const fullText = data.text || "";
