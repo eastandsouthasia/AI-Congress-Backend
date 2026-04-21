@@ -114,6 +114,29 @@ class DebateEngine:
         cleaned = re.sub(r'^\s*\[[^\]]{1,30}\]\s*:\s*', '', cleaned.strip())
         return cleaned.strip() if cleaned.strip() else text.strip()
 
+    def _strip_member_intro(self, text: str) -> str:
+        """
+        AI가 발언 첫 줄에 자기 이름 또는 다른 의원 이름으로 자기소개하는 패턴 제거.
+        예:
+          "제미나이 의원입니다. 라마 의원님의 발언에…"  → "라마 의원님의 발언에…"
+          "저는 제미나이 의원입니다."                  → (빈 문자열)
+          "안녕하세요, 미스트랄 의원입니다."            → (빈 문자열)
+        버블 헤더(displayName)와 텍스트 내 발언자 불일치를 방지.
+        """
+        if not text:
+            return text
+        for m in self.members:
+            n = re.escape(m["name"])
+            for pat in [
+                rf'^{n}\s*의원입니다[.!]?\s*',
+                rf'^저는\s*{n}\s*의원입니다[.!]?\s*',
+                rf'^본\s*의원은\s*{n}\s*의원입니다[.!]?\s*',
+                rf'^안녕하세요[,\s]*{n}\s*의원입니다[.!]?\s*',
+                rf'^{n}\s*의원\s*입니다[.!]?\s*',
+            ]:
+                text = re.sub(pat, '', text, flags=re.UNICODE).strip()
+        return text.strip()
+
     async def _wait_for_ready(self, timeout: float = 60.0):
         """프론트에서 'ready' ACK가 올 때까지 대기 (최대 timeout초)"""
         try:
@@ -150,27 +173,34 @@ class DebateEngine:
                 "content": (
                     f"당신은 의장 {chair['name']}입니다. 현재 토론 형식: [{self.debate_format}]\n"
                     f"참여 의원 목록 (발언 지목 대상):\n{non_chair_list_str}\n\n"
-                    "역할: 사회자. 개인 주장 절대 금지. 지시된 사회 행위만 수행하세요.\n"
-                    f"⚠️ 절대 금지: 본인({chair['name']})을 발언자로 지목하거나 호명하지 마세요. "
-                    "의장은 사회만 봅니다.\n"
+                    "역할: 사회자. 반드시 지시된 사회 멘트만 출력하세요.\n"
+                    "⚠️ 절대 금지 사항:\n"
+                    f"  1. 본인({chair['name']})을 발언자로 지목하거나 호명하는 것\n"
+                    "  2. 의원의 발언 내용을 대신 생성하거나 이어 쓰는 것\n"
+                    "     — 의원을 지목한 뒤 그 의원이 할 말을 절대 이어서 쓰지 마세요.\n"
+                    "  3. 개인 주장이나 의견 표명\n"
                     f"발언 지목 시 반드시 위 목록에 있는 의원 이름만 사용하세요.\n"
                     f"{max_chars}자 이내. 완전한 문장으로. 공식적인 의회 어투로."
                 )
             },
             {
                 "role": "user",
-                "content": f"안건: \"{self.issue}\"\n\n사회 지시: {instruction}\n\n지금 발언하세요."
+                "content": f"안건: \"{self.issue}\"\n\n사회 지시: {instruction}\n\n의장으로서 사회 멘트만 출력하세요."
             }
         ]
         try:
             result = await call_member(chair, messages, temperature=0.3)
             cleaned = self._strip_prefix(result)
-            # ── 사후 안전망: AI가 의장 자신을 지목하는 문구 제거 ──
             cleaned = self._remove_self_nomination(cleaned, chair)
+            # 지나치게 길면 의원 발언을 이어 쓴 것으로 간주 → 첫 문장까지만 사용
+            if len(cleaned) > max_chars * 1.5:
+                import re as _re
+                parts = _re.split(r'(?<=[.!?。！？])\s+', cleaned)
+                cleaned = parts[0] if parts else cleaned[:max_chars]
             return cleaned
         except Exception as e:
             print(f"[의장 사회] 실패: {e}")
-            return instruction
+            return "지금부터 발언을 시작하겠습니다."
 
     @staticmethod
     def _remove_self_nomination(text: str, chair: dict) -> str:
@@ -400,7 +430,8 @@ class DebateEngine:
             "- 이미 나온 주장 반복 금지. 당신의 학습 기반 고유의 새 관점·데이터를 추가하라.\n"
             "- 다른 의원과 같은 결론이라도 반드시 다른 근거와 다른 언어로 표현하라.\n"
             "- 반드시 마침표·느낌표·물음표로 완전히 끝내세요.\n"
-            "- 자신을 '본 의원'이라 하세요.\n"
+            "- 자신을 '본 의원'이라 하세요. 절대로 자신의 이름을 발언 속에서 쓰지 마세요.\n"
+            f"- ⚠️ 발언을 '{member['name']} 의원입니다' 또는 '저는 {member['name']}입니다' 등 자기소개로 시작하지 마세요. 바로 주장으로 시작하세요.\n"
             f"- 의장: '{chair_name} 의장님' / 다른 의원: '○○ 의원님'\n"
             f"- ⚠️ '{chair_name} 의장님께서 다음으로 발언하시길…' 등 의장에게 발언을 요구하거나 지목하는 표현 금지.\n"
             "- [ADMIT] 후에는 수정된 입장을 이후 발언에서 일관되게 유지하세요.\n"
@@ -417,6 +448,7 @@ class DebateEngine:
             try:
                 result = await call_member(member, messages, temperature=temperature)
                 result = self._strip_prefix(result)
+                result = self._strip_member_intro(result)   # 자기소개형 시작 제거
                 if result and len(result) > 10:
                     return result
                 print(f"[{member['name']}] 응답 비정상(시도 {attempt+1}): {repr(result)}")
