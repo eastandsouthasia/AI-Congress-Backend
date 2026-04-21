@@ -191,6 +191,7 @@ export default function VoteReportScreen({ issue, result, history, members, onCl
   const slideAnim = useRef(new Animated.Value(40)).current;
   const sealAnim  = useRef(new Animated.Value(0)).current;
   const [isSaving, setIsSaving] = useState(false);
+  const [showReplay, setShowReplay] = useState(false); // 다시보기 모달
 
   // 입장 애니메이션
   useEffect(() => {
@@ -219,6 +220,40 @@ export default function VoteReportScreen({ issue, result, history, members, onCl
       await saveReport(issue, result, history);
     } catch (e) {
       Alert.alert('내보내기 실패', e.message || '오류가 발생했습니다.\nAPK 빌드 후 정상 작동합니다.');
+    } finally {
+      setIsSaving(false);
+    }
+  }, [issue, result, history, isSaving]);
+
+  // 공유: 다른 앱으로 텍스트 전송
+  const handleShare = useCallback(async () => {
+    try {
+      const text = buildReportText(issue, result, history);
+      const { Share } = require('react-native');
+      await Share.share({ message: text, title: `AI 의회 의결보고서: ${issue}` });
+    } catch (e) {
+      Alert.alert('공유 실패', e.message || '공유할 수 없습니다.');
+    }
+  }, [issue, result, history]);
+
+  // 다운로드: 파일로 저장
+  const handleDownload = useCallback(async () => {
+    if (isSaving) return;
+    setIsSaving(true);
+    try {
+      const text = buildReportText(issue, result, history);
+      const fileName = `AI_의결보고서_${Date.now()}.txt`;
+      const baseDir = FileSystem.documentDirectory || FileSystem.cacheDirectory;
+      const fileUri = baseDir + fileName;
+      await FileSystem.writeAsStringAsync(fileUri, text, { encoding: FileSystem.EncodingType.UTF8 });
+      const canShare = await Sharing.isAvailableAsync();
+      if (canShare) {
+        await Sharing.shareAsync(fileUri, { mimeType: 'text/plain', dialogTitle: '파일 저장' });
+      } else {
+        Alert.alert('저장 완료', `파일 경로:\n${fileUri}`);
+      }
+    } catch (e) {
+      Alert.alert('다운로드 실패', e.message || '파일을 저장할 수 없습니다.');
     } finally {
       setIsSaving(false);
     }
@@ -387,24 +422,61 @@ export default function VoteReportScreen({ issue, result, history, members, onCl
           <View style={{ height: 32 }} />
         </ScrollView>
 
-        {/* ── 하단 버튼 ── */}
+        {/* ── 하단 버튼 4개 ── */}
         <View style={styles.footer}>
-          <TouchableOpacity
-            style={[styles.footerBtn, styles.footerBtnClose]}
-            onPress={onClose}
-          >
-            <Text style={styles.footerBtnText}>닫  기</Text>
+          <TouchableOpacity style={[styles.footerBtn, styles.footerBtnClose]} onPress={onClose}>
+            <Text style={styles.footerBtnText}>✕{'\n'}닫기</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.footerBtn, styles.footerBtnReplay]} onPress={() => setShowReplay(true)}>
+            <Text style={styles.footerBtnText}>👁{'\n'}다시보기</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.footerBtn, styles.footerBtnShare]} onPress={handleShare}>
+            <Text style={styles.footerBtnText}>📤{'\n'}공유</Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.footerBtn, styles.footerBtnSave, isSaving && styles.footerBtnDisabled]}
-            onPress={handleSave}
+            onPress={handleDownload}
             disabled={isSaving}
           >
             <Text style={[styles.footerBtnText, { color: C.bg }]}>
-              {isSaving ? '처리 중...' : '📤  내보내기'}
+              {isSaving ? '...' : '⬇'}{'\n'}{isSaving ? '처리중' : '내려받기'}
             </Text>
           </TouchableOpacity>
         </View>
+
+        {/* ── 다시보기 모달 (토론 회의록) ── */}
+        {showReplay && (
+          <View style={styles.replayOverlay}>
+            <View style={styles.replaySheet}>
+              <View style={styles.replayHeader}>
+                <Text style={styles.replayTitle}>📜 토론 회의록</Text>
+                <Text style={styles.replayIssue} numberOfLines={1}>{issue}</Text>
+                <TouchableOpacity onPress={() => setShowReplay(false)} style={styles.replayCloseBtn}>
+                  <Text style={styles.replayCloseText}>✕ 닫기</Text>
+                </TouchableOpacity>
+              </View>
+              <ScrollView style={styles.replayScroll} contentContainerStyle={{ padding: 14 }}>
+                {(history || []).map((h, i) => {
+                  const member = members?.find(m => m.id === h.memberId);
+                  const color = h.color || member?.color || C.gold;
+                  const tag = h.type === 'REFUTE' ? '⚔반박' : h.type === 'ADMIT' ? '✅수용' : null;
+                  return (
+                    <View key={i} style={[styles.replayCard, { borderLeftColor: color + "99" }]}>
+                      <View style={styles.replayCardHeader}>
+                        <Text style={[styles.replayCardNum, { color: C.goldDim }]}>{i + 1}</Text>
+                        <Text style={[styles.replayCardName, { color }]}>{h.avatar || '💬'} {h.displayName}</Text>
+                        {tag && <Text style={styles.replayTag}>{tag}</Text>}
+                        {h.timestamp && <Text style={styles.replayTime}>{h.timestamp}</Text>}
+                      </View>
+                      <Text style={styles.replayText}>{h.text}</Text>
+                    </View>
+                  );
+                })}
+                <View style={{ height: 40 }} />
+              </ScrollView>
+            </View>
+          </View>
+        )}
 
       </Animated.View>
     </Animated.View>
@@ -815,23 +887,31 @@ const styles = StyleSheet.create({
   // ── 하단 버튼 ──
   footer: {
     flexDirection: 'row',
-    padding: 12,
-    gap: 10,
+    padding: 10,
+    gap: 8,
     borderTopWidth: 1,
     borderTopColor: C.borderGold,
     backgroundColor: C.headerBg,
   },
   footerBtn: {
     flex: 1,
-    paddingVertical: 13,
-    borderRadius: 4,
+    paddingVertical: 10,
+    borderRadius: 6,
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
   },
   footerBtnClose: {
-    backgroundColor: '#1a1a1a',
+    backgroundColor: '#12141a',
     borderColor: C.borderGold,
+  },
+  footerBtnReplay: {
+    backgroundColor: '#0d1828',
+    borderColor: '#2980b966',
+  },
+  footerBtnShare: {
+    backgroundColor: '#0d1e12',
+    borderColor: '#27ae6066',
   },
   footerBtnSave: {
     backgroundColor: C.gold,
@@ -843,8 +923,60 @@ const styles = StyleSheet.create({
   },
   footerBtnText: {
     color: C.gold,
-    fontSize: 13,
+    fontSize: 10,
     fontWeight: '800',
-    letterSpacing: 2,
+    letterSpacing: 1,
+    textAlign: 'center',
+    lineHeight: 15,
   },
+
+  // ── 다시보기 모달 ──
+  replayOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.92)',
+    zIndex: 10,
+    justifyContent: 'flex-end',
+  },
+  replaySheet: {
+    backgroundColor: '#0d1018',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    borderTopWidth: 2,
+    borderTopColor: C.goldDim,
+    maxHeight: '90%',
+    flex: 1,
+    marginTop: 60,
+  },
+  replayHeader: {
+    backgroundColor: C.headerBg,
+    padding: 16,
+    paddingTop: 20,
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: C.borderGold,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  replayTitle: { color: C.goldLight, fontSize: 14, fontWeight: '800', letterSpacing: 1 },
+  replayIssue: { flex: 1, color: C.textMuted, fontSize: 10 },
+  replayCloseBtn: { paddingHorizontal: 10, paddingVertical: 5, backgroundColor: '#1a1a1a', borderRadius: 6, borderWidth: 1, borderColor: C.borderGold },
+  replayCloseText: { color: C.gold, fontSize: 11, fontWeight: '700' },
+  replayScroll: { flex: 1 },
+  replayCard: {
+    borderLeftWidth: 3,
+    paddingLeft: 12,
+    paddingVertical: 10,
+    marginBottom: 10,
+    backgroundColor: '#0c0f16',
+    borderRadius: 6,
+    paddingRight: 10,
+  },
+  replayCardHeader: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 5, flexWrap: 'wrap' },
+  replayCardNum: { fontSize: 10, fontWeight: '700', width: 20 },
+  replayCardName: { fontSize: 11, fontWeight: '700', flex: 1 },
+  replayTag: { fontSize: 9, color: C.gold, backgroundColor: C.borderGold, borderRadius: 3, paddingHorizontal: 5, paddingVertical: 1 },
+  replayTime: { fontSize: 9, color: C.textDark, fontWeight: '600' },
+  replayText: { color: '#aab0c0', fontSize: 12, lineHeight: 18 },
 });

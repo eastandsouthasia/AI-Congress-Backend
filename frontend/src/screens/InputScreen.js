@@ -180,78 +180,90 @@ export default function InputScreen({ onStart, onShowHistory }) {
 
 const GOLD   = "#c9a84c";
 const GOLD2  = "#e8cc7a";
-const NAVY   = "#0a0e1a";
-const NAVY2  = "#0f1420";
-const PANEL  = "#141928";
+const NAVY   = "#080c14";
+const NAVY2  = "#0c1020";
+const PANEL  = "#10151f";
+const PANEL2 = "#161d2b";
+const SLATE  = "#1c2436";
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: NAVY },
 
   /* ── 헤더 ── */
   heroHeader: {
-    backgroundColor: NAVY,
+    backgroundColor: PANEL,
     alignItems: "center",
-    paddingTop: 10,
-    paddingBottom: 16,
+    paddingTop: 16,
+    paddingBottom: 20,
     borderBottomWidth: 1,
-    borderBottomColor: GOLD + "44",
+    borderBottomColor: GOLD + "33",
   },
-  heroTop:    { marginBottom: 4 },
-  pillars:    { fontSize: 10, color: GOLD + "66", letterSpacing: 6 },
-  heroTitle:  { fontSize: 28, fontWeight: "900", color: GOLD2, letterSpacing: 4 },
-  heroSub:    { fontSize: 9, color: GOLD + "88", letterSpacing: 5, marginTop: 2 },
-  heroDivider:{ width: 80, height: 1, backgroundColor: GOLD + "55", marginTop: 10 },
+  heroTop:    { marginBottom: 6 },
+  pillars:    { fontSize: 9, color: GOLD + "55", letterSpacing: 8 },
+  heroTitle:  { fontSize: 30, fontWeight: "900", color: GOLD2, letterSpacing: 5, textShadowColor: GOLD + "44", textShadowOffset: { width: 0, height: 0 }, textShadowRadius: 8 },
+  heroSub:    { fontSize: 9, color: GOLD + "77", letterSpacing: 5, marginTop: 3 },
+  heroDivider:{ width: 60, height: 1, backgroundColor: GOLD + "44", marginTop: 12 },
 
   scroll:  { flex: 1 },
-  content: { padding: 20 },
+  content: { padding: 18, paddingTop: 20 },
 
   /* ── 섹션 ── */
-  section:       { marginBottom: 22 },
+  section:       { marginBottom: 24 },
   sectionHeader: { flexDirection: "row", alignItems: "center", marginBottom: 10 },
-  sectionDot:    { width: 3, height: 14, backgroundColor: GOLD, borderRadius: 2, marginRight: 8 },
-  label:         { color: GOLD2, fontSize: 12, fontWeight: "700", letterSpacing: 3 },
-  labelCount:    { color: COLORS.textMuted, fontSize: 11, fontWeight: "400" },
+  sectionDot:    { width: 2, height: 14, backgroundColor: GOLD, borderRadius: 1, marginRight: 10 },
+  label:         { color: GOLD2, fontSize: 11, fontWeight: "800", letterSpacing: 3 },
+  labelCount:    { color: "#3a4560", fontSize: 11, fontWeight: "400" },
 
   input: {
     backgroundColor: PANEL,
-    color: "#e8e8e8",
-    borderRadius: 8, padding: 14,
-    borderWidth: 1, borderColor: GOLD + "44",
-    fontSize: 14, minHeight: 80, textAlignVertical: "top",
+    color: "#c8d4e8",
+    borderRadius: 10, padding: 14,
+    borderWidth: 1, borderColor: GOLD + "33",
+    fontSize: 14, minHeight: 88, textAlignVertical: "top",
+    lineHeight: 22,
   },
 
   /* ── 칩 ── */
   row:            { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  chip:           { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 6, borderWidth: 1, borderColor: GOLD + "44", backgroundColor: PANEL },
-  chipActive:     { backgroundColor: GOLD, borderColor: GOLD },
-  chipText:       { color: GOLD + "cc", fontSize: 13 },
-  chipTextActive: { color: NAVY, fontWeight: "800" },
+  chip: {
+    paddingHorizontal: 14, paddingVertical: 9, borderRadius: 8,
+    borderWidth: 1, borderColor: "#2a3448",
+    backgroundColor: PANEL,
+  },
+  chipActive:     { backgroundColor: GOLD + "22", borderColor: GOLD + "88" },
+  chipText:       { color: "#4a5a78", fontSize: 12, fontWeight: "600" },
+  chipTextActive: { color: GOLD2, fontWeight: "800" },
 
   /* ── 의원 그리드 ── */
   memberGrid: { flexDirection: "row", flexWrap: "wrap", gap: 10 },
   memberCard: {
     width: "47%", flexDirection: "row", alignItems: "center",
-    backgroundColor: PANEL, borderRadius: 8,
-    borderWidth: 1, borderColor: "#ffffff11",
-    paddingHorizontal: 10, paddingVertical: 10, gap: 8,
+    backgroundColor: PANEL, borderRadius: 10,
+    borderWidth: 1, borderColor: "#1c2436",
+    paddingHorizontal: 12, paddingVertical: 11, gap: 10,
   },
   memberAvatar:    { fontSize: 20 },
-  memberName:      { flex: 1, fontSize: 12, fontWeight: "600" },
-  memberCheck:     { width: 18, height: 18, borderRadius: 9, borderWidth: 1, borderColor: "#ffffff33", alignItems: "center", justifyContent: "center" },
-  memberCheckText: { color: "#fff", fontSize: 11, fontWeight: "900" },
+  memberName:      { flex: 1, fontSize: 12, fontWeight: "700" },
+  memberCheck:     {
+    width: 20, height: 20, borderRadius: 10,
+    borderWidth: 1, borderColor: "#2a3448",
+    alignItems: "center", justifyContent: "center",
+  },
+  memberCheckText: { color: "#fff", fontSize: 12, fontWeight: "900" },
 
   /* ── 시작 버튼 ── */
   startBtn: {
-    borderRadius: 10, marginTop: 8, overflow: "hidden",
+    borderRadius: 12, marginTop: 6, overflow: "hidden",
     backgroundColor: GOLD,
-    borderWidth: 1, borderColor: GOLD2,
+    shadowColor: GOLD, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 12,
+    elevation: 8,
   },
-  startBtnDisabled: { opacity: 0.35 },
-  startBtnInner:    { flexDirection: "row", alignItems: "center", justifyContent: "center", padding: 18, gap: 10 },
+  startBtnDisabled: { opacity: 0.3 },
+  startBtnInner:    { flexDirection: "row", alignItems: "center", justifyContent: "center", padding: 18, gap: 12 },
   startGavel:       { fontSize: 20 },
-  startText:        { color: NAVY, fontWeight: "900", fontSize: 17, letterSpacing: 3 },
+  startText:        { color: NAVY, fontWeight: "900", fontSize: 16, letterSpacing: 4 },
 
   /* ── 보관함 버튼 ── */
-  historyBtn:  { alignItems: "center", marginTop: 14, padding: 12, borderRadius: 8, borderWidth: 1, borderColor: GOLD + "33" },
-  historyText: { color: GOLD + "99", fontSize: 13, letterSpacing: 2 },
+  historyBtn:  { alignItems: "center", marginTop: 14, padding: 14, borderRadius: 10, borderWidth: 1, borderColor: "#1c2436", backgroundColor: PANEL },
+  historyText: { color: "#3a4560", fontSize: 12, letterSpacing: 2, fontWeight: "600" },
 });

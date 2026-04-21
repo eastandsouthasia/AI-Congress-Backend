@@ -15,6 +15,7 @@ export default function App() {
   // ✅ 참여 의원 ID 목록 (기본: 전원)
   const [activeMembers, setActiveMembers]   = useState(MEMBERS.map(m => m.id));
   const [result, setResult]           = useState(null);
+  const [debateHistory, setDebateHistory] = useState([]);
 
   // ✅ activeMembers까지 5번째 파라미터로 수신
   const handleStart = (
@@ -34,6 +35,7 @@ export default function App() {
 
   const handleFinish = (finalResult) => {
     setResult(finalResult);
+    setDebateHistory(finalResult?.history || []);
     setScreen("voting");
   };
 
@@ -63,7 +65,9 @@ export default function App() {
         <VotingScreen
           issue={issue}
           result={result}
-          onReset={() => { setResult(null); setScreen("input"); }}
+          history={debateHistory}
+          members={MEMBERS}
+          onClose={() => { setResult(null); setDebateHistory([]); setScreen("input"); }}
         />
       )}
 

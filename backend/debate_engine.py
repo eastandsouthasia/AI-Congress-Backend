@@ -92,6 +92,8 @@ class DebateEngine:
         display     = f"의장 {member['name']}" if is_chair else f"{member['name']} 의원"
         model_str   = member.get("model", "?")
         engine_info = f"{member.get('engine','?')}/{model_str.split('/')[-1]}"
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         await self.send(
             "speech",
             memberId    = member["id"],
@@ -101,6 +103,7 @@ class DebateEngine:
             engineInfo  = engine_info,
             color       = member.get("color", "#ffffff"),
             avatar      = member.get("avatar", "💬"),
+            timestamp   = timestamp,
         )
         self.speech_count[member["id"]] = self.speech_count.get(member["id"], 0) + 1
         if skip_wait:
@@ -769,13 +772,16 @@ class DebateEngine:
 
         # 개회사 + 1라운드 선언 + 첫 의원 지목을 하나로 통합
         open_instruction = (
-            f"안건 \"{self.issue}\"에 대한 릴레이 토론을 개회합니다. "
-            f"총 {self.rounds}라운드로 진행되며, 의장 지목 순서에 따라 균등하게 발언합니다. "
-            f"1라운드를 시작합니다."
+            f"지금부터 AI 의회 본회의를 개회합니다. "
+            f"오늘 상정된 안건은 \"{self.issue}\"입니다. "
+            f"이 안건은 우리 사회에서 중요한 의미를 지니며, 다양한 관점에서 심도 있는 논의가 필요합니다. "
+            f"본 토론은 {self.rounds}라운드 릴레이 형식으로 진행되며, 총 {duration}분이 주어집니다. "
+            f"의원 여러분은 각자의 전문 지식과 학습 데이터를 바탕으로 논거를 제시해 주시기 바랍니다. "
+            f"이제 제1라운드를 시작합니다."
         )
         if first_member:
-            open_instruction += f" 첫 번째로 {first_member['name']} 의원님, 의견을 개진해 주십시오."
-        open_text = await self.chair_speak(chair, open_instruction, max_chars=CHAIR_MAX_LEN + 50)
+            open_instruction += f" 첫 번째 발언자로 {first_member['name']} 의원님께 발언권을 드립니다."
+        open_text = await self.chair_speak(chair, open_instruction, max_chars=CHAIR_MAX_LEN + 150)
         self.ctx.push(f"[의장 {chair['name']}]", open_text)
         await self.send_speech(chair, open_text, "NORMAL", True)
 
@@ -941,11 +947,12 @@ class DebateEngine:
 
         open_text = await self.chair_speak(
             chair,
-            f"안건 \"{self.issue}\"에 대한 집중토론을 개회합니다. "
-            f"핵심 토론자는 {d_names}입니다. "
-            f"{self.rounds}라운드에 걸쳐 집중 대결하며, 나머지 의원께서는 이후 질의 시간까지 대기해 주십시오. "
+            f"지금부터 AI 의회 본회의를 개회합니다. "
+            f"오늘 상정된 안건은 \"{self.issue}\"이며, 이는 면밀한 검토와 논의가 요구되는 사안입니다. "
+            f"본 토론은 집중토론 형식으로, 핵심 토론자인 {d_names}께서 {self.rounds}라운드에 걸쳐 집중 대결합니다. "
+            f"그 외 의원들은 이후 질의 시간에 발언 기회가 주어집니다. "
             f"1라운드를 시작합니다. 먼저 {debaters[0]['name']} 의원님, 발언해 주십시오.",
-            max_chars=CHAIR_MAX_LEN + 50,
+            max_chars=CHAIR_MAX_LEN + 150,
         )
         self.ctx.push(f"[의장 {chair['name']}]", open_text)
         await self.send_speech(chair, open_text, "NORMAL", True)
@@ -1177,11 +1184,14 @@ class DebateEngine:
 
         open_text = await self.chair_speak(
             chair,
-            f"안건 \"{self.issue}\"에 대한 자유토론을 개회합니다. "
-            f"총 {deadline_mins}분 또는 최대 {self.max_free_turns}회 발언까지 "
+            f"지금부터 AI 의회 본회의를 개회합니다. "
+            f"오늘 상정된 안건은 \"{self.issue}\"입니다. "
+            f"이 안건은 다양한 관점에서 심층적 검토가 필요한 사안으로, "
+            f"본 의회는 자유토론 형식으로 논의를 진행합니다. "
+            f"총 {deadline_mins}분 또는 최대 {self.max_free_turns}회 발언 한도 내에서 "
             "순서 제한 없이 자유롭게 발언하실 수 있습니다. "
             "시간 또는 발언 한도 종료 후에는 즉시 최종 의결로 이행합니다.",
-            max_chars=CHAIR_MAX_LEN,
+            max_chars=CHAIR_MAX_LEN + 150,
         )
         self.ctx.push(f"[의장 {chair['name']}]", open_text)
         await self.send_speech(chair, open_text, "NORMAL", True)

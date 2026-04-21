@@ -221,6 +221,7 @@ const DebateScreen = ({
           engineInfo:  data.engineInfo  || "",
           color:       data.color       || COLORS.border,
           avatar:      data.avatar      || "💬",
+          timestamp:   data.timestamp   || new Date().toLocaleTimeString('ko-KR', {hour:'2-digit',minute:'2-digit',second:'2-digit'}),
         }];
         historyRef.current = next;
         return next;
@@ -457,38 +458,51 @@ const DebateScreen = ({
 
   return (
     <View style={styles.container}>
-      <View style={styles.statusRow}>
-        <Text style={styles.status} numberOfLines={2}>{status}</Text>
-        <Text style={[styles.formatBadge, debateFormat === "자유토론" && styles.formatBadgeFree]}>
-          {debateFormat === "릴레이" ? "🔄"
-            : debateFormat === "집중토론" ? "⚡"
-            : debateFormat === "전문가패널" ? "🎓"
-            : "🌀"} {debateFormat}
-        </Text>
-        <Text style={styles.durationBadge}>⏱ {duration}분</Text>
+      {/* 상단 헤더 */}
+      <View style={styles.header}>
+        <View style={styles.headerLeft}>
+          <Text style={styles.headerTitle}>🏛 AI 의회</Text>
+          <Text style={styles.headerIssue} numberOfLines={1}>{issue}</Text>
+        </View>
+        <View style={styles.headerRight}>
+          <View style={[styles.badge, debateFormat === "자유토론" && styles.badgePurple]}>
+            <Text style={styles.badgeText}>
+              {debateFormat === "릴레이" ? "🔄" : debateFormat === "집중토론" ? "⚡" : debateFormat === "전문가패널" ? "🎓" : "🌀"} {debateFormat}
+            </Text>
+          </View>
+          <View style={styles.badge}>
+            <Text style={styles.badgeText}>⏱ {duration}분</Text>
+          </View>
+          <TouchableOpacity
+            style={[styles.iconBtn, !ttsEnabled && styles.iconBtnOff]}
+            onPress={() => {
+              Speech.stop();
+              const next = !ttsEnabled;
+              setTtsEnabled(next);
+              ttsEnabledRef.current = next;
+            }}
+          >
+            <Text style={styles.iconBtnText}>{ttsEnabled ? "🔊" : "🔇"}</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      {/* 상태 바 */}
+      <View style={styles.statusBar}>
+        <View style={styles.statusDot} />
+        <Text style={styles.statusText} numberOfLines={1}>{status}</Text>
         {isFinished && (
           <TouchableOpacity
-            style={[styles.saveBtn, isSaving && styles.saveBtnDisabled]}
+            style={[styles.actionBtn, isSaving && styles.actionBtnDisabled]}
             onPress={downloadDebateLog}
             disabled={isSaving}
           >
-            <Text style={styles.saveBtnText}>{isSaving ? "저장 중..." : "📤 내보내기"}</Text>
+            <Text style={styles.actionBtnText}>{isSaving ? "처리 중..." : "📤 내보내기"}</Text>
           </TouchableOpacity>
         )}
-        <TouchableOpacity
-          style={[styles.ttsBtn, !ttsEnabled && styles.ttsBtnOff]}
-          onPress={() => {
-            Speech.stop();
-            const next = !ttsEnabled;
-            setTtsEnabled(next);
-            ttsEnabledRef.current = next;
-          }}
-        >
-          <Text style={styles.ttsBtnText}>{ttsEnabled ? "🔊" : "🔇"}</Text>
-        </TouchableOpacity>
       </View>
 
-      <ScrollView ref={scrollRef} style={styles.scroll}>
+      <ScrollView ref={scrollRef} style={styles.scroll} contentContainerStyle={styles.scrollContent}>
         {history.map((h, i) => {
           const member = MEMBERS.find(m => m.id === h.memberId);
           const color = h.color || member?.color || COLORS.border;
@@ -497,25 +511,36 @@ const DebateScreen = ({
           if (isRoundHeader) {
             return (
               <View key={h.id || i} style={styles.roundHeader}>
+                <View style={styles.roundHeaderLine} />
                 <Text style={styles.roundHeaderText}>{h.text}</Text>
+                <View style={styles.roundHeaderLine} />
               </View>
             );
           }
+
+          const isChair = h.displayName?.startsWith("의장");
 
           return (
             <View key={h.id || i} style={[
               styles.card,
               { borderLeftColor: color },
               h.type === "REFUTE" && styles.cardRefute,
-              h.type === "ADMIT" && styles.cardAdmit,
+              h.type === "ADMIT"  && styles.cardAdmit,
+              isChair && styles.cardChair,
             ]}>
-              <View style={styles.nameRow}>
-                <Text style={[styles.name, { color }]}>
-                  {h.avatar || member?.avatar || "💬"} {h.displayName}
-                </Text>
-                {!!h.engineInfo && <Text style={styles.engineBadge}>{h.engineInfo}</Text>}
-                {h.type === "REFUTE" && <Text style={styles.refuteBadge}>⚔ 반박</Text>}
-                {h.type === "ADMIT" && <Text style={styles.admitBadge}>✅ 수용</Text>}
+              <View style={styles.cardHeader}>
+                <View style={styles.avatarWrap}>
+                  <Text style={styles.avatar}>{h.avatar || member?.avatar || "💬"}</Text>
+                </View>
+                <View style={styles.nameWrap}>
+                  <Text style={[styles.name, { color }]}>{h.displayName}</Text>
+                  {!!h.engineInfo && <Text style={styles.engineBadge}>{h.engineInfo}</Text>}
+                </View>
+                <View style={styles.metaRight}>
+                  {h.type === "REFUTE" && <View style={styles.typeBadgeRefute}><Text style={styles.typeBadgeText}>⚔ 반박</Text></View>}
+                  {h.type === "ADMIT"  && <View style={styles.typeBadgeAdmit}><Text style={styles.typeBadgeText}>✅ 수용</Text></View>}
+                  {!!h.timestamp && <Text style={styles.timestamp}>{h.timestamp}</Text>}
+                </View>
               </View>
               {parseSegments(h.text).map((seg, si) => {
                 if (seg.type === 'data') return (
@@ -534,51 +559,111 @@ const DebateScreen = ({
                     <Text style={styles.tableText}>{seg.content}</Text>
                   </View>
                 );
-                return <Text key={si} style={styles.text}>{seg.content}</Text>;
+                return <Text key={si} style={[styles.text, isChair && styles.textChair]}>{seg.content}</Text>;
               })}
             </View>
           );
         })}
-        <View style={{ height: 30 }} />
+        <View style={{ height: 40 }} />
       </ScrollView>
     </View>
   );
 };
 
+const GOLD = "#c9a84c";
+const GOLD2 = "#e8cc7a";
+const NAVY = "#080c14";
+const PANEL = "#10151f";
+const PANEL2 = "#161d2b";
+const SLATE = "#1c2436";
+
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: COLORS.background, paddingTop: 50, paddingHorizontal: 16 },
-  statusRow: { flexDirection: "row", alignItems: "center", marginBottom: 12, gap: 6, flexWrap: "wrap" },
-  status: { flex: 1, color: COLORS.accent, fontWeight: "bold", fontSize: 12, minWidth: 100 },
-  durationBadge: { color: COLORS.gold, fontSize: 11, fontWeight: "700", backgroundColor: "#1a1500", borderRadius: 6, paddingHorizontal: 7, paddingVertical: 4, borderWidth: 1, borderColor: COLORS.gold + "55" },
-  formatBadge: { color: COLORS.blue, fontSize: 11, fontWeight: "700", backgroundColor: "#0d1a2e", borderRadius: 6, paddingHorizontal: 7, paddingVertical: 4, borderWidth: 1, borderColor: COLORS.blue + "55" },
-  formatBadgeFree: { color: "#9b59b6", backgroundColor: "#1a0d2e", borderColor: "#9b59b6" + "55" },
-  saveBtn: { backgroundColor: COLORS.success, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6 },
-  saveBtnDisabled: { backgroundColor: COLORS.textMuted },
-  saveBtnText: { color: '#fff', fontSize: 11, fontWeight: "bold" },
-  ttsBtn: { backgroundColor: COLORS.surface2, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1, borderColor: COLORS.border2 },
-  ttsBtnOff: { borderColor: COLORS.error },
-  ttsBtnText: { fontSize: 14 },
+  container: { flex: 1, backgroundColor: NAVY },
+
+  // ── 헤더 ──
+  header: {
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    paddingTop: 52, paddingBottom: 12, paddingHorizontal: 16,
+    backgroundColor: PANEL,
+    borderBottomWidth: 1, borderBottomColor: GOLD + "33",
+  },
+  headerLeft: { flex: 1, marginRight: 10 },
+  headerTitle: { color: GOLD2, fontSize: 14, fontWeight: "900", letterSpacing: 3 },
+  headerIssue: { color: "#8899bb", fontSize: 11, marginTop: 2 },
+  headerRight: { flexDirection: "row", alignItems: "center", gap: 6 },
+
+  badge: { backgroundColor: PANEL2, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4, borderWidth: 1, borderColor: GOLD + "33" },
+  badgePurple: { borderColor: "#9b59b6" + "55", backgroundColor: "#1a0d2e" },
+  badgeText: { color: GOLD, fontSize: 10, fontWeight: "700" },
+  iconBtn: { backgroundColor: PANEL2, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1, borderColor: GOLD + "33" },
+  iconBtnOff: { borderColor: "#e74c3c55" },
+  iconBtnText: { fontSize: 14 },
+
+  // ── 상태 바 ──
+  statusBar: {
+    flexDirection: "row", alignItems: "center",
+    paddingHorizontal: 16, paddingVertical: 8,
+    backgroundColor: PANEL2,
+    borderBottomWidth: 1, borderBottomColor: "#ffffff0a",
+    gap: 8,
+  },
+  statusDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#4fc3f7" },
+  statusText: { flex: 1, color: "#7899cc", fontSize: 11, fontWeight: "600" },
+  actionBtn: { backgroundColor: "#1a3a1a", borderRadius: 6, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: "#27ae6055" },
+  actionBtnDisabled: { backgroundColor: SLATE, borderColor: "#333" },
+  actionBtnText: { color: "#27ae60", fontSize: 10, fontWeight: "700" },
+
   scroll: { flex: 1 },
+  scrollContent: { paddingHorizontal: 14, paddingTop: 12 },
 
-  roundHeader: { backgroundColor: "#1a1f2e", padding: 10, marginVertical: 8, borderRadius: 6, alignItems: "center", borderWidth: 1, borderColor: COLORS.accent + "44" },
-  roundHeaderText: { color: COLORS.accent, fontSize: 12, fontWeight: "700", letterSpacing: 1 },
+  // ── 라운드 헤더 ──
+  roundHeader: {
+    flexDirection: "row", alignItems: "center",
+    marginVertical: 14, gap: 10,
+  },
+  roundHeaderLine: { flex: 1, height: 1, backgroundColor: GOLD + "33" },
+  roundHeaderText: { color: GOLD + "aa", fontSize: 10, fontWeight: "700", letterSpacing: 2 },
 
-  card: { backgroundColor: COLORS.card, padding: 14, marginBottom: 12, borderRadius: 10, borderLeftWidth: 4 },
-  cardRefute: { backgroundColor: "#1e1010" },
-  cardAdmit: { backgroundColor: "#0f1e0f" },
-  nameRow: { flexDirection: "row", alignItems: "center", marginBottom: 6, flexWrap: "wrap", gap: 6 },
-  name: { fontSize: 11, fontWeight: "bold" },
-  engineBadge: { fontSize: 9, color: COLORS.textMuted, backgroundColor: COLORS.surface2, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 2 },
-  refuteBadge: { fontSize: 10, color: COLORS.error, fontWeight: "700" },
-  admitBadge: { fontSize: 10, color: COLORS.success, fontWeight: "700" },
-  text: { color: COLORS.text, lineHeight: 22, fontSize: 14 },
-  dataBox: { flexDirection: 'row', alignItems: 'flex-start', backgroundColor: '#0d2137', borderRadius: 6, padding: 8, marginVertical: 4, borderLeftWidth: 3, borderLeftColor: COLORS.accent },
-  dataIcon: { fontSize: 13, marginRight: 6 },
-  dataText: { flex: 1, color: COLORS.accent, fontSize: 12, fontFamily: 'monospace' },
-  graphicBox: { backgroundColor: '#0a1a0a', borderRadius: 6, padding: 10, marginVertical: 4, borderWidth: 1, borderColor: COLORS.success },
+  // ── 발언 카드 ──
+  card: {
+    backgroundColor: PANEL,
+    paddingHorizontal: 14, paddingVertical: 12,
+    marginBottom: 10, borderRadius: 10,
+    borderLeftWidth: 3,
+    borderWidth: 1, borderColor: "#ffffff08",
+  },
+  cardRefute: { backgroundColor: "#160e0e", borderColor: "#e74c3c18" },
+  cardAdmit:  { backgroundColor: "#0c160c", borderColor: "#27ae6018" },
+  cardChair:  { backgroundColor: PANEL2, borderColor: GOLD + "18", borderLeftColor: GOLD + "66" },
+
+  cardHeader: { flexDirection: "row", alignItems: "flex-start", marginBottom: 10, gap: 10 },
+  avatarWrap: {
+    width: 34, height: 34, borderRadius: 17,
+    backgroundColor: SLATE, alignItems: "center", justifyContent: "center",
+    borderWidth: 1, borderColor: "#ffffff14",
+  },
+  avatar: { fontSize: 16 },
+  nameWrap: { flex: 1 },
+  name: { fontSize: 12, fontWeight: "800", letterSpacing: 0.5 },
+  engineBadge: { fontSize: 9, color: "#4a5572", marginTop: 2 },
+
+  metaRight: { alignItems: "flex-end", gap: 4 },
+  timestamp: { color: "#3a4560", fontSize: 9, fontWeight: "600", letterSpacing: 0.5 },
+
+  typeBadgeRefute: { backgroundColor: "#2a0f0f", borderRadius: 4, paddingHorizontal: 7, paddingVertical: 2, borderWidth: 1, borderColor: "#e74c3c44" },
+  typeBadgeAdmit:  { backgroundColor: "#0c1f0c", borderRadius: 4, paddingHorizontal: 7, paddingVertical: 2, borderWidth: 1, borderColor: "#27ae6044" },
+  typeBadgeText: { fontSize: 9, fontWeight: "700", color: "#aaa" },
+
+  text:      { color: "#c8d4e8", lineHeight: 22, fontSize: 13.5, letterSpacing: 0.2 },
+  textChair: { color: "#a8b8cc", fontStyle: "italic" },
+
+  dataBox: { flexDirection: 'row', alignItems: 'flex-start', backgroundColor: '#091828', borderRadius: 6, padding: 10, marginVertical: 5, borderLeftWidth: 3, borderLeftColor: "#4fc3f7" },
+  dataIcon: { fontSize: 13, marginRight: 7 },
+  dataText: { flex: 1, color: "#4fc3f7", fontSize: 12, fontFamily: 'monospace' },
+  graphicBox: { backgroundColor: '#091409', borderRadius: 6, padding: 10, marginVertical: 5, borderWidth: 1, borderColor: "#27ae6044" },
   graphicText: { color: '#39d353', fontSize: 12, fontFamily: 'monospace' },
-  tableBox: { backgroundColor: '#0d1a2e', borderRadius: 6, padding: 10, marginVertical: 4, borderWidth: 1, borderColor: COLORS.accent + "66" },
-  tableText: { color: COLORS.text, fontSize: 11, fontFamily: 'monospace', lineHeight: 18 },
+  tableBox: { backgroundColor: '#0d1426', borderRadius: 6, padding: 10, marginVertical: 5, borderWidth: 1, borderColor: GOLD + "33" },
+  tableText: { color: "#b8c8e0", fontSize: 11, fontFamily: 'monospace', lineHeight: 18 },
 });
 
 export default DebateScreen;
