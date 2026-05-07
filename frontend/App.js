@@ -16,6 +16,7 @@ export default function App() {
   const [activeMembers, setActiveMembers]   = useState(MEMBERS.map(m => m.id));
   const [result, setResult]           = useState(null);
   const [debateHistory, setDebateHistory] = useState([]);
+  const [conviction, setConviction]   = useState({});  // 의원별 최종 확신도
 
   // ✅ activeMembers까지 5번째 파라미터로 수신
   const handleStart = (
@@ -36,6 +37,7 @@ export default function App() {
   const handleFinish = (finalResult) => {
     setResult(finalResult);
     setDebateHistory(finalResult?.history || []);
+    setConviction(finalResult?.conviction || {});
     setScreen("voting");
   };
 
@@ -67,7 +69,8 @@ export default function App() {
           result={result}
           history={debateHistory}
           members={MEMBERS}
-          onClose={() => { setResult(null); setDebateHistory([]); setScreen("input"); }}
+          conviction={conviction}
+          onClose={() => { setResult(null); setDebateHistory([]); setConviction({}); setScreen("input"); }}
         />
       )}
 

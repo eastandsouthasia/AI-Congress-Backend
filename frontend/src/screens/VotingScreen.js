@@ -26,7 +26,7 @@ import {
 } from 'react-native';
 import * as FileSystem from 'expo-file-system';
 import * as Sharing   from 'expo-sharing';
-import AsyncStorage   from '@react-native-async-storage/async-storage';
+// [버그A6 수정] AsyncStorage import 제거 — saveReport에서 중복 저장 삭제로 불필요
 
 // ─── 색상 팔레트 (국회 공식 느낌) ─────────────────
 const C = {
@@ -52,6 +52,26 @@ const C = {
 };
 
 // ─── 의원 이름 매핑 ────────────────────────────────
+// bias → 초기 확신도 (conviction_tracker.py의 _INITIAL_CONVICTION과 동일)
+// [정합성 수정④] "기술주의·효율" 키 제거 — members.py에 해당 bias 의원 없음.
+const INITIAL_CONVICTION = {
+  "진보·개혁·공정":  55,
+  "자유주의·분권":   30,
+  "실용·데이터중심": 10,
+  "보수·안정·점진": -30,
+};
+
+// 확신도(-100~+100) → 라벨·색상
+const convictionLabel = (v) => {
+  if (v >= 60)  return { label: "강한 찬성",  color: "#27ae60" };
+  if (v >= 25)  return { label: "찬성",       color: "#2ecc71" };
+  if (v >= 5)   return { label: "약한 찬성",  color: "#82c98a" };
+  if (v >= -5)  return { label: "중립",       color: "#95a5a6" };
+  if (v >= -25) return { label: "약한 반대",  color: "#e07b54" };
+  if (v >= -60) return { label: "반대",       color: "#e74c3c" };
+  return         { label: "강한 반대",  color: "#c0392b" };
+};
+
 const MEMBER_NAMES = {
   gemini:   '제미나이',
   llama4:   '라마',
@@ -61,17 +81,21 @@ const MEMBER_NAMES = {
 };
 
 const MEMBER_AVATARS = {
-  gemini:   '🔵',
+  gemini:   '♊',   // members.py 기준
   llama4:   '🦙',
-  mistral:  '🌪',
-  gptoss:   '🤖',
-  nemotron: '⚡',
+  // [버그8 수정] members.py avatar와 불일치하던 3개 항목 수정
+  mistral:  '🌊',  // 기존: 🌪
+  gptoss:   '⚡',  // 기존: 🤖
+  nemotron: '🖥️', // 기존: ⚡
 };
 
-// ─── 투표 결과 파싱 ────────────────────────────────
+// ─── 투표 결과 파싱 (DebateScreen.js의 parseVoteResult와 동일 로직 유지) ──
+// [버그수정] 오파싱 방지: 브라켓 prefix 또는 엄격한 시작 패턴으로만 판단.
 const parseVoteText = (text = '') => {
-  if (text.includes('[찬성]') || text.startsWith('찬성')) return 'FOR';
-  if (text.includes('[반대]') || text.startsWith('반대')) return 'AGAINST';
+  const t = text.trimStart();
+  if (/^\[찬성\]/.test(t) || /^찬성[\s.,!]/.test(t) || t === '찬성') return 'FOR';
+  if (/^\[반대\]/.test(t) || /^반대[\s.,!]/.test(t) || t === '반대') return 'AGAINST';
+  if (/^\[기권\]/.test(t) || /^기권[\s.,!]/.test(t) || t === '기권') return 'ABSTAIN';
   return 'ABSTAIN';
 };
 
@@ -124,8 +148,8 @@ const buildReportText = (issue, result, history) => {
       out += `  ${reason}\n\n`;
     });
   } else {
-    out += `\n  【 공동 결의안 】\n\n`;
-    out += result.content + '\n';
+    out += `\n  【 공식 결의문 (Resolution) 】\n\n`;
+    out += (result.content || '결의문 없음') + '\n';
   }
 
   out += `\n${thin}\n`;
@@ -165,28 +189,15 @@ const saveReport = async (issue, result, history) => {
   } else {
     Alert.alert('저장 완료', `경로: ${fileUri}`);
   }
-
-  // AsyncStorage에도 보관
-  try {
-    const existing = await AsyncStorage.getItem('debate_history');
-    const list     = existing ? JSON.parse(existing) : [];
-    const pro = (result.content || []).filter ? result.content.filter(v => parseVoteText(v.text) === 'FOR').length : 0;
-    const con = (result.content || []).filter ? result.content.filter(v => parseVoteText(v.text) === 'AGAINST').length : 0;
-    list.unshift({
-      id:      Date.now(),
-      date:    new Date().toLocaleString('ko-KR'),
-      issue,
-      content: text,
-      result:  result.type === 'VOTE' ? (pro > con ? '가결' : '부결') : '결의안',
-    });
-    await AsyncStorage.setItem('debate_history', JSON.stringify(list.slice(0, 50)));
-  } catch (_) {}
+  // [버그A6 수정] AsyncStorage 중복 저장 제거.
+  // DebateScreen.js의 saveToStorage()가 result 수신 시 이미 저장하므로
+  // 여기서 다시 저장하면 같은 토론이 보관함에 2개 쌓임.
 };
 
 // ══════════════════════════════════════════════════════
 // 메인 컴포넌트
 // ══════════════════════════════════════════════════════
-export default function VoteReportScreen({ issue, result, history, members, onClose }) {
+export default function VoteReportScreen({ issue, result, history, members, conviction, onClose }) {
   const fadeAnim  = useRef(new Animated.Value(0)).current;
   const slideAnim = useRef(new Animated.Value(40)).current;
   const sealAnim  = useRef(new Animated.Value(0)).current;
@@ -373,12 +384,119 @@ export default function VoteReportScreen({ issue, result, history, members, onCl
               {/* ── 공동 결의안 ── */}
               <View style={styles.resolutionBox}>
                 <Text style={styles.sectionTitle}>【 공동 결의안 】</Text>
-                <Text style={styles.resolutionText}>{result.content}</Text>
+                <Text style={styles.resolutionText}>{result.content || '결의문을 생성할 수 없습니다.'}</Text>
               </View>
             </>
           )}
 
           <View style={styles.sectionDivider} />
+
+          {/* ── 확신도 변화 ── */}
+          {conviction && Object.keys(conviction).length > 0 && (() => {
+            const convMembers = (members || []).filter(m => conviction[m.id] !== undefined);
+            if (convMembers.length === 0) return null;
+            return (
+              <>
+                <Text style={styles.sectionTitle}>
+                  {isVote ? "【 토론 중 확신도 변화 (투표 반영) 】" : "【 토론 중 확신도 변화 (결의 방향 참고) 】"}
+                </Text>
+                <Text style={styles.convSubtitle}>
+                  {isVote
+                    ? "토론 전 성향(bias)에서 출발해 [ADMIT]/[REFUTE] 발언으로 변화한 최종 확신도이며, 투표에 반영되었습니다."
+                    : "토론 전 성향(bias)에서 출발해 [ADMIT]/[REFUTE] 발언으로 변화한 최종 확신도입니다. 결의문 작성 시 참고 지표로 사용되었습니다."}
+                </Text>
+                {convMembers.map((m) => {
+                  const initVal = INITIAL_CONVICTION[m.bias] ?? 0;
+                  const finalVal = conviction[m.id] ?? initVal;
+                  const delta = finalVal - initVal;
+                  const initInfo  = convictionLabel(initVal);
+                  const finalInfo = convictionLabel(finalVal);
+                  const avatar = MEMBER_AVATARS[m.id] || '💬';
+                  const name   = MEMBER_NAMES[m.id]   || m.id;
+
+                  // 바 너비: -100~+100 → 0~100% (50%가 0 기준점)
+                  const toBarPct = (v) => Math.round((v + 100) / 2);
+                  const initPct  = toBarPct(initVal);
+                  const finalPct = toBarPct(finalVal);
+
+                  return (
+                    <View key={m.id} style={styles.convCard}>
+                      {/* 헤더 */}
+                      <View style={styles.convCardHeader}>
+                        <Text style={[styles.convMemberName, { color: m.color || C.gold }]}>
+                          {avatar} {name} 의원
+                        </Text>
+                        <View style={styles.convDeltaBadge}>
+                          <Text style={[
+                            styles.convDeltaText,
+                            { color: delta > 0 ? '#27ae60' : delta < 0 ? '#e74c3c' : '#95a5a6' }
+                          ]}>
+                            {delta > 0 ? `+${delta.toFixed(0)}` : delta.toFixed(0)}
+                          </Text>
+                        </View>
+                      </View>
+
+                      {/* 초기 → 최종 라벨 */}
+                      <View style={styles.convLabelRow}>
+                        <View style={styles.convLabelItem}>
+                          <Text style={styles.convLabelSub}>토론 전</Text>
+                          <Text style={[styles.convLabelVal, { color: initInfo.color }]}>
+                            {initInfo.label}
+                          </Text>
+                          <Text style={[styles.convLabelNum, { color: initInfo.color }]}>
+                            {initVal > 0 ? `+${initVal}` : initVal}
+                          </Text>
+                        </View>
+                        <Text style={styles.convArrow}>
+                          {delta > 2 ? '→ 찬성 ▲' : delta < -2 ? '→ 반대 ▼' : '→ 유지 ─'}
+                        </Text>
+                        <View style={[styles.convLabelItem, { alignItems: 'flex-end' }]}>
+                          <Text style={styles.convLabelSub}>토론 후</Text>
+                          <Text style={[styles.convLabelVal, { color: finalInfo.color }]}>
+                            {finalInfo.label}
+                          </Text>
+                          <Text style={[styles.convLabelNum, { color: finalInfo.color }]}>
+                            {finalVal > 0 ? `+${finalVal.toFixed(0)}` : finalVal.toFixed(0)}
+                          </Text>
+                        </View>
+                      </View>
+
+                      {/* 확신도 바 */}
+                      <View style={styles.convBarWrap}>
+                        {/* 중앙선(0점) */}
+                        <View style={styles.convBarCenter} />
+                        {/* 초기 마커 */}
+                        <View style={[styles.convBarMarker, {
+                          left: `${initPct}%`,
+                          borderColor: initInfo.color,
+                        }]} />
+                        {/* 최종 채움 */}
+                        <View style={[styles.convBarFill, {
+                          left:  `${Math.min(initPct, finalPct)}%`,
+                          width: `${Math.abs(finalPct - initPct)}%`,
+                          backgroundColor: delta >= 0 ? '#27ae60' : '#e74c3c',
+                          opacity: 0.35,
+                        }]} />
+                        {/* 최종 마커 */}
+                        <View style={[styles.convBarDot, {
+                          left: `${finalPct}%`,
+                          backgroundColor: finalInfo.color,
+                        }]} />
+                      </View>
+
+                      {/* 축 레이블 */}
+                      <View style={styles.convAxisRow}>
+                        <Text style={styles.convAxisLabel}>강한 반대</Text>
+                        <Text style={styles.convAxisLabel}>중립</Text>
+                        <Text style={styles.convAxisLabel}>강한 찬성</Text>
+                      </View>
+                    </View>
+                  );
+                })}
+                <View style={styles.sectionDivider} />
+              </>
+            );
+          })()}
 
           {/* ── 발언록 요약 ── */}
           <Text style={styles.sectionTitle}>【 주요 발언록 】</Text>
@@ -979,4 +1097,65 @@ const styles = StyleSheet.create({
   replayTag: { fontSize: 9, color: C.gold, backgroundColor: C.borderGold, borderRadius: 3, paddingHorizontal: 5, paddingVertical: 1 },
   replayTime: { fontSize: 9, color: C.textDark, fontWeight: '600' },
   replayText: { color: '#aab0c0', fontSize: 12, lineHeight: 18 },
+
+  // ── 확신도 변화 ──
+  convSubtitle: {
+    fontSize: 10, color: C.textDark, lineHeight: 15,
+    marginBottom: 12, marginTop: -4,
+  },
+  convCard: {
+    backgroundColor: '#0c0f16',
+    borderWidth: 1, borderColor: '#1c2336',
+    borderRadius: 8, padding: 14, marginBottom: 10,
+  },
+  convCardHeader: {
+    flexDirection: 'row', alignItems: 'center',
+    justifyContent: 'space-between', marginBottom: 10,
+  },
+  convMemberName: { fontSize: 13, fontWeight: '700' },
+  convDeltaBadge: {
+    paddingHorizontal: 8, paddingVertical: 3,
+    backgroundColor: '#161c2a', borderRadius: 20,
+    borderWidth: 1, borderColor: '#2a3448',
+  },
+  convDeltaText: { fontSize: 12, fontWeight: '800' },
+  convLabelRow: {
+    flexDirection: 'row', alignItems: 'center',
+    justifyContent: 'space-between', marginBottom: 12,
+  },
+  convLabelItem: { alignItems: 'flex-start' },
+  convLabelSub:  { fontSize: 9,  color: C.textDark, marginBottom: 2 },
+  convLabelVal:  { fontSize: 11, fontWeight: '700' },
+  convLabelNum:  { fontSize: 10, fontWeight: '600', opacity: 0.8 },
+  convArrow:     { fontSize: 10, color: C.textDark, flex: 1, textAlign: 'center' },
+
+  // 바 그래프
+  convBarWrap: {
+    height: 20, backgroundColor: '#141820',
+    borderRadius: 10, position: 'relative',
+    overflow: 'hidden', marginBottom: 4,
+  },
+  convBarCenter: {
+    position: 'absolute', left: '50%', top: 0, bottom: 0,
+    width: 1, backgroundColor: '#2a3448',
+  },
+  convBarMarker: {
+    position: 'absolute', top: 3, bottom: 3,
+    width: 2, borderRadius: 1,
+    borderWidth: 1,
+    marginLeft: -1,
+  },
+  convBarFill: {
+    position: 'absolute', top: 0, bottom: 0,
+    minWidth: 2,
+  },
+  convBarDot: {
+    position: 'absolute', top: '50%',
+    width: 10, height: 10, borderRadius: 5,
+    marginTop: -5, marginLeft: -5,
+  },
+  convAxisRow: {
+    flexDirection: 'row', justifyContent: 'space-between',
+  },
+  convAxisLabel: { fontSize: 8, color: '#2a3448' },
 });

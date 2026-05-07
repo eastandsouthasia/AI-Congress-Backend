@@ -42,6 +42,10 @@ const parseSegments = (text) => {
       // 빈 줄이면 블록 종료
       if (line.trim() === '' && buffer.length > 0) {
         flushBlock();
+      } else if (line.startsWith('[DATA]')) {
+        // [버그N9 수정] 블록 내 [DATA] 라인은 블록을 먼저 닫고 data 세그먼트로 처리
+        flushBlock();
+        segments.push({ type: 'data', content: line.replace('[DATA]', '').trim() });
       } else {
         buffer.push(line);
       }
@@ -59,13 +63,18 @@ const parseSegments = (text) => {
 // TTS 완료 대기
 // 글자당 약 70ms (한국어 평균 낭독 속도 기준), 최소 1.5초, 최대 12초
 // onDone이 늦거나 안 오는 경우를 대비한 안전 타임아웃
-const speakAndWaitSafe = (text, options) => new Promise((resolve) => {
+// [버그F 수정] abortSignal 파라미터 추가 — TTS 토글/의결 완료 시 즉시 resolve 가능
+const speakAndWaitSafe = (text, options, abortSignal) => new Promise((resolve) => {
   if (!text || !text.trim()) { resolve(); return; }
   let done = false;
   const rate = options?.rate || 0.88;
   const estimatedMs = Math.min(12000, Math.max(1500, (text.length * 70) / rate));
   const finish = () => { if (!done) { done = true; resolve(); } };
   const timeout = setTimeout(finish, estimatedMs);
+  // abort 신호 등록 — 토글/의결 시 즉시 resolve
+  if (abortSignal) {
+    abortSignal.onabort = () => { clearTimeout(timeout); finish(); };
+  }
   try {
     Speech.speak(text, {
       ...options,
@@ -86,6 +95,19 @@ const speakAndWaitSafe = (text, options) => new Promise((resolve) => {
 const estimateTTSDuration = (text, rate = 0.88) =>
   Math.min(12000, Math.max(1500, ((text || "").length * 70) / rate));
 
+// [버그N10 수정] 찬반 파싱 로직을 VotingScreen.js의 parseVoteText와 동일하게 통일.
+// 기존: text.includes("찬성") → 이유 설명에 "찬성" 단어가 포함돼도 카운트됨.
+// 수정: [찬성]/[반대]/[기권] prefix 또는 시작 단어로만 판단.
+// [정합성 수정①] VotingScreen.js의 parseVoteText와 완전히 동일한 로직으로 통일.
+// 기존 주석 "VotingScreen.js와 동일 로직"이 실제로는 [기권] 패턴이 빠져 불일치했던 문제 해결.
+const parseVoteResult = (text = "") => {
+  const t = text.trimStart();
+  if (/^\[찬성\]/.test(t) || /^찬성[\s.,!]/.test(t) || t === "찬성") return "FOR";
+  if (/^\[반대\]/.test(t) || /^반대[\s.,!]/.test(t) || t === "반대") return "AGAINST";
+  if (/^\[기권\]/.test(t) || /^기권[\s.,!]/.test(t) || t === "기권") return "ABSTAIN";
+  return "ABSTAIN";
+};
+
 // 회의록 포맷
 const formatDebateLog = (issue, history, voteResult = null) => {
   if (!history || history.length === 0) return "기록된 발언이 없습니다.";
@@ -104,17 +126,20 @@ const formatDebateLog = (issue, history, voteResult = null) => {
 
   let resultSection = "";
   if (voteResult) {
-    resultSection = `\n------------------------------------------\n최종 의결:\n`;
+    const isResolution = voteResult.type === "RESOLUTION";
+    resultSection = `\n------------------------------------------\n${isResolution ? "공식 결의문" : "최종 의결"}:\n`;
     if (voteResult.type === "VOTE") {
-      const pro  = voteResult.content?.filter(v => v.text?.includes("찬성")).length || 0;
-      const con  = voteResult.content?.filter(v => v.text?.includes("반대")).length || 0;
+      // [버그N10 수정] parseVoteResult 사용 — VotingScreen.js와 동일한 파싱 로직
+      const pro  = voteResult.content?.filter(v => parseVoteResult(v.text) === "FOR").length || 0;
+      const con  = voteResult.content?.filter(v => parseVoteResult(v.text) === "AGAINST").length || 0;
       const abs  = (voteResult.content?.length || 0) - pro - con;
       resultSection += `찬성 ${pro} / 반대 ${con} / 기권 ${abs}\n결과: ${pro > con ? "✅ 가결" : "❌ 부결"}\n`;
       voteResult.content?.forEach(v => {
         resultSection += `${v.memberId}: ${v.text}\n`;
       });
     } else {
-      resultSection += `공동 결의안:\n${voteResult.content}`;
+      // RESOLUTION: 결의문 본문에 이미 구조(【전문】 등)가 있으므로 prefix 없이 바로 출력
+      resultSection += `${voteResult.content}`;
     }
     resultSection += `\n`;
   }
@@ -127,22 +152,34 @@ const saveToStorage = async (issue, history, voteResult) => {
   try {
     const existing = await AsyncStorage.getItem('debate_history');
     const list = existing ? JSON.parse(existing) : [];
+    // [버그N10 수정] parseVoteResult 사용 — VotingScreen.js와 동일한 파싱 로직
+    const proCount = voteResult?.type === "VOTE"
+      ? (voteResult.content?.filter(v => parseVoteResult(v.text) === "FOR").length || 0)
+      : 0;
+    const conCount = voteResult?.type === "VOTE"
+      ? (voteResult.content?.filter(v => parseVoteResult(v.text) === "AGAINST").length || 0)
+      : 0;
     const newEntry = {
       id: Date.now(),
       date: new Date().toLocaleString('ko-KR'),
       issue,
       content: formatDebateLog(issue, history, voteResult),
       result: voteResult?.type === "VOTE"
-        ? (voteResult.content?.filter(v => v.text?.includes("찬성")).length >
-           voteResult.content?.filter(v => v.text?.includes("반대")).length ? "가결" : "부결")
+        ? (proCount > conCount ? "가결" : "부결")
         : "결의안",
     };
     await AsyncStorage.setItem('debate_history', JSON.stringify([newEntry, ...list].slice(0, 50)));
   } catch (e) { console.error("저장 실패:", e); }
 };
 
-// TTS 음성 설정 (한국어 음성 목록 캐싱 — 매 발언마다 재조회 방지)
+// TTS 음성 설정
+// [버그A7 수정] _cachedKoreanVoices를 모듈 레벨에 두면 컴포넌트 재마운트·
+// 기기 음성 목록 변경 시 캐시가 갱신되지 않음.
+// 컴포넌트 외부에 두되 앱 세션당 1회만 캐싱하는 것은 유지하고,
+// 캐시 무효화 함수를 노출하여 언마운트 시 초기화하도록 변경.
 let _cachedKoreanVoices = null;
+export const invalidateVoiceCache = () => { _cachedKoreanVoices = null; };
+
 const getVoiceSettings = async (memberId) => {
   let pitch = 1.0, rate = 0.88, volume = 1.0, voice = null;
   switch (memberId) {
@@ -188,14 +225,24 @@ const DebateScreen = ({
   const ttsEnabledRef = useRef(true);
   const wsRef         = useRef(null);
   const voteResultRef = useRef(null);
+  const convictionRef = useRef({});   // 의원별 최종 확신도 { memberId: float }
   const speechQueue   = useRef([]);   // 발언 표시 큐
   const speechBusy    = useRef(false);// 발언 표시 중 여부
   const isMountedRef  = useRef(true); // 언마운트 후 TTS 호출 방지
+  // [버그A 수정] onFinish를 ref에 보관 — WS 클로저가 최초 마운트 시 캡처하므로
+  // prop이 바뀌어도 항상 최신 참조를 가리키도록 보장.
+  const onFinishRef   = useRef(onFinish);
+  useEffect(() => { onFinishRef.current = onFinish; }, [onFinish]);
+  // [버그F 수정] TTS 토글/의결 완료 시 진행 중인 speakAndWaitSafe를 즉시 resolve.
+  const ttsAbortRef   = useRef(null);
 
-  // 컴포넌트 언마운트 시 플래그 해제
+  // 컴포넌트 언마운트 시 플래그 해제 + 음성 캐시 초기화
   useEffect(() => {
     isMountedRef.current = true;
-    return () => { isMountedRef.current = false; };
+    return () => {
+      isMountedRef.current = false;
+      invalidateVoiceCache(); // [버그A7 수정] 언마운트 시 캐시 무효화
+    };
   }, []);
 
   // ─── 발언 표시 큐 처리: 한 번에 한 발언씩 순서대로 표시 ───
@@ -204,12 +251,16 @@ const DebateScreen = ({
     speechBusy.current = true;
 
     while (speechQueue.current.length > 0) {
-      if (!isMountedRef.current) break; // 언마운트 후 큐 처리 중단
+      if (!isMountedRef.current) break;
       const data = speechQueue.current.shift();
       const baseId   = Date.now() + Math.random();
       const fullText = data.text || "";
       const lines    = fullText.split('\n').filter(l => l.trim() !== '');
+      // [FIX-T2] 백엔드가 보낸 ackSeq를 보관 — TTS 완료 후 ACK에 echo
+      const pendingAckSeq = data.ackSeq ?? null;
 
+      // [버그A5 수정] 카드 추가 전 마운트 상태 재확인
+      if (!isMountedRef.current) break;
       // 카드 추가 (텍스트 빈 상태로)
       setHistory(prev => {
         const next = [...prev, {
@@ -226,6 +277,7 @@ const DebateScreen = ({
         historyRef.current = next;
         return next;
       });
+      if (!isMountedRef.current) break;
       setStatus(`🎙 ${data.displayName} 발언 중...`);
       setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 60);
 
@@ -280,12 +332,22 @@ const DebateScreen = ({
       // ── TTS와 텍스트 타이핑 동시 시작 ──
       const voiceSettings = await getVoiceSettings(data.memberId);
       const { pitch, rate, volume, voice } = voiceSettings;
-      const ttsDurationMs = estimateTTSDuration(ttsClean || fullText, rate);
+      // [버그7 수정] ttsClean이 빈 문자열("")일 때 || fullText로 폴백하면
+      // TTS는 실제로 재생되지 않는데 타이핑 속도만 fullText 길이 기준으로 계산됨.
+      // ttsEnabled가 꺼져 있거나 정제 후 내용이 없을 때는 0으로 처리해
+      // 타이핑이 TTS와 무관하게 빠르게 완료되도록 함.
+      const ttsTextForDuration = (ttsEnabledRef.current && ttsClean) ? ttsClean : "";
+      const ttsDurationMs = ttsTextForDuration
+        ? estimateTTSDuration(ttsTextForDuration, rate)
+        : 800; // TTS 없을 때 최소 간격
 
       // TTS를 await 없이 fire → Promise만 보관
       let ttsPromise = Promise.resolve();
       if (ttsEnabledRef.current && ttsClean) {
-        ttsPromise = speakAndWaitSafe(ttsClean, { language: 'ko-KR', pitch, rate, volume, voice });
+        // [버그F 수정] AbortController로 토글/의결 시 즉시 resolve 가능하게 함
+        const abortCtrl = new AbortController();
+        ttsAbortRef.current = abortCtrl;
+        ttsPromise = speakAndWaitSafe(ttsClean, { language: 'ko-KR', pitch, rate, volume, voice }, abortCtrl.signal);
       }
 
       // 텍스트 타이핑: TTS 낭독 시간 비율에 맞춰 줄 단위로 표시
@@ -293,6 +355,7 @@ const DebateScreen = ({
         const totalChars = lines.reduce((s, l) => s + l.length, 0) || 1;
         let accumulated = "";
         for (let i = 0; i < lines.length; i++) {
+          if (!isMountedRef.current) break; // [버그A5 수정] 타이핑 중 언마운트 체크
           accumulated += (i === 0 ? "" : "\n") + lines[i];
           const snap = accumulated;
           setHistory(prev => {
@@ -308,11 +371,13 @@ const DebateScreen = ({
           }
         }
       } else {
-        setHistory(prev => {
-          const next = prev.map(h => h.id === baseId ? { ...h, text: fullText } : h);
-          historyRef.current = next;
-          return next;
-        });
+        if (isMountedRef.current) { // [버그A5 수정]
+          setHistory(prev => {
+            const next = prev.map(h => h.id === baseId ? { ...h, text: fullText } : h);
+            historyRef.current = next;
+            return next;
+          });
+        }
       }
 
       setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
@@ -325,15 +390,22 @@ const DebateScreen = ({
         await new Promise(r => setTimeout(r, 600));
       }
 
+      if (!isMountedRef.current) break; // [버그A5 수정] TTS 완료 후 언마운트 체크
       setStatus("다음 발언 준비 중...");
 
       // 발언 카드 간 여백
       await new Promise(r => setTimeout(r, 400));
 
       // 백엔드에 ACK 전송 — 다음 발언을 보내도 좋다는 신호
+      // [FIX-T1] TTS 완료 후 전송 (TTS 완료 → ttsPromise await 이후 이 지점에 도달)
+      // [FIX-T2] ackSeq echo — 백엔드가 stale ACK를 seq 불일치로 폐기할 수 있도록
       try {
         if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ type: "ready" }));
+          const ack = { type: "ready" };
+          if (pendingAckSeq !== null && pendingAckSeq !== undefined) {
+            ack.ackSeq = pendingAckSeq;
+          }
+          wsRef.current.send(JSON.stringify(ack));
         }
       } catch (e) { console.warn("[ACK] 전송 실패:", e); }
     }
@@ -381,26 +453,44 @@ const DebateScreen = ({
             setStatus(msg.label || "");
             break;
           case "speech":
-            addLog(msg);
+            addLog(msg);   // msg.ackSeq 포함 — [FIX-T2] 큐를 통해 ACK에 echo
             break;
-          case "result":
+          case "result": {
             const voteResult = { type: msg.resultType, content: msg.content };
             voteResultRef.current = voteResult;
             // 남은 발언 큐 비우기 — 의결 후 발언이 이어지지 않도록
             speechQueue.current = [];
             Speech.stop();
+            // [버그J 수정] Speech.stop()만으로는 onStopped가 늦거나 안 오는 플랫폼에서
+            // processSpeechQueue가 최대 12초간 ttsPromise를 기다리다 뒤늦게 ACK를 전송함.
+            if (ttsAbortRef.current) {
+              ttsAbortRef.current.abort();
+              ttsAbortRef.current = null;
+            }
             saveToStorage(issue, historyRef.current, voteResult);
-            onFinish({
-              type: msg.resultType,
-              content: msg.content,
-              history: [...historyRef.current],
-            });
-            setIsFinished(true);
-            setStatus("✅ 토론 종료 — 기록이 보관함에 저장되었습니다");
+            if (isMountedRef.current) {
+              setIsFinished(true);
+              setStatus("✅ 토론 종료 — 기록이 보관함에 저장되었습니다");
+              // [버그A 수정] onFinishRef.current 사용 — stale closure 방지
+              onFinishRef.current({
+                type: msg.resultType,
+                content: msg.content,
+                history: [...historyRef.current],
+                conviction: convictionRef.current,   // 확신도 변화 데이터 전달
+              });
+            }
             break;
+          }
           case "done":
             setIsFinished(true);
             break;
+          case "conviction": {
+            // 확신도 업데이트 — all 객체에 memberId별 최신 확신도 보관
+            if (msg.all && typeof msg.all === 'object') {
+              convictionRef.current = msg.all;
+            }
+            break;
+          }
           case "error":
             Alert.alert("서버 오류", msg.message || "알 수 없는 오류");
             setStatus("⚠️ 오류 발생");
@@ -425,7 +515,11 @@ const DebateScreen = ({
       speechQueue.current = [];
       if (ws.readyState === WebSocket.OPEN) ws.close();
     };
-  }, [issue, duration, debateFormat, conclusionType, activeMembers, onFinish]);
+  // [버그9 수정] onFinish를 의존성 배열에서 제거.
+  // App.js에서 인라인 함수로 전달되면 렌더마다 새 참조가 생겨
+  // WebSocket이 매 렌더마다 재연결됨. onFinish는 ref를 통해 최신값을 사용.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [issue, duration, debateFormat, conclusionType, activeMembers]);
 
   // ─── 파일 내보내기 ───
   const downloadDebateLog = async () => {
@@ -435,19 +529,21 @@ const DebateScreen = ({
       const current = historyRef.current;
       if (!current || current.length === 0) {
         Alert.alert("알림", "저장할 토론 기록이 없습니다.");
-        return;
-      }
-      const logText = formatDebateLog(issue, current, voteResultRef.current);
-      const fileName = `AI_Congress_${Date.now()}.txt`;
-      const baseDir = FileSystem.documentDirectory || FileSystem.cacheDirectory;
-      const fileUri = baseDir + fileName;
-      await FileSystem.writeAsStringAsync(fileUri, logText, { encoding: FileSystem.EncodingType.UTF8 });
-
-      const canShare = await Sharing.isAvailableAsync();
-      if (canShare) {
-        await Sharing.shareAsync(fileUri, { mimeType: 'text/plain', dialogTitle: 'AI 의회 토론 기록' });
+        // [버그I 수정] 기존 return은 finally를 건너뛰어 isSaving이 true로 고착됨.
+        // if-else로 전환하여 항상 finally { setIsSaving(false) } 실행 보장.
       } else {
-        Alert.alert("저장 완료", `경로: ${fileUri}`);
+        const logText = formatDebateLog(issue, current, voteResultRef.current);
+        const fileName = `AI_Congress_${Date.now()}.txt`;
+        const baseDir = FileSystem.documentDirectory || FileSystem.cacheDirectory;
+        const fileUri = baseDir + fileName;
+        await FileSystem.writeAsStringAsync(fileUri, logText, { encoding: FileSystem.EncodingType.UTF8 });
+
+        const canShare = await Sharing.isAvailableAsync();
+        if (canShare) {
+          await Sharing.shareAsync(fileUri, { mimeType: 'text/plain', dialogTitle: 'AI 의회 토론 기록' });
+        } else {
+          Alert.alert("저장 완료", `경로: ${fileUri}`);
+        }
       }
     } catch (error) {
       Alert.alert("저장 실패", `오류: ${error.message}`);
@@ -477,6 +573,11 @@ const DebateScreen = ({
             style={[styles.iconBtn, !ttsEnabled && styles.iconBtnOff]}
             onPress={() => {
               Speech.stop();
+              // [버그F 수정] 현재 ttsPromise를 즉시 resolve — 큐 최대 12초 차단 방지
+              if (ttsAbortRef.current) {
+                ttsAbortRef.current.abort();
+                ttsAbortRef.current = null;
+              }
               const next = !ttsEnabled;
               setTtsEnabled(next);
               ttsEnabledRef.current = next;

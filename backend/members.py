@@ -1,6 +1,27 @@
 """
 members.py — AI 의회 백엔드용 의원 데이터
-members.js와 항상 동기화 상태를 유지하세요.
+
+[버그5 수정] members.py의 engine/model 필드가 ai_caller.py의 MEMBER_ENGINE_MAP과
+불일치하여 완전히 무시되던 문제를 해결.
+→ MEMBER_ENGINE_MAP을 이 파일의 값으로 통일. members.py가 단일 진실 공급원(SSOT).
+
+[버그8 수정] avatar 필드가 VotingScreen.js의 MEMBER_AVATARS와 불일치하던 문제.
+→ VotingScreen.js의 MEMBER_AVATARS를 이 파일 기준으로 수정.
+   (members.py가 SSOT이므로 이 파일은 변경 없음 — VotingScreen.js에서 수정)
+
+[개선②] bias + vote_tendency 추가
+   ConvictionTracker의 초기 확신도 매핑 및 get_vote() system prompt에 반영.
+   각 AI의 실제 훈련 철학·데이터 특성을 기반으로 성향을 설정.
+
+   bias → ConvictionTracker 초기 확신도 매핑:
+     "진보·개혁·공정"  → +55
+     "자유주의·분권"   → +30
+     "실용·데이터중심" → +10
+     "기술주의·효율"   → +20
+     "보수·안정·점진"  → -30
+     기타(중립 등)     →   0
+
+   vote_tendency: 투표 시 system prompt에 추가되는 성향 설명 (비어있으면 생략)
 """
 
 MEMBERS = [
@@ -16,13 +37,19 @@ MEMBERS = [
             "당신이 아는 것은 자신 있게 제시하고, 모르거나 불확실한 것은 반드시 '불확실'로 명시하십시오. "
             "주장할 때는 구체적 수치나 출처를 먼저 제시하고, 논리를 전개하십시오."
         ),
-        "bias":  "중립",
+        # Google: 실용적·데이터 중심. 정보 접근성·개방성 중시.
+        "bias":          "실용·데이터중심",
+        "vote_tendency": (
+            "데이터와 실증 근거를 가장 중요시합니다. "
+            "수치로 입증된 주장에 설득되는 경향이 강하며, "
+            "감정적 호소보다 국제 비교 사례와 통계를 우선합니다."
+        ),
         "temperature": 0.5,
         "color":  "#4285F4",
         "avatar": "♊",
         "pitch":  1.0,
         "engine": "gemini",
-        "model":  "gemini-2.5-pro",
+        "model":  "gemini-2.5-flash",
     },
     {
         "id":     "llama4",
@@ -36,13 +63,19 @@ MEMBERS = [
             "당신이 아는 것은 자신 있게 제시하고, 모르거나 불확실한 것은 반드시 '불확실'로 명시하십시오. "
             "주장할 때는 구체적 근거를 먼저 제시하고, 논리를 전개하십시오."
         ),
-        "bias":  "중립",
+        # Meta: 오픈소스·자유주의. 분권·개방·접근성 중시.
+        "bias":          "자유주의·분권",
+        "vote_tendency": (
+            "정보의 자유로운 접근과 권력 분산을 중시합니다. "
+            "특정 기관이 권력을 독점하는 구조에 회의적이며, "
+            "다양한 이해관계자가 참여하는 분권적 해결책을 선호합니다."
+        ),
         "temperature": 0.7,
         "color":  "#0668E1",
         "avatar": "🦙",
         "pitch":  1.05,
         "engine": "groq",
-        "model":  "meta-llama/llama-4-scout-17b-16e-instruct",
+        "model":  "llama-3.3-70b-versatile",
     },
     {
         "id":     "mistral",
@@ -56,7 +89,13 @@ MEMBERS = [
             "당신이 아는 것은 자신 있게 제시하고, 모르거나 불확실한 것은 반드시 '불확실'로 명시하십시오. "
             "주장할 때는 구체적 근거를 먼저 제시하고, 논리를 전개하십시오."
         ),
-        "bias":  "중립",
+        # Mistral: 유럽적 법치·규범 중시. 법률적 안정성, 제도적 보수성.
+        "bias":          "보수·안정·점진",
+        "vote_tendency": (
+            "기존 법제도의 안정성과 유럽식 법치주의 규범을 중시합니다. "
+            "급격한 제도 변화보다 점진적이고 합법적인 절차를 선호하며, "
+            "국제 규범과 선례에 의거한 논거에 설득되는 경향이 있습니다."
+        ),
         "temperature": 0.55,
         "color":  "#FF7000",
         "avatar": "🌊",
@@ -76,13 +115,19 @@ MEMBERS = [
             "당신이 아는 것은 자신 있게 제시하고, 모르거나 불확실한 것은 반드시 '불확실'로 명시하십시오. "
             "주장할 때는 구체적 근거를 먼저 제시하고, 논리를 전개하십시오."
         ),
-        "bias":  "중립",
+        # OpenAI/RLHF: 인간 피드백 기반. 사회적 공정성·개혁적 성향.
+        "bias":          "진보·개혁·공정",
+        "vote_tendency": (
+            "사회적 공정성과 제도 개혁에 우호적입니다. "
+            "인간 피드백 강화학습으로 다양한 사회적 관점을 흡수했으며, "
+            "불공정한 현행 제도의 개선 필요성에 공감하는 경향이 있습니다."
+        ),
         "temperature": 0.7,
         "color":  "#10A37F",
         "avatar": "⚡",
         "pitch":  1.1,
         "engine": "openrouter",
-        "model":  "openai/gpt-oss-120b:free",
+        "model":  "qwen/qwen3-8b:free",
     },
     {
         "id":     "nemotron",
@@ -96,13 +141,20 @@ MEMBERS = [
             "당신이 아는 것은 자신 있게 제시하고, 모르거나 불확실한 것은 반드시 '불확실'로 명시하십시오. "
             "주장할 때는 구체적 근거를 먼저 제시하고, 논리를 전개하십시오."
         ),
-        "bias":  "중립",
+        # NVIDIA: 시스템 무결성·예측가능성 최우선. 급격한 제도 변화에 회의적.
+        "bias":          "보수·안정·점진",
+        "vote_tendency": (
+            "기술적 타당성과 시스템 무결성을 최우선으로 판단합니다. "
+            "예측 불가능성을 높이는 급격한 제도 변화에 신중한 입장이며, "
+            "검증된 규칙과 일관된 절차를 통한 점진적 개선을 선호합니다."
+        ),
         "temperature": 0.6,
         "color":  "#76B900",
         "avatar": "🖥️",
         "pitch":  0.95,
+        # [BUG-API-2 수정] ultra-253b:free → super-49b:free (타임아웃 방지)
         "engine": "openrouter",
-        "model":  "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
+        "model":  "nvidia/llama-3.3-nemotron-super-49b-v1:free",
     },
 ]
 

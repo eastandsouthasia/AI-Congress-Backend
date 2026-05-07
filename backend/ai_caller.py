@@ -103,12 +103,16 @@ async def call_groq(
     messages: list,
     temperature: float = 0.5,
     model: str = "llama-3.3-70b-versatile",
+    max_tokens: int = 300,
     retry: int = 0
 ) -> str:
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY 없음")
 
-    await _BUCKETS["groq"].acquire()
+    # [BUG-5 수정] retry > 0이면 acquire 건너뜀.
+    # 재귀 호출 시 함수 첫 줄부터 재실행되므로 acquire가 이중 소비되던 문제 수정.
+    if retry == 0:
+        await _BUCKETS["groq"].acquire()
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -118,7 +122,7 @@ async def call_groq(
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 300,
+        "max_tokens": max_tokens,
         "presence_penalty": 0.4,
     }
 
@@ -156,12 +160,15 @@ async def call_gemini(
     messages: list,
     temperature: float = 0.4,
     model: str = "gemini-2.5-flash",
+    max_tokens: int = 300,
     retry: int = 0
 ) -> str:
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY 없음")
 
-    await _BUCKETS["gemini"].acquire()
+    # [BUG-5 수정] retry > 0이면 acquire 건너뜀
+    if retry == 0:
+        await _BUCKETS["gemini"].acquire()
 
     system_text = next(
         (m["content"] for m in messages if m["role"] == "system"), ""
@@ -188,7 +195,7 @@ async def call_gemini(
         "system_instruction": {"parts": [{"text": system_text}]},
         "generationConfig": {
             "temperature": temperature,
-            "maxOutputTokens": 350,
+            "maxOutputTokens": max_tokens,
         },
     }
 
@@ -221,12 +228,15 @@ async def call_openrouter(
     messages: list,
     temperature: float = 0.5,
     model: str = "mistralai/mistral-small-3.2-24b-instruct:free",
+    max_tokens: int = 350,
     retry: int = 0
 ) -> str:
     if not OPENROUTER_API_KEY:
         raise ValueError("OPENROUTER_API_KEY 없음")
 
-    await _BUCKETS["openrouter"].acquire()
+    # [BUG-5 수정] retry > 0이면 acquire 건너뜀
+    if retry == 0:
+        await _BUCKETS["openrouter"].acquire()
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -238,7 +248,7 @@ async def call_openrouter(
         "model": model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 350,
+        "max_tokens": max_tokens,
         "presence_penalty": 0.4,
     }
 
@@ -295,14 +305,6 @@ async def call_openrouter(
 #   느림(30s+): deepseek-r1:free, grok-3-mini-beta → 사용 안 함
 # ─────────────────────────────────────────────
 
-# ai_caller.py
-MEMBER_ENGINE_MAP = {
-    "gemini":   {"engine": "gemini",      "model": "gemini-2.5-flash"},
-    "llama4":   {"engine": "groq",        "model": "llama-3.3-70b-versatile"},
-    "mistral":  {"engine": "openrouter",  "model": "mistralai/mistral-small-3.2-24b-instruct:free"},
-    "gptoss":   {"engine": "openrouter",  "model": "qwen/qwen3-8b:free"},             # gpt-oss-120b 불안정 → qwen3-8b (빠름)
-    "nemotron": {"engine": "groq",        "model": "llama-3.3-70b-versatile"},        # nemotron-253b 타임아웃 → groq llama (빠름)
-}
 # ─────────────────────────────────────────────
 # 엔진별 교차 폴백 순서
 # 1차 실패 시 → 다른 엔진으로 교차 시도 (Groq 단일 폴백 제거)
@@ -315,17 +317,22 @@ _FALLBACK_ORDER = {
 
 # ─────────────────────────────────────────────
 # 통합 호출: 엔진별 버킷 + 교차 폴백
+#
+# [정합성 수정②] MEMBER_ENGINE_MAP 제거.
+# 기존: MEMBER_ENGINE_MAP[member_id]를 참조하고 member["engine"]/member["model"]은
+#       표시용으로만 사용 → members.py 수정 시 MEMBER_ENGINE_MAP도 반드시 함께 수정해야
+#       하는 이중관리 문제 존재.
+# 수정: member dict의 "engine"/"model" 필드를 직접 참조.
+#       members.py가 SSOT(단일 진실 공급원)이므로 여기서는 그 값을 그대로 사용.
+#       members.py에서 engine/model을 바꾸면 호출도 자동으로 반영됨.
+# 폴백 기본값: engine 누락 시 "openrouter", model 누락 시 mistral 무료 모델.
 # ─────────────────────────────────────────────
 async def call_member(member: dict, messages: list, temperature: float = 0.5) -> str:
     member_id = member.get("id", "")
     name      = member.get("name", "?")
-    config    = MEMBER_ENGINE_MAP.get(
-        member_id,
-        {"engine": "openrouter", "model": "mistralai/mistral-small-3.2-24b-instruct:free"}
-    )
-    engine = config["engine"]
-    model  = config["model"]
-    sem    = _ENGINE_SEMAPHORES.get(engine, _ENGINE_SEMAPHORES["openrouter"])
+    engine    = member.get("engine", "openrouter")
+    model     = member.get("model",  "mistralai/mistral-small-3.2-24b-instruct:free")
+    sem       = _ENGINE_SEMAPHORES.get(engine, _ENGINE_SEMAPHORES["openrouter"])
 
     async with sem:
         # ── 1차: 전용 엔진 ──
@@ -345,7 +352,11 @@ async def call_member(member: dict, messages: list, temperature: float = 0.5) ->
             try:
                 print(f"[{name}] {fallback_engine} 교차 폴백 시도")
                 async with fallback_sem:
-                    return await fallback_fn(messages, temperature)
+                    # [BUG-API-6 수정] retry=1로 전달 → acquire() 스킵
+                    # 1차 실패 시 해당 엔진 버킷은 이미 penalize됐거나 토큰이 소비됨.
+                    # fallback_fn은 다른 엔진이므로 그 엔진의 acquire를 실행해야 하나,
+                    # 폴백은 긴급 경로이므로 버킷 토큰 소비 없이 즉시 시도.
+                    return await fallback_fn(messages, temperature, retry=1)
             except Exception as e2:
                 print(f"[{name}/{fallback_engine}] 교차 폴백 실패: {e2}")
                 continue
