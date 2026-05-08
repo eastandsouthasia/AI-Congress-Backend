@@ -1,18 +1,29 @@
 """
-AI Congress Debate Engine
-✅ 타이밍 수정 (이번 버전):
-  [FIX-T1] skip_wait=True 발언의 ACK 없이 0.3초만 대기하던 문제 해결.
-           → send_speech에서 skip_wait 제거, 대신 _wait_for_ready_short(timeout)를 사용.
-           → 짧은 발언은 TTS 완료 후 빠르게 ACK 수신, 느리면 timeout(기본 8초) 내 자동 진행.
-  [FIX-T2] _wait_for_ready에 stale ACK 방지용 sequence 번호 도입.
-           → ACK 수신 시 현재 시퀀스와 일치하는지 검증. 이전 TTS의 늦은 ACK는 무시됨.
-  [FIX-T3] _handle_rebuttal_request의 request_notice + judge_speech를
-           skip_wait(0.3초) → _wait_for_ready_short(8초 timeout ACK 대기)로 변경.
-  [FIX-T4] 파이프라인 prefetch 중 prepare_speech가 ctx.push()까지 선행 완료하여
-           deliver 직전 ctx 순서가 꼬이던 문제 주석으로 명확화 및 방어 처리.
-  [FIX-T5] nominate 발언(의장 지목) 도 _wait_for_ready_short(5초)로 변경하여
-           TTS와 다음 API 호출 겹침 방지.
-  [FIX-T6] _ack_listener에서 sequence 기반 set으로 변경하여 stale ACK 소비 방지.
+AI Congress Debate Engine — v2 (턴 기반 · ACK 제거)
+
+[v2 변경 사항]
+  1. 시간 제한 완전 제거 → 턴(발언 횟수) 기반으로 전환
+     - duration(분) 파라미터 폐지, max_turns(총 발언 횟수) 파라미터 도입
+     - _time_over() / _elapsed_minutes() 제거 → _turns_over() 로 대체
+     - start_time 불필요하므로 제거
+
+  2. TTS ACK 대기 로직 전면 제거
+     - _wait_for_ready() 제거
+     - _ack_listener() 제거
+     - send_speech()의 ackSeq, _pending_seq, _ack_seq, _ready_event 제거
+     - 모든 await self._wait_for_ready(...) 호출 제거
+     - run()의 ack_task 생성/취소 제거
+     - 텍스트는 즉시 전송, 음성은 토론 완료 후 프론트에서 독립 재생
+
+  3. 시간 기반 경고 → 턴 기반 경고
+     - 자유토론: 80% 턴 소진 시 잔여 턴 경고
+
+  4. 라운드 수: max_turns에서 자동 계산
+     - 15턴 이하 → 1라운드
+     - 16~35턴   → 2라운드
+     - 36턴 이상  → 3라운드
+
+  5. 개회사에서 "XX분" 언급 제거, 턴/라운드 안내로 교체
 """
 
 import json
@@ -20,9 +31,10 @@ import asyncio
 import random
 import re
 import time
+import datetime
 from fastapi import WebSocket
 from members import MEMBERS
-from ai_caller import call_member
+from ai_caller import call_member, call_research
 from debate_context import DebateContext
 from conviction_tracker import ConvictionTracker
 
@@ -31,36 +43,38 @@ from conviction_tracker import ConvictionTracker
 # ─────────────────────────────────────────────────────────────
 MAX_ROUNDS     = 3
 MIN_ROUNDS     = 1
-MAX_FREE_TURNS = 60
 MAX_SPEECH_LEN = 500   # 의원 발언 최대 글자수
 CHAIR_MAX_LEN  = 200   # 의장 사회 발언 최대 글자수
 
-# [FIX-T1] skip_wait 대체 타임아웃 값
-NOMINATE_ACK_TIMEOUT = 5.0   # 지목 발언 ACK 대기 최대 (초)
-NOTICE_ACK_TIMEOUT   = 8.0   # 반박신청/판단 발언 ACK 대기 최대 (초)
-SPEECH_ACK_TIMEOUT   = 60.0  # 본 발언 ACK 대기 최대 (초)
-
-
-
+# 턴 → 라운드 수 매핑
+def _calc_rounds(max_turns: int) -> int:
+    if max_turns <= 15:
+        return 1
+    elif max_turns <= 35:
+        return 2
+    else:
+        return 3
 
 
 class DebateEngine:
     def __init__(
         self,
         issue: str,
-        duration: int,
+        max_turns: int,
         ws: WebSocket,
         debate_format: str = "릴레이",
         conclusion_type: str = "VOTE",
         active_members: list = None,
     ):
         self.issue           = issue
-        self.duration        = duration
+        self.max_turns       = max(5, max_turns)   # 최소 5턴 보장
         self.ws              = ws
         self.ctx             = DebateContext()
         self.debate_format   = debate_format
         self.conclusion_type = conclusion_type
-        self.start_time      = None
+
+        # 총 발언 턴 카운터 (의장 사회 발언 제외, 의원 발언만 카운트)
+        self._turn_count: int = 0
 
         if active_members and len(active_members) >= 2:
             self.members = [m for m in MEMBERS if m["id"] in active_members]
@@ -78,30 +92,36 @@ class DebateEngine:
         self._chair_final_spoke: bool = False
         self.conviction = ConvictionTracker(self.members, issue)
 
-        # [FIX-T2] stale ACK 방지를 위한 시퀀스 카운터
-        # _wait_for_ready() 호출 시 seq를 1 증가시키고,
-        # _ack_listener는 수신된 ACK의 seq가 현재 seq와 일치할 때만 event를 set함.
-        self._ack_seq      = 0          # 현재 대기 중인 ACK 시퀀스 번호
-        self._pending_seq  = 0          # 마지막으로 전송된 speech의 시퀀스 번호
-        self._ready_event  = asyncio.Event()
+        # 사전 리서치 결과 캐시 — member_id → 리서치 요약 텍스트
+        self.research_cache: dict[str, str] = {m["id"]: "" for m in self.members}
 
-        if duration <= 5:
-            self.rounds = 1
-        elif duration <= 19:
-            self.rounds = 2
-        else:
-            self.rounds = 3
+        # 라운드 수 자동 계산
+        self.rounds = _calc_rounds(self.max_turns)
 
-        turns_by_time = int(duration * 2.0)
-        self.max_free_turns = min(turns_by_time, MAX_FREE_TURNS)
+        # 자유토론 최대 턴 = max_turns 그대로 사용
+        self.max_free_turns = self.max_turns
 
         print(
             f"[Engine] 참여 의원 {len(self.members)}명 / "
-            f"{duration}분 / {self.rounds}라운드 / "
-            f"자유토론 상한 {self.max_free_turns}회"
+            f"최대 {self.max_turns}턴 / {self.rounds}라운드 / "
+            f"형식: {self.debate_format}"
         )
 
         self.member_list_str = "\n".join(f"- {m['name']}" for m in self.members)
+
+    # ══════════════════════════════════════════════
+    # 턴 카운터
+    # ══════════════════════════════════════════════
+    def _increment_turn(self):
+        """의원 발언 1회 완료 시 호출"""
+        self._turn_count += 1
+
+    def _turns_over(self) -> bool:
+        """총 발언 턴이 한도에 도달했는지 확인"""
+        return self._turn_count >= self.max_turns
+
+    def _turns_remaining(self) -> int:
+        return max(0, self.max_turns - self._turn_count)
 
     # ══════════════════════════════════════════════
     # 전송 헬퍼
@@ -120,23 +140,11 @@ class DebateEngine:
         speech_type: str,
         is_chair: bool,
     ):
-        """
-        발언을 전송한다.
-        [FIX-T1] skip_wait 파라미터 완전 제거.
-        호출 측에서 ACK 타임아웃을 직접 제어:
-          - 본 발언: await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
-          - 지목 발언: await self._wait_for_ready(NOMINATE_ACK_TIMEOUT)
-          - 반박 알림/판단: await self._wait_for_ready(NOTICE_ACK_TIMEOUT)
-        """
+        """발언을 즉시 전송한다. ACK 대기 없음 — TTS는 프론트에서 독립 재생."""
         display     = f"의장 {member['name']}" if is_chair else f"{member['name']} 의원"
         model_str   = member.get("model", "?")
         engine_info = f"{member.get('engine','?')}/{model_str.split('/')[-1]}"
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-
-        # [FIX-T2] 전송 전 pending_seq를 증가 — 이 발언의 ACK 시퀀스 등록
-        self._pending_seq += 1
-        seq = self._pending_seq
+        timestamp   = datetime.datetime.now().strftime("%H:%M:%S")
 
         await self.send(
             "speech",
@@ -148,13 +156,10 @@ class DebateEngine:
             color       = member.get("color", "#ffffff"),
             avatar      = member.get("avatar", "💬"),
             timestamp   = timestamp,
-            ackSeq      = seq,   # [FIX-T2] 프론트가 ready ACK에 이 seq를 echo해야 함
+            turnCount   = self._turn_count,   # 프론트 진행 표시용
+            maxTurns    = self.max_turns,
         )
         self.speech_count[member["id"]] = self.speech_count.get(member["id"], 0) + 1
-
-        # [FIX-T2] 이 seq의 ACK를 대기하도록 ack_seq 업데이트
-        self._ack_seq = seq
-        self._ready_event.clear()
 
     @staticmethod
     def _strip_prefix(text: str) -> str:
@@ -179,83 +184,69 @@ class DebateEngine:
                 text = re.sub(pat, '', text, flags=re.UNICODE).strip()
         return text.strip()
 
-    # ══════════════════════════════════════════════
-    # ACK 대기 헬퍼 — [FIX-T2] 시퀀스 기반
-    # ══════════════════════════════════════════════
-    async def _wait_for_ready(self, timeout: float = SPEECH_ACK_TIMEOUT):
-        """
-        현재 _ack_seq 번호의 ACK를 기다린다.
-        timeout 초 내에 수신되지 않으면 강제 진행.
-        [FIX-T2] stale ACK 방지: _ack_listener가 seq 불일치 ACK는 무시하므로
-                 이전 TTS의 늦은 ACK가 다음 발언 wait를 조기 해제하지 않음.
-        """
-        expected_seq = self._ack_seq
-        try:
-            await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            if timeout >= SPEECH_ACK_TIMEOUT:
-                print(f"[Engine] ACK 타임아웃 (seq={expected_seq}) — 강제 진행")
-            # 짧은 타임아웃(지목/알림)은 정상 경로이므로 로그 생략
-
-    # ══════════════════════════════════════════════
-    # ACK 리스너 — [FIX-T6] 시퀀스 검증
-    # ══════════════════════════════════════════════
-    async def _ack_listener(self):
-        """
-        프론트에서 오는 'ready' 메시지를 수신.
-        [FIX-T6] 수신된 ACK의 ackSeq가 현재 _ack_seq와 일치할 때만 event를 set.
-                 이전 TTS의 늦은 ACK(stale ACK)는 _ack_seq 불일치로 자동 폐기.
-        프론트(DebateScreen.js)는 TTS onFinish 콜백에서:
-          ws.send(JSON.stringify({ type: 'ready', ackSeq: receivedAckSeq }))
-        형태로 ACK를 전송해야 한다.
-        ackSeq 없이 { type: 'ready' }만 보내는 기존 프론트와의 하위 호환성을 위해:
-          ackSeq 필드가 없으면 현재 seq와 무조건 매칭으로 처리.
-        """
-        try:
-            while True:
-                data = await self.ws.receive_text()
-                try:
-                    msg = json.loads(data)
-                    if msg.get("type") == "ready":
-                        recv_seq = msg.get("ackSeq", None)
-                        if recv_seq is None:
-                            # 하위 호환: seq 없으면 무조건 수락
-                            self._ready_event.set()
-                        elif int(recv_seq) == self._ack_seq:
-                            # [FIX-T6] seq 일치 → set
-                            self._ready_event.set()
-                        else:
-                            # [FIX-T6] stale ACK → 무시
-                            print(
-                                f"[ACK] stale ACK 폐기: recv_seq={recv_seq}, "
-                                f"expected={self._ack_seq}"
-                            )
-                except Exception:
-                    pass
-        except Exception:
-            self._ready_event.set()
-
     @staticmethod
     def detect_type(text: str) -> str:
         if "[REFUTE]" in text: return "REFUTE"
         if "[ADMIT]"  in text: return "ADMIT"
         return "NORMAL"
 
-    def _elapsed_minutes(self) -> float:
-        if self.start_time is None:
-            return 0.0
-        return (time.time() - self.start_time) / 60.0
+    # ══════════════════════════════════════════════
+    # 사전 리서치 단계 — 첫 발언 전 최신 정보 수집
+    # ══════════════════════════════════════════════
+    async def research_phase(self):
+        """
+        모든 참여 의원이 병렬로 해당 안건의 최신 정보를 수집합니다.
+        결과는 self.research_cache[member_id]에 저장되며,
+        get_opinion()의 system prompt에 【사전 리서치】 블록으로 주입됩니다.
+        """
+        await self.send("status", message="📡 각 AI 의원이 안건 관련 최신 정보를 수집 중입니다...")
+        print(f"[Engine] 사전 리서치 시작 — {len(self.members)}명 병렬 수집")
 
-    def _time_over(self) -> bool:
-        return self._elapsed_minutes() >= self.duration
+        async def _research_one(member: dict):
+            mid  = member["id"]
+            name = member["name"]
+            lens = member.get("lens", "")
+            try:
+                result = await call_research(self.issue, name, lens)
+                if result:
+                    self.research_cache[mid] = result
+                    print(f"[Research] {name}: {len(result)}자 수집 완료")
+                else:
+                    print(f"[Research] {name}: 결과 없음 — 학습 기반으로 진행")
+            except Exception as e:
+                print(f"[Research] {name}: 오류 발생 ({e}) — 학습 기반으로 진행")
+
+        await asyncio.gather(*[_research_one(m) for m in self.members])
+
+        collected = sum(1 for v in self.research_cache.values() if v)
+        await self.send(
+            "status",
+            message=f"✅ 사전 리서치 완료 — {collected}/{len(self.members)}명 정보 수집 성공. 토론을 시작합니다.",
+        )
+        print(f"[Engine] 사전 리서치 완료: {collected}/{len(self.members)}명 성공")
 
     # ══════════════════════════════════════════════
     # 의장 사회 발언 생성
     # ══════════════════════════════════════════════
     async def chair_speak(self, chair: dict, instruction: str,
-                          max_chars: int = CHAIR_MAX_LEN) -> str:
+                          max_chars: int = CHAIR_MAX_LEN,
+                          is_opening: bool = False) -> str:
         non_chair_names = [m["name"] for m in self.members if m["id"] != chair["id"]]
         non_chair_list_str = "\n".join(f"- {n}" for n in non_chair_names)
+
+        if is_opening:
+            opening_guide = (
+                "\n【개회사 작성 지침 — 반드시 준수】\n"
+                "① 안건 소개: 안건이 왜 지금 중요한지, 사회적·정책적 맥락을 2~3문장으로 밝히세요.\n"
+                "② 핵심 논점 예고: 이 토론에서 다루어야 할 핵심 쟁점 2~3가지를 구체적으로 나열하세요.\n"
+                "   예) '찬성 측은 ○○ 효과를 근거로, 반대 측은 ○○ 우려를 중심으로 논거를 펼칠 것입니다.'\n"
+                "③ 진행 안내: 토론 형식과 라운드 수를 간략히 안내하세요. '몇 분' 언급 금지.\n"
+                "④ 첫 발언자 지목: 마지막에 첫 발언자를 자연스럽게 호명하며 마무리하세요.\n"
+                "⚠️ 단순 형식 안내만으로 끝내지 마세요. 안건의 실질적 내용이 반드시 담겨야 합니다.\n"
+            )
+        else:
+            opening_guide = ""
+
         messages = [
             {
                 "role": "system",
@@ -263,11 +254,12 @@ class DebateEngine:
                     f"당신은 의장 {chair['name']}입니다. 현재 토론 형식: [{self.debate_format}]\n"
                     f"참여 의원 목록 (발언 지목 대상):\n{non_chair_list_str}\n\n"
                     "역할: 사회자. 반드시 지시된 사회 멘트만 출력하세요.\n"
+                    f"{opening_guide}"
                     "⚠️ 절대 금지 사항:\n"
                     f"  1. 본인({chair['name']})을 발언자로 지목하거나 호명하는 것\n"
                     "  2. 의원의 발언 내용을 대신 생성하거나 이어 쓰는 것\n"
-                    "     — 의원을 지목한 뒤 그 의원이 할 말을 절대 이어서 쓰지 마세요.\n"
                     "  3. 개인 주장이나 의견 표명\n"
+                    "  4. '몇 분' '시간' 등 시간 관련 언급\n"
                     f"발언 지목 시 반드시 위 목록에 있는 의원 이름만 사용하세요.\n"
                     f"{max_chars}자 이내. 완전한 문장으로. 공식적인 의회 어투로."
                 )
@@ -282,8 +274,7 @@ class DebateEngine:
             cleaned = self._strip_prefix(result)
             cleaned = self._remove_self_nomination(cleaned, chair)
             if len(cleaned) > max_chars * 1.5:
-                import re as _re
-                parts = _re.split(r'(?<=[.!?。！？])\s+', cleaned)
+                parts = re.split(r'(?<=[.!?。！？])\s+', cleaned)
                 cleaned = parts[0] if parts else cleaned[:max_chars]
             return cleaned
         except Exception as e:
@@ -361,7 +352,7 @@ class DebateEngine:
                                    first_member: dict = None) -> str:
         first_name = first_member["name"] if first_member else ""
         instruction = (
-            f"시간 관계상 최종 {round_num}라운드로 직행합니다. "
+            f"발언 한도 관계상 최종 {round_num}라운드로 직행합니다. "
             "전체 토론을 검토하고 최종 입장을 밝혀주십시오."
         )
         if first_name:
@@ -411,7 +402,8 @@ class DebateEngine:
                 "반드시 직전 발언자의 이름을 직접 언급하며 반응하세요.\n"
                 "예: '라마 의원님의 주장에서 문제점을 발견했습니다.' / '제미나이 의원님 말씀에 일부 동의하나 ...'\n"
                 "논리적 허점이 있으면 [REFUTE], 더 타당한 주장엔 [ADMIT], 새 데이터면 [DATA]를 앞에 붙이세요.\n"
-                "태그 없이 일반 논증을 이어가도 됩니다. 강요하지 않습니다.\n"
+                "단순 의견 표명보다 구체적 수치·연구·사례([DATA])로 논거를 강화하세요.\n"
+                "여러 항목 비교는 [TABLE], 비율·추세는 [GRAPHIC]으로 시각화하세요.\n"
                 f"발언은 {MAX_SPEECH_LEN}자 이내."
             )
         elif is_rebuttal and target_speech:
@@ -424,31 +416,36 @@ class DebateEngine:
             max_round = self.rounds
             if round_num == 1:
                 action_guide = (
-                    "【1라운드 — 입장 표명】\n"
-                    "이것이 첫 발언입니다. 이 안건에 대한 본인의 찬반 입장과 핵심 근거를 명확히 밝히세요.\n"
-                    "다른 의원 발언이 아직 없으므로, 본인 학습 데이터에서 나오는 사실과 논리를 펼치세요.\n"
-                    "구체적 수치나 사례가 있으면 [DATA] 태그를 활용하세요."
+                    "【1라운드 — 입장 표명 + 데이터 기반 논거】\n"
+                    "이것이 첫 발언입니다. 이 안건에 대한 본인의 입장과 핵심 근거를 명확히 밝히세요.\n"
+                    "반드시 당신이 학습한 구체적 통계·연구·사례를 최소 1개 이상 [DATA] 태그로 제시하세요.\n"
+                    "기관명·연도·수치를 포함한 실증 데이터가 없는 주장은 설득력이 없습니다.\n"
+                    "국제 비교 사례나 국내 현황 데이터가 있다면 적극 활용하세요."
                 )
                 action_guide += f"\n발언은 {MAX_SPEECH_LEN}자 이내."
             elif round_num == max_round:
                 action_guide = (
-                    "【최종 라운드 — 심층 결론】\n"
+                    "【최종 라운드 — 심층 결론 + 데이터 종합】\n"
                     "이번이 마지막 발언 기회입니다. 반드시 다음 세 가지를 포함하세요:\n"
                     "① 이 토론에서 상대측이 제시한 논거 중 가장 강력했던 것을 의원 이름과 함께 직접 인용하세요.\n"
                     "   예: '제미나이 의원님의 처분적 법률 논거는 날카로웠습니다만…'\n"
                     "② 그 논거에 대한 최종 평가를 밝히세요 (수용하면 [ADMIT], 반박이면 [REFUTE]).\n"
-                    "③ 당신의 최종 찬반 입장과 핵심 이유를 하나의 강한 문장으로 마무리하세요.\n"
+                    "   반박 시에는 반드시 구체적 수치·문헌으로 근거를 보완하세요.\n"
+                    "③ 당신의 최종 입장과 핵심 이유를 데이터 기반으로 강하게 마무리하세요.\n"
+                    "   [DATA] 태그로 핵심 수치를 최소 1개 이상 제시하세요.\n"
                     "'반대를 유지합니다' 수준의 짧은 발언 금지. 반드시 상대 발언에 직접 반응하세요.\n"
                     "토론 전반을 종합한 깊이 있는 최종 발언을 300자 이상으로 작성하세요."
                 )
                 action_guide += f"\n발언은 최대 {MAX_SPEECH_LEN}자 (단, 300자 이상 권장)."
             else:
                 action_guide = (
-                    f"【{round_num}라운드 — 교차 검증】\n"
+                    f"【{round_num}라운드 — 교차 검증 + 데이터 반박】\n"
                     "직전 발언자의 이름을 직접 언급하며 발언을 시작하세요.\n"
                     "예: '라마 의원님께서 언급하신 ○○ 수치에는 중요한 맹점이 있습니다.'\n"
-                    "오류가 있으면 [REFUTE], 더 타당하면 [ADMIT], 새 관점이면 [DATA]를 앞에 붙이세요.\n"
-                    "태그가 적합하지 않으면 일반 논증으로 이어가도 됩니다."
+                    "상대방 데이터·논리의 허점을 지적하거나, 더 강력한 반증 데이터를 제시하세요.\n"
+                    "오류가 있으면 [REFUTE], 더 타당하면 [ADMIT], 새 데이터면 [DATA], "
+                    "비교가 필요하면 [TABLE], 추세를 보여줄 때는 [GRAPHIC]을 활용하세요.\n"
+                    "단순 의견 대립이 아니라 데이터와 논리로 승부하세요."
                 )
                 action_guide += f"\n발언은 {MAX_SPEECH_LEN}자 이내."
 
@@ -467,6 +464,16 @@ class DebateEngine:
         temperature   = member.get("temperature", 0.6)
         stance_guide  = self._get_stance_guide(member["id"])
 
+        # 사전 리서치 결과 주입 (있을 때만)
+        research_text = self.research_cache.get(member["id"], "")
+        research_block = (
+            f"\n\n【사전 리서치 — 반드시 활용하라】\n"
+            f"토론 시작 전 당신이 수집한 안건 관련 최신 정보입니다. "
+            f"발언 시 이 데이터를 [DATA] 태그와 함께 적극 인용하세요:\n"
+            f"{research_text}\n"
+            f"⚠️ 위 정보는 불확실할 수 있습니다. '추정' 표시된 항목은 그대로 불확실로 밝히세요."
+        ) if research_text else ""
+
         system = (
             f"당신은 AI 의회 토론 참여자입니다.\n"
             f"당신은 {member['name']} 의원입니다.\n\n"
@@ -475,28 +482,43 @@ class DebateEngine:
             f"{stance_guide}\n"
             f"【당신의 이념적 성향: {bias}】\n"
             "이 성향은 당신의 진짜 관점입니다. 토론 내내 일관되게 유지하세요.\n"
-            "다른 의원과 성향이 다르면 자연스럽게 의견 충돌이 발생합니다 — 이것이 정상입니다.\n\n"
+            "다른 의원과 성향이 다르면 자연스럽게 의견 충돌이 발생합니다 — 이것이 정상입니다.\n"
+            f"{research_block}\n\n"
             f"【핵심 원칙 — 반드시 준수】\n"
             "1. 주장은 반드시 '근거 → 논리 → 결론' 순서로 전개하라.\n"
             "2. 확실한 것은 자신 있게, 불확실한 것은 반드시 '불확실' 또는 '추정'으로 명시하라.\n"
             "3. 직전 의원 발언에 반드시 반응하라. 무시하거나 언급조차 않는 것은 금지.\n"
             "4. 이미 나온 주장을 반복하지 말고, 당신의 학습 기반에서 나오는 고유한 관점을 추가하라.\n\n"
+            "【데이터·근거 활용 — AI로서 최대한 활용하라】\n"
+            "당신은 방대한 학술 논문, 통계 데이터베이스, 정책 보고서, 국제 기관 자료를 학습했습니다.\n"
+            "추상적 주장보다 구체적 수치·출처·사례가 훨씬 강력합니다. 반드시 다음을 실천하세요:\n"
+            "  • 수치 제시: 퍼센트, 금액, 인원, 연도, 순위 등 구체적 숫자를 포함하라.\n"
+            "    예: '전체 가구의 38.4%' / 'GDP 대비 2.1%p 감소' / '2022년 기준 OECD 평균'\n"
+            "  • 출처 명시: 기관명·연도를 함께 밝혀라.\n"
+            "    예: 'IMF 2023 보고서에 따르면' / 'OECD Health Statistics 2022 기준'\n"
+            "  • 국제 비교: 다른 나라의 사례·결과를 비교하라.\n"
+            "  • [DATA] 태그: 핵심 통계는 반드시 [DATA] 태그로 강조하라.\n"
+            "  • [TABLE]: 여러 항목을 비교할 때 표로 구조화하라.\n"
+            "  • [GRAPHIC]: 비율·추세를 시각적으로 보여줄 때 활용하라.\n"
+            "⚠️ '일부 연구에 따르면'처럼 모호한 표현만 사용하는 것은 금지.\n"
+            "   구체적 기관명과 수치가 없으면 [DATA] 태그를 쓰지 마세요.\n\n"
             f"참여 의원 목록 (이 이름만 사용):\n{self.member_list_str}\n\n"
             f"【현재 토론 형식: {self.debate_format}】\n"
             f"{format_guide}\n\n"
             "발언 태그 (상황에 맞게 선택적 활용):\n"
             "[REFUTE]: 상대 논리·데이터에 명확한 오류가 있을 때. 발언 맨 앞에 한 번만.\n"
             "[ADMIT]: 상대 주장이 더 타당해서 본인 입장을 실제로 수정할 때. 발언 맨 앞에 한 번만.\n"
-            "[DATA]: 객관적 수치·통계를 제시할 때. 예: [DATA] OECD 2023년 기준 15% 감소\n"
+            "[DATA]: 구체적 수치·통계·출처를 제시할 때. 예: [DATA] IMF(2023): 한국 부채비율 GDP 대비 54.3%\n"
             "[GRAPHIC]: 텍스트 시각화. 예:\n"
             "  [GRAPHIC]\n"
             "  찬성 ████████░░ 78%\n"
             "  반대 ██░░░░░░░░ 22%\n"
             "[TABLE]: 텍스트 표. 예:\n"
             "  [TABLE]\n"
-            "  | 항목 | 찬성측 | 반대측 |\n"
-            "  |------|--------|--------|\n"
-            "  | 경제 | 성장   | 불안정 |\n\n"
+            "  | 국가  | 도입연도 | 효과(%) |\n"
+            "  |-------|----------|----------|\n"
+            "  | 독일  | 2015     | +12.3    |\n"
+            "  | 프랑스| 2017     | +8.7     |\n\n"
             "수학 표기 규칙 (TTS 오독 방지):\n"
             "  크거나 같다: '이상', 작거나 같다: '이하'\n"
             "  크다: '초과', 작다: '미만', 같다: '동일'\n"
@@ -549,8 +571,8 @@ class DebateEngine:
         target_speech: str = None,
         free_mode: bool = False,
     ) -> tuple:
-        """API 호출만 수행 (전송 없음) — 파이프라인 1단계."""
-        await self.send("status", message=f"⏳ {member['name']} 의원 발언 준비 중...")
+        """API 호출만 수행 (전송 없음)."""
+        await self.send("status", message=f"⏳ {member['name']} 의원 발언 준비 중... ({self._turn_count+1}/{self.max_turns}턴)")
         opinion = await self.get_opinion(
             member, chair["name"],
             format_guide=fmt_guide,
@@ -588,21 +610,18 @@ class DebateEngine:
         round_num: int,
         free_mode: bool = False,
     ) -> str:
-        """전송 + ACK 대기 — 파이프라인 2단계."""
+        """전송 — ACK 대기 없음. 턴 카운터 증가."""
         if len(opinion) > MAX_SPEECH_LEN:
-            # 500자 초과 시 의장 개입
             await self.send_speech(member, opinion, stype, False)
-            await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
+            self._increment_turn()
             intervene = await self.chair_intervene(chair, member)
             self.ctx.push(f"[의장 {chair['name']}]", intervene)
             await self.send_speech(chair, intervene, "NORMAL", True)
-            # [FIX-T1] 의장 개입 발언도 충분한 ACK 대기
-            await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
         else:
             await self.send_speech(member, opinion, stype, False)
-            await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
+            self._increment_turn()
 
-        if stype == "REFUTE" and not free_mode and round_num < self.rounds:
+        if stype == "REFUTE" and not free_mode and round_num < self.rounds and not self._turns_over():
             await self._handle_rebuttal_request(
                 chair, member, opinion, non_chair, fmt_guide, round_num
             )
@@ -631,7 +650,7 @@ class DebateEngine:
         )
 
     # ══════════════════════════════════════════════
-    # [FIX-T3] 반박 신청 처리 — skip_wait 제거
+    # 반박 신청 처리
     # ══════════════════════════════════════════════
     async def _handle_rebuttal_request(
         self,
@@ -642,16 +661,6 @@ class DebateEngine:
         fmt_guide: str,
         round_num: int,
     ):
-        """
-        [REFUTE] 감지 후:
-        1. 반박 신청 알림 전송 → NOTICE_ACK_TIMEOUT(8초) ACK 대기
-        2. 의장 허가 판단 (LLM) → 판단 발언 전송 → NOTICE_ACK_TIMEOUT ACK 대기
-        3. 허가 시 반박 발언 생성 → 전송 → SPEECH_ACK_TIMEOUT ACK 대기
-
-        [FIX-T3] 기존 skip_wait=True(0.3초)를 전부 제거하고
-        모든 발언에 적절한 타임아웃의 _wait_for_ready()를 적용.
-        이로써 1→2→3 각 발언의 TTS가 완전히 끝난 후 다음 단계로 진행됨.
-        """
         candidate = None
         for log in reversed(self.ctx.all_logs[:-1]):
             spk = log.get("speaker", "")
@@ -661,36 +670,24 @@ class DebateEngine:
                     break
             if candidate:
                 break
+
         if not candidate:
-            candidates = [m for m in non_chair if m["id"] != refuter["id"]]
-            if not candidates:
-                return
-            candidate = random.choice(candidates)
+            return
 
-        # ① 반박 신청 알림
-        request_notice = (
-            f"{refuter['name']} 의원님이 {candidate['name']} 의원 발언에 대한 반박을 신청합니다."
-        )
-        self.ctx.push(f"[{refuter['name']} 의원]", request_notice)
-        await self.send_speech(refuter, request_notice, "NORMAL", False)
-        # [FIX-T3] 0.3초 → NOTICE_ACK_TIMEOUT(8초) 타임아웃 ACK 대기
-        await self._wait_for_ready(NOTICE_ACK_TIMEOUT)
+        allow, judge_speech = await self.chair_judge_rebuttal(chair, refuter, refute_speech)
 
-        # ② 의장 허가 판단 (LLM 호출이 ACK 대기 시간 중 일어남)
-        allow, judge_speech = await self.chair_judge_rebuttal(
-            chair, refuter, refute_speech
+        notice_text = (
+            f"[반박 신청] {refuter['name']} 의원이 반박을 신청했습니다."
         )
+        self.ctx.push(f"[의장 {chair['name']}]", notice_text)
+        await self.send_speech(chair, notice_text, "NORMAL", True)
+
         self.ctx.push(f"[의장 {chair['name']}]", judge_speech)
         await self.send_speech(chair, judge_speech, "NORMAL", True)
-        # [FIX-T3] 0.3초 → NOTICE_ACK_TIMEOUT(8초) 타임아웃 ACK 대기
-        await self._wait_for_ready(NOTICE_ACK_TIMEOUT)
-        await self.ctx.compress_if_needed()
 
         if not allow:
             return
 
-        # ③ 반박 발언
-        await self.send("status", message=f"⏳ {candidate['name']} 의원 반박 준비 중...")
         rebuttal = await self.get_opinion(
             candidate, chair["name"],
             format_guide=fmt_guide,
@@ -714,8 +711,7 @@ class DebateEngine:
             print(f"[ConvictionTracker] rebuttal 평가 중 오류 (무시): {e}")
 
         await self.send_speech(candidate, rebuttal, rstype, False)
-        # [FIX-T3] 반박 발언은 본 발언이므로 SPEECH_ACK_TIMEOUT
-        await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
+        self._increment_turn()
         await self.ctx.compress_if_needed()
 
     # ══════════════════════════════════════════════
@@ -737,12 +733,7 @@ class DebateEngine:
         vote_tendency = member.get("vote_tendency", "")
         temp          = member.get("temperature", 0.4)
         conviction_instruction = self.conviction.conviction_to_vote_instruction(member["id"])
-        stance = self._stance_map.get(member["id"], "FREE")
         stance_note = ""
-        if stance == "FOR":
-            stance_note = "\n※ 당신은 이 토론에서 찬성 측 논거를 맡았습니다. 최종 투표는 토론 결과에 따라 자유롭게 결정하십시오."
-        elif stance == "AGAINST":
-            stance_note = "\n※ 당신은 이 토론에서 반대 측 논거를 맡았습니다. 최종 투표는 토론 결과에 따라 자유롭게 결정하십시오."
 
         speeches_text = chr(10).join(speeches) if speeches else "발언 없음 (사회자로 역할 수행)"
 
@@ -759,12 +750,12 @@ class DebateEngine:
                     f"{debate_context}{admit_note}{stance_note}"
                     f"{conviction_instruction}\n\n"
                     "투표 규칙:\n"
-                    "- 최우선 기준: 위 【토론 결과 반영 — 확신도】를 따르세요. 확신도가 실제 설득 결과입니다.\n"
+                    "- 최우선 기준: 위 【토론 결과 반영 — 확신도】를 따르세요.\n"
                     "- 당신의 이념적 성향(bias)과 투표 경향도 반영하세요.\n"
-                    "- 다른 의원들과 성향이 다르므로 투표 결과가 달라도 됩니다 — 이것이 올바른 토론입니다.\n"
+                    "- 다른 의원 모두와 같은 결론이 나와도 됩니다.\n"
                     "- 발언이 없었던 경우에도 전체 토론 내용을 숙지하고 최종 판단을 내리십시오.\n"
                     "- 형식: [찬성|반대|기권] 이유 (200자 이내, 완전한 문장으로)\n"
-                    "⚠️ 1라운드에서 찬성 논거를 개진했더라도, 토론 중 설득당했다면 반대 투표할 수 있습니다."
+                    "⚠️ 토론 과정에서 설득된 방향으로 솔직하게 투표하세요."
                 )
             },
             {"role": "user", "content": f"안건 \"{self.issue}\"에 최종 투표하세요."}
@@ -798,10 +789,10 @@ class DebateEngine:
                     "  【전문】 안건 배경 및 논의 경과 (2~3문장)\n"
                     "  【결의 제1조】 의회가 권고하는 핵심 방향\n"
                     "  【결의 제2조】 조건, 단서, 또는 추가 검토 사항\n"
-                    "  【결의 제3조】 이행 방안 또는 후속 조치 (토론 내용에서 도출)\n"
-                    "  【부기】 소수 의견 또는 유보 입장 ([REFUTE]로 끝까지 반박된 견해 반영)\n\n"
+                    "  【결의 제3조】 이행 방안 또는 후속 조치\n"
+                    "  【부기】 소수 의견 또는 유보 입장\n\n"
                     "작성 원칙:\n"
-                    "  - '찬성 N명 반대 M명' 식의 표결 집계 문구를 절대 넣지 마세요.\n"
+                    "  - '찬성 N명 반대 M명' 식의 표결 집계 문구 금지.\n"
                     "  - '심도 있는 논의가 필요하다' 같은 모호한 선언만으로 끝내지 마세요.\n"
                     "  - 토론에서 실제로 논증된 근거에 기반하여 구체적으로 작성하세요.\n"
                     "  - 800자 이내, 완전한 문장으로.\n"
@@ -812,16 +803,6 @@ class DebateEngine:
                 "content": f"안건: \"{self.issue}\"\n\n{context_text}\n\n위 토론을 바탕으로 의회 공식 결의문을 작성하세요."
             }
         ]
-        # [정합성 수정③] _resolution_callers() 직접 호출 제거.
-        # 기존: _resolution_callers()가 call_groq/call_gemini/call_openrouter를
-        #       버킷·세마포어 없이 직접 호출 → 레이트리밋 보호 우회 문제.
-        # 수정: call_member()를 사용하여 기존 발언 호출과 동일한 레이트리밋 보호 및
-        #       폴백 체인을 적용. max_tokens를 600으로 늘리기 위해 call_member에서
-        #       호출하는 각 엔진 함수의 기본값(300)을 오버라이드할 수 없으므로,
-        #       결의문 전용으로 messages에 토큰 힌트를 포함하고 call_member 사용.
-        # 결의문은 발언 당 1회만 호출되므로 레이트리밋 영향 미미.
-        # 단, max_tokens 600이 필요하므로 call_member 대신 직접 호출하되
-        #   세마포어와 버킷은 동일하게 적용하는 하이브리드로 처리.
         from ai_caller import (
             call_gemini as _cg, call_groq as _cgr, call_openrouter as _cor,
             _ENGINE_SEMAPHORES, _BUCKETS,
@@ -894,17 +875,14 @@ class DebateEngine:
                     except Exception as e:
                         print(f"[ConvictionTracker] 의장 소견 평가 중 오류 (무시): {e}")
                     await self.send_speech(chair, chair_final, chair_stype, True)
-                    await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
                     self._chair_final_spoke = True
                     print(f"[Engine] 의장 {chair['name']} 최종 소견 발언 완료")
             except Exception as e:
                 print(f"[Engine] 의장 최종 소견 실패 (무시): {e}")
 
-        elapsed = int(self._elapsed_minutes())
         if timed_out:
             close_instruction = (
-                f"토론 시간 {elapsed}분이 경과하였습니다. "
-                "예정된 토론 시간이 종료되어 더 이상의 발언을 받지 않겠습니다. "
+                f"발언 한도 {self.max_turns}턴이 소진되었습니다. "
                 f"지금까지의 논의를 바탕으로 {'찬반 표결' if self.conclusion_type == 'VOTE' else '공동 결의안 채택'}을 실시하겠습니다."
             )
         elif self.debate_format == "자유토론":
@@ -920,7 +898,6 @@ class DebateEngine:
         close_text = await self.chair_speak(chair, close_instruction, max_chars=CHAIR_MAX_LEN)
         self.ctx.push(f"[의장 {chair['name']}]", close_text)
         await self.send_speech(chair, close_text, "NORMAL", True)
-        await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
 
         status_msg = "표결 진행 중..." if self.conclusion_type == "VOTE" else "결의안 작성 중..."
         await self.send("status", message=status_msg)
@@ -941,59 +918,31 @@ class DebateEngine:
         await self.send("done")
 
     # ══════════════════════════════════════════════
-    # 찬반 역할 배정
+    # 자율 입장 초기화
     # ══════════════════════════════════════════════
     def _assign_stances(self, chair_id: str):
-        from conviction_tracker import _INITIAL_CONVICTION
-
-        self._stance_map = {}
-        for m in self.members:
-            if m["id"] == chair_id:
-                self._stance_map[m["id"]] = "FREE"
-                continue
-            bias = m.get("bias", "중립")
-            init_conviction = _INITIAL_CONVICTION.get(bias, 0)
-            self._stance_map[m["id"]] = "FOR" if init_conviction > 0 else "AGAINST"
-
-        non_chair_stances = [
-            (m, self._stance_map[m["id"]])
-            for m in self.members if m["id"] != chair_id
-        ]
-        for_members     = [m for m, s in non_chair_stances if s == "FOR"]
-        against_members = [m for m, s in non_chair_stances if s == "AGAINST"]
-
-        if not for_members:
-            best = max(against_members,
-                       key=lambda m: _INITIAL_CONVICTION.get(m.get("bias","중립"), 0))
-            self._stance_map[best["id"]] = "FOR"
-            print(f"[Engine] 전원 반대 보정: {best['name']} → FOR")
-        elif not against_members:
-            worst = min(for_members,
-                        key=lambda m: _INITIAL_CONVICTION.get(m.get("bias","중립"), 0))
-            self._stance_map[worst["id"]] = "AGAINST"
-            print(f"[Engine] 전원 찬성 보정: {worst['name']} → AGAINST")
-
-        print(f"[Engine] 찬반 역할 배정: { {m['name']: self._stance_map[m['id']] for m in self.members} }")
+        self._stance_map = {m["id"]: "FREE" for m in self.members}
+        print(f"[Engine] 자율 입장 형성 모드 — 전원 FREE")
 
     def _get_stance_guide(self, member_id: str) -> str:
-        stance = self._stance_map.get(member_id, "FREE")
-        if stance == "FOR":
-            return (
-                "\n【역할 배정: 찬성 측】\n"
-                "이 토론에서 당신은 찬성 측 논거를 중심으로 발언합니다.\n"
-                "이것은 당신의 bias(이념적 성향)와 일치하는 자연스러운 입장입니다.\n"
-                "찬성 입장을 뒷받침하는 가장 강력한 논거를 당신의 전문 지식에서 찾아 제시하세요.\n"
-                "단, 상대측의 강한 반박에 설득된다면 [ADMIT]로 솔직하게 인정해도 됩니다.\n"
-            )
-        elif stance == "AGAINST":
-            return (
-                "\n【역할 배정: 반대 측】\n"
-                "이 토론에서 당신은 반대 측 논거를 중심으로 발언합니다.\n"
-                "이것은 당신의 bias(이념적 성향)와 일치하는 자연스러운 입장입니다.\n"
-                "반대 입장을 뒷받침하는 가장 강력한 논거를 당신의 전문 지식에서 찾아 제시하세요.\n"
-                "단, 상대측의 강한 논거에 설득된다면 [ADMIT]로 솔직하게 인정해도 됩니다.\n"
-            )
-        return ""
+        m = self.member_map.get(member_id, {})
+        bias = m.get("bias", "중립")
+        vote_tendency = m.get("vote_tendency", "")
+
+        guide = (
+            "\n【입장 형성 원칙】\n"
+            "당신의 찬반 입장은 사전에 배정된 것이 아닙니다.\n"
+            "당신이 학습한 데이터, 지식, 가치관을 바탕으로 이 안건을 스스로 판단하세요.\n"
+            f"당신의 이념적 성향({bias})은 하나의 렌즈입니다 — 이를 참고하되, "
+            "안건의 실질적 내용과 논거를 더 중요하게 고려하세요.\n"
+        )
+        if vote_tendency:
+            guide += f"참고: {vote_tendency}\n"
+        guide += (
+            "토론이 진행되면서 더 강한 논거·데이터에 설득된다면 [ADMIT]로 솔직히 인정하고 입장을 바꾸세요.\n"
+            "만장일치 결론이 나더라도 그것이 논리적으로 타당하다면 자연스러운 결과입니다.\n"
+        )
+        return guide
 
     def _get_last_speech_context(self, current_member: dict) -> str:
         if not self.ctx.all_logs:
@@ -1011,20 +960,13 @@ class DebateEngine:
         return ""
 
     # ══════════════════════════════════════════════
-    # [FIX-T5] 지목 발언 헬퍼 — nominate + 짧은 ACK 대기를 묶음
+    # 지목 발언 헬퍼
     # ══════════════════════════════════════════════
     async def _nominate(self, chair: dict, member: dict, text: str = None):
-        """
-        의장이 의원을 지목하는 짧은 발언을 전송하고
-        NOMINATE_ACK_TIMEOUT(5초) 안에 ACK를 기다린다.
-        [FIX-T5] 기존 skip_wait=True(0.3초)를 대체.
-        TTS가 5초 내 완료되면 ACK 즉시 수신 → 바로 다음 단계.
-        5초 초과 시 자동 진행 (짧은 지목 문장에서 5초 초과는 TTS 지연 상황).
-        """
+        """의장이 의원을 지목하는 짧은 발언을 즉시 전송. ACK 대기 없음."""
         nominate = text or f"{member['name']} 의원님, 발언해 주시기 바랍니다."
         self.ctx.push(f"[의장 {chair['name']}]", nominate)
         await self.send_speech(chair, nominate, "NORMAL", True)
-        await self._wait_for_ready(NOMINATE_ACK_TIMEOUT)
 
     # ══════════════════════════════════════════════
     # 메인 진입점
@@ -1035,13 +977,20 @@ class DebateEngine:
             format    = self.debate_format,
             chairId   = chair["id"],
             chairName = chair["name"],
+            maxTurns  = self.max_turns,
+            rounds    = self.rounds,
         )
-        print(f"[Engine] 의장: {chair['name']} / 형식: {self.debate_format} / 라운드: {self.rounds}")
+        print(f"[Engine] 의장: {chair['name']} / 형식: {self.debate_format} / {self.rounds}라운드 / 최대 {self.max_turns}턴")
 
         self._assign_stances(chair["id"])
-        self.start_time = time.time()
 
-        ack_task = asyncio.create_task(self._ack_listener())
+        # 사전 리서치 (턴 카운트 시작 전)
+        try:
+            await self.research_phase()
+        except Exception as e:
+            print(f"[Engine] 사전 리서치 전체 실패 (토론은 정상 진행): {e}")
+
+        # ACK 리스너 불필요 — 제거됨
 
         dispatch = {
             "릴레이":     self._run_relay,
@@ -1050,14 +999,7 @@ class DebateEngine:
             "자유토론":   self._run_free,
         }
         runner = dispatch.get(self.debate_format, self._run_relay)
-        try:
-            await runner(chair)
-        finally:
-            ack_task.cancel()
-            try:
-                await ack_task
-            except asyncio.CancelledError:
-                pass
+        await runner(chair)
 
     # ══════════════════════════════════════════════
     # 1. 릴레이 토론
@@ -1075,26 +1017,26 @@ class DebateEngine:
 
         open_instruction = (
             f"지금부터 AI 의회 본회의를 개회합니다. "
-            f"오늘 상정된 안건은 \"{self.issue}\"입니다. "
-            f"이 안건은 우리 사회에서 중요한 의미를 지니며, 다양한 관점에서 심도 있는 논의가 필요합니다. "
-            f"본 토론은 {self.rounds}라운드 릴레이 형식으로 진행되며, 총 {self.duration}분이 주어집니다. "
-            f"의원 여러분은 각자의 전문 지식과 학습 데이터를 바탕으로 논거를 제시해 주시기 바랍니다. "
-            f"이제 제1라운드를 시작합니다."
+            f"오늘 상정된 안건은 '{self.issue}'입니다. "
+            f"이 안건의 사회적·정책적 배경과 현재 논의가 필요한 이유를 2~3문장으로 소개하고, "
+            f"찬성 측과 반대 측이 각각 중심적으로 다룰 것으로 예상되는 핵심 쟁점 2~3가지를 구체적으로 예고하세요. "
+            f"그런 다음 본 토론이 {self.rounds}라운드 릴레이 형식으로 진행됨을 안내하고, "
+            f"의원들이 실증 데이터와 문헌 근거를 적극 활용해 논거를 전개해 줄 것을 당부하세요."
         )
         if first_member:
-            open_instruction += f" 첫 번째 발언자로 {first_member['name']} 의원님께 발언권을 드립니다."
-        open_text = await self.chair_speak(chair, open_instruction, max_chars=CHAIR_MAX_LEN + 150)
+            open_instruction += f" 마지막으로 첫 번째 발언자로 {first_member['name']} 의원님께 발언권을 드리세요."
+        open_text = await self.chair_speak(chair, open_instruction, max_chars=CHAIR_MAX_LEN + 250, is_opening=True)
+
         self.ctx.push(f"[의장 {chair['name']}]", open_text)
         await self.send_speech(chair, open_text, "NORMAL", True)
-        await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
 
         _next_order_override = None
 
         for round_num in range(1, self.rounds + 1):
             self.current_round = round_num
 
-            if self._time_over():
-                print(f"[Engine] 릴레이 시간 초과 ({self._elapsed_minutes():.1f}분) — 의결로 이동")
+            if self._turns_over():
+                print(f"[Engine] 릴레이 턴 소진 ({self._turn_count}턴) — 의결로 이동")
                 await self.run_conclusion(chair, timed_out=True)
                 return
 
@@ -1107,128 +1049,35 @@ class DebateEngine:
                 order = non_chair.copy()
                 random.shuffle(order)
 
-            prefetch_task   = None
-            prefetch_member = None
-
             for idx, m in enumerate(order):
-                if self._time_over():
-                    if prefetch_task:
-                        prefetch_task.cancel()
-                        try:
-                            await prefetch_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
+                if self._turns_over():
                     await self.run_conclusion(chair, timed_out=True)
                     return
 
-                # [FIX-T5] 지목 발언: skip_wait → _nominate() 사용
                 if idx > 0:
                     await self._nominate(chair, m)
 
-                if prefetch_task is None or prefetch_member is None or prefetch_member["id"] != m["id"]:
-                    if prefetch_task is not None:
-                        prefetch_task.cancel()
-                        try:
-                            await prefetch_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                        prefetch_task = None
-                    cur_opinion, cur_stype = await self.prepare_speech(
-                        chair, m, fmt_guide, round_num
-                    )
-                else:
-                    cur_opinion, cur_stype = await prefetch_task
-                    prefetch_task = None
-
-                next_idx = idx + 1
-                if next_idx < len(order) and not self._time_over():
-                    next_m = order[next_idx]
-                    prefetch_member = next_m
-                    prefetch_task = asyncio.create_task(
-                        self.prepare_speech(chair, next_m, fmt_guide, round_num)
-                    )
-                else:
-                    prefetch_task   = None
-                    prefetch_member = None
-
+                cur_opinion, cur_stype = await self.prepare_speech(
+                    chair, m, fmt_guide, round_num
+                )
                 await self.deliver_speech(
                     chair, m, cur_opinion, cur_stype,
                     non_chair, fmt_guide, round_num
                 )
 
             if round_num < self.rounds:
-                elapsed_ratio = self._elapsed_minutes() / self.duration if self.duration > 0 else 1.0
+                if self._turns_over():
+                    await self.run_conclusion(chair, timed_out=True)
+                    return
+                next_order = non_chair.copy()
+                random.shuffle(next_order)
+                next_first = next_order[0] if next_order else None
+                transition = await self.chair_transition_round(chair, round_num, first_member=next_first)
+                self.ctx.push(f"[의장 {chair['name']}]", transition)
+                await self.send_speech(chair, transition, "NORMAL", True)
+                _next_order_override = next_order
 
-                if elapsed_ratio >= 0.85 and (self.rounds - round_num) >= 2:
-                    final_order = non_chair.copy()
-                    random.shuffle(final_order)
-                    final_first = final_order[0] if final_order else None
-
-                    final_text = await self.chair_announce_round(chair, self.rounds, first_member=final_first)
-                    self.ctx.push(f"[의장 {chair['name']}]", final_text)
-                    await self.send_speech(chair, final_text, "NORMAL", True)
-                    await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
-
-                    _final_timed_out = False
-                    _fpf = None
-                    _fpf_member = None
-                    for _fi, fm in enumerate(final_order):
-                        if self._time_over():
-                            if _fpf:
-                                _fpf.cancel()
-                                try:
-                                    await _fpf
-                                except (asyncio.CancelledError, Exception):
-                                    pass
-                            _final_timed_out = True
-                            break
-                        # [FIX-T5] 첫 번째 제외, 지목 발언 모두 _nominate() 사용
-                        if _fi > 0:
-                            await self._nominate(chair, fm)
-                        if _fpf is None or _fpf_member is None or _fpf_member["id"] != fm["id"]:
-                            if _fpf is not None:
-                                _fpf.cancel()
-                                try:
-                                    await _fpf
-                                except (asyncio.CancelledError, Exception):
-                                    pass
-                            _fop, _fst = await self.prepare_speech(chair, fm, fmt_guide, self.rounds)
-                        else:
-                            _fop, _fst = await _fpf
-                            _fpf = None
-                        _ni = _fi + 1
-                        if _ni < len(final_order) and not self._time_over():
-                            _fpf_member = final_order[_ni]
-                            _fpf = asyncio.create_task(self.prepare_speech(chair, _fpf_member, fmt_guide, self.rounds))
-                        else:
-                            _fpf = None
-                            _fpf_member = None
-                        await self.deliver_speech(chair, fm, _fop, _fst, non_chair, fmt_guide, self.rounds)
-                    if _final_timed_out:
-                        await self.run_conclusion(chair, timed_out=True)
-                        return
-                    if _fpf is not None:
-                        _fpf.cancel()
-                        try:
-                            await _fpf
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                        _fpf = None
-                    break
-                else:
-                    if self._time_over():
-                        await self.run_conclusion(chair, timed_out=True)
-                        return
-                    next_order = non_chair.copy()
-                    random.shuffle(next_order)
-                    next_first = next_order[0] if next_order else None
-                    transition = await self.chair_transition_round(chair, round_num, first_member=next_first)
-                    self.ctx.push(f"[의장 {chair['name']}]", transition)
-                    await self.send_speech(chair, transition, "NORMAL", True)
-                    await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
-                    _next_order_override = next_order
-
-        await self.run_conclusion(chair, timed_out=self._time_over())
+        await self.run_conclusion(chair, timed_out=self._turns_over())
 
     # ══════════════════════════════════════════════
     # 2. 집중토론
@@ -1255,85 +1104,49 @@ class DebateEngine:
         open_text = await self.chair_speak(
             chair,
             f"지금부터 AI 의회 본회의를 개회합니다. "
-            f"오늘 상정된 안건은 \"{self.issue}\"이며, 이는 면밀한 검토와 논의가 요구되는 사안입니다. "
-            f"본 토론은 집중토론 형식으로, 핵심 토론자인 {d_names}께서 {self.rounds}라운드에 걸쳐 집중 대결합니다. "
-            f"그 외 의원들은 이후 질의 시간에 발언 기회가 주어집니다. "
-            f"1라운드를 시작합니다. 먼저 {debaters[0]['name']} 의원님, 발언해 주십시오.",
-            max_chars=CHAIR_MAX_LEN + 150,
+            f"오늘 상정된 안건은 '{self.issue}'입니다. "
+            f"이 안건의 사회적·정책적 배경과 현시점에 논의가 필요한 이유를 2~3문장으로 소개하고, "
+            f"찬반 양측이 각각 중심적으로 다룰 핵심 쟁점 2~3가지를 구체적으로 예고해 주세요. "
+            f"본 토론은 집중토론 형식으로, 핵심 토론자 {d_names}께서 {self.rounds}라운드 집중 대결을 펼칩니다. "
+            f"나머지 의원들은 이후 질의 시간에 발언권이 주어집니다. "
+            f"실증 데이터와 문헌 근거를 적극 활용해 논거를 전개해 줄 것을 당부하며, "
+            f"1라운드 첫 발언자로 {debaters[0]['name']} 의원님께 발언권을 드립니다.",
+            max_chars=CHAIR_MAX_LEN + 250,
+            is_opening=True,
         )
         self.ctx.push(f"[의장 {chair['name']}]", open_text)
         await self.send_speech(chair, open_text, "NORMAL", True)
-        await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
-
-        _focused_next_pair = None
 
         for round_num in range(1, self.rounds + 1):
             self.current_round = round_num
 
-            if self._time_over():
+            if self._turns_over():
                 await self.run_conclusion(chair, timed_out=True)
                 return
 
-            if round_num == 1:
-                pair = debaters.copy()
-            elif _focused_next_pair is not None:
-                pair = _focused_next_pair
-                _focused_next_pair = None
-            else:
-                pair = debaters.copy()
+            pair = debaters.copy()
+            if round_num > 1:
                 random.shuffle(pair)
 
-            _pf = None
-            _pf_member = None
             for _pi, m in enumerate(pair):
-                if self._time_over():
-                    if _pf:
-                        _pf.cancel()
-                        try:
-                            await _pf
-                        except (asyncio.CancelledError, Exception):
-                            pass
+                if self._turns_over():
                     await self.run_conclusion(chair, timed_out=True)
                     return
-                # [FIX-T5] 두 번째 토론자 지목도 _nominate()
                 if _pi > 0:
-                    await self._nominate(chair, m,
-                        text=f"{m['name']} 의원님, 발언해 주십시오.")
-                if _pf is None or _pf_member is None or _pf_member["id"] != m["id"]:
-                    if _pf is not None:
-                        _pf.cancel()
-                        try:
-                            await _pf
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                    _po, _ps = await self.prepare_speech(chair, m, fmt_guide, round_num)
-                else:
-                    _po, _ps = await _pf
-                    _pf = None
-                _ni = _pi + 1
-                if _ni < len(pair) and not self._time_over():
-                    _pf_member = pair[_ni]
-                    _pf = asyncio.create_task(self.prepare_speech(chair, _pf_member, fmt_guide, round_num))
-                else:
-                    _pf = None
-                    _pf_member = None
+                    await self._nominate(chair, m, text=f"{m['name']} 의원님, 발언해 주십시오.")
+                _po, _ps = await self.prepare_speech(chair, m, fmt_guide, round_num)
                 await self.deliver_speech(chair, m, _po, _ps, non_chair, fmt_guide, round_num)
 
             if round_num < self.rounds:
-                if self._time_over():
+                if self._turns_over():
                     await self.run_conclusion(chair, timed_out=True)
                     return
-                _focused_next_pair = debaters.copy()
-                random.shuffle(_focused_next_pair)
-                next_first = _focused_next_pair[0] if _focused_next_pair else None
+                next_first = debaters[1] if round_num % 2 == 0 else debaters[0]
                 transition = await self.chair_transition_round(chair, round_num, first_member=next_first)
                 self.ctx.push(f"[의장 {chair['name']}]", transition)
                 await self.send_speech(chair, transition, "NORMAL", True)
-                await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
 
-        _obs_timed_out = False
-
-        if observers and not self._time_over():
+        if observers and not self._turns_over():
             qa_open = await self.chair_speak(
                 chair,
                 "핵심토론이 완료되었습니다. 나머지 의원님들의 질의 시간입니다.",
@@ -1341,46 +1154,15 @@ class DebateEngine:
             )
             self.ctx.push(f"[의장 {chair['name']}]", qa_open)
             await self.send_speech(chair, qa_open, "NORMAL", True)
-            await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
-            _of = None
-            _of_member = None
-            for _oi, m in enumerate(observers):
-                if self._time_over():
-                    if _of:
-                        _of.cancel()
-                        try:
-                            await _of
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                    _obs_timed_out = True
-                    break
-                # [FIX-T5]
-                await self._nominate(chair, m,
-                    text=f"{m['name']} 의원님, 질의해 주십시오.")
-                if _of is not None and _of_member is not None and _of_member["id"] == m["id"]:
-                    _oo, _os2 = await _of
-                    _of = None
-                    _of_member = None
-                else:
-                    if _of is not None:
-                        _of.cancel()
-                        try:
-                            await _of
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                        _of = None
-                        _of_member = None
-                    _oo, _os2 = await self.prepare_speech(chair, m, fmt_guide, max(1, self.rounds - 1))
-                _ni = _oi + 1
-                if _ni < len(observers) and not self._time_over():
-                    _of_member = observers[_ni]
-                    _of = asyncio.create_task(self.prepare_speech(chair, _of_member, fmt_guide, max(1, self.rounds - 1)))
-                else:
-                    _of = None
-                    _of_member = None
-                await self.deliver_speech(chair, m, _oo, _os2, non_chair, fmt_guide, max(1, self.rounds - 1))
 
-        await self.run_conclusion(chair, timed_out=_obs_timed_out or self._time_over())
+            for m in observers:
+                if self._turns_over():
+                    break
+                await self._nominate(chair, m, text=f"{m['name']} 의원님, 질의해 주십시오.")
+                _oo, _os2 = await self.prepare_speech(chair, m, fmt_guide, self.rounds)
+                await self.deliver_speech(chair, m, _oo, _os2, non_chair, fmt_guide, self.rounds)
+
+        await self.run_conclusion(chair, timed_out=self._turns_over())
 
     # ══════════════════════════════════════════════
     # 3. 전문가패널
@@ -1388,188 +1170,63 @@ class DebateEngine:
     async def _run_panel(self, chair: dict):
         fmt_guide = (
             f"【전문가패널 형식 규칙】\n"
-            "전문가 패널이 먼저 심층 발언합니다.\n"
-            "패널 발언 후 전체 질의·응답 시간이 진행됩니다.\n"
-            f"패널 발언 중 다른 의원의 개입은 허용하지 않습니다. 최대 {MAX_SPEECH_LEN}자."
+            "패널로 선정된 의원이 심층 발언을 합니다.\n"
+            "일반 의원은 패널에게 질의하는 형식으로 참여합니다.\n"
+            f"패널은 반드시 질의에 직접 답하되 새 데이터를 추가해야 합니다. 최대 {MAX_SPEECH_LEN}자."
         )
 
-        non_chair   = [m for m in self.members if m["id"] != chair["id"]]
-        panel_count = max(1, min(3, len(non_chair) // 2))
-        panels      = random.sample(non_chair, panel_count)
-        general     = [m for m in non_chair if m not in panels]
-        p_names     = ", ".join(f"{p['name']} 의원" for p in panels)
+        non_chair = [m for m in self.members if m["id"] != chair["id"]]
+        if len(non_chair) < 2:
+            await self._run_relay(chair)
+            return
 
-        open_text = await self.chair_speak(
-            chair,
-            f"안건 \"{self.issue}\"에 대한 전문가패널 토론을 개회합니다. "
-            f"전문가 패널로 {p_names}을 선정했습니다. "
-            "심층 발언 후 전체 질의·응답을 진행합니다. "
-            "패널 발언 중에는 다른 의원의 개입을 엄격히 금합니다.",
-            max_chars=CHAIR_MAX_LEN,
-        )
-        self.ctx.push(f"[의장 {chair['name']}]", open_text)
-        await self.send_speech(chair, open_text, "NORMAL", True)
-        await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
-
-        panel_start = await self.chair_speak(
-            chair,
-            "패널 심층 발언을 시작합니다. 각 패널은 전문 분야의 깊이 있는 분석을 제시해 주십시오.",
-            max_chars=120,
-        )
-        self.ctx.push(f"[의장 {chair['name']}]", panel_start)
-        await self.send_speech(chair, panel_start, "NORMAL", True)
-        await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
-
-        _pnf = None
-        _pnf_member = None
-        for _pni, m in enumerate(panels):
-            if self._time_over():
-                if _pnf:
-                    _pnf.cancel()
-                    try:
-                        await _pnf
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                await self.run_conclusion(chair, timed_out=True)
-                return
-            # [FIX-T5]
-            await self._nominate(chair, m,
-                text=f"패널 {m['name']} 의원님, 전문가 발언을 시작해 주십시오.")
-            if _pnf is not None and _pnf_member is not None and _pnf_member["id"] == m["id"]:
-                _pno, _pns = await _pnf
-                _pnf = None
-                _pnf_member = None
-            else:
-                if _pnf is not None:
-                    _pnf.cancel()
-                    try:
-                        await _pnf
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    _pnf = None
-                    _pnf_member = None
-                _pno, _pns = await self.prepare_speech(chair, m, fmt_guide, 1)
-            _ni = _pni + 1
-            if _ni < len(panels) and not self._time_over():
-                _pnf_member = panels[_ni]
-                _pnf = asyncio.create_task(self.prepare_speech(chair, _pnf_member, fmt_guide, 1))
-            else:
-                _pnf = None
-                _pnf_member = None
-            await self.deliver_speech(chair, m, _pno, _pns, non_chair, fmt_guide, 1)
-
-        if _pnf is not None:
-            _pnf.cancel()
-            try:
-                await _pnf
-            except (asyncio.CancelledError, Exception):
-                pass
-            _pnf = None
+        panel_count = max(1, len(non_chair) // 2)
+        panels  = random.sample(non_chair, panel_count)
+        general = [m for m in non_chair if m not in panels]
+        p_names = ", ".join(p["name"] for p in panels)
 
         summary = await self.chair_speak(
             chair,
-            "패널 심층 발언이 완료되었습니다. 전체 질의·응답 시간을 시작합니다.",
-            max_chars=CHAIR_MAX_LEN,
+            f"지금부터 AI 의회 전문가패널 토론을 개회합니다. "
+            f"안건은 '{self.issue}'입니다. "
+            f"패널로는 {p_names} 의원님께서 선정되었습니다. "
+            "패널 의원님들의 심층 발언과 일반 의원들의 질의로 진행됩니다.",
+            max_chars=CHAIR_MAX_LEN + 100,
+            is_opening=True,
         )
         self.ctx.push(f"[의장 {chair['name']}]", summary)
         await self.send_speech(chair, summary, "NORMAL", True)
-        await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
 
-        _panel_timed_out = False
         qa_rounds = max(1, self.rounds - 1)
         for qa_round in range(1, qa_rounds + 1):
-            if self._time_over():
-                _panel_timed_out = True
+            if self._turns_over():
                 break
-            if general:
-                qa_text = await self.chair_speak(
-                    chair,
-                    f"전체 질의·응답 {qa_round}라운드를 시작합니다.",
-                    max_chars=100,
-                )
-                self.ctx.push(f"[의장 {chair['name']}]", qa_text)
-                await self.send_speech(chair, qa_text, "NORMAL", True)
-                await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
+            qa_text = await self.chair_speak(
+                chair,
+                f"전체 질의·응답 {qa_round}라운드를 시작합니다.",
+                max_chars=100,
+            )
+            self.ctx.push(f"[의장 {chair['name']}]", qa_text)
+            await self.send_speech(chair, qa_text, "NORMAL", True)
 
+            if general:
                 shuffled_gen = general.copy()
                 random.shuffle(shuffled_gen)
-                _gf = None
-                _gf_member = None
-                for _gi, m in enumerate(shuffled_gen):
-                    if self._time_over():
-                        if _gf:
-                            _gf.cancel()
-                            try:
-                                await _gf
-                            except (asyncio.CancelledError, Exception):
-                                pass
-                        _panel_timed_out = True
+                for m in shuffled_gen:
+                    if self._turns_over():
                         break
-                    # [FIX-T5]
-                    await self._nominate(chair, m,
-                        text=f"{m['name']} 의원님, 패널에 질의해 주십시오.")
-                    if _gf is not None and _gf_member is not None and _gf_member["id"] == m["id"]:
-                        _go, _gs = await _gf
-                        _gf = None
-                        _gf_member = None
-                    else:
-                        if _gf is not None:
-                            _gf.cancel()
-                            try:
-                                await _gf
-                            except (asyncio.CancelledError, Exception):
-                                pass
-                            _gf = None
-                            _gf_member = None
-                        _go, _gs = await self.prepare_speech(chair, m, fmt_guide, max(1, self.rounds - 1))
-                    _ni = _gi + 1
-                    if _ni < len(shuffled_gen) and not self._time_over():
-                        _gf_member = shuffled_gen[_ni]
-                        _gf = asyncio.create_task(self.prepare_speech(chair, _gf_member, fmt_guide, max(1, self.rounds - 1)))
-                    else:
-                        _gf = None
-                        _gf_member = None
+                    await self._nominate(chair, m, text=f"{m['name']} 의원님, 패널에 질의해 주십시오.")
+                    _go, _gs = await self.prepare_speech(chair, m, fmt_guide, max(1, self.rounds - 1))
                     await self.deliver_speech(chair, m, _go, _gs, non_chair, fmt_guide, max(1, self.rounds - 1))
 
-            _rf = None
-            _rf_member = None
-            for _ri, p in enumerate(panels):
-                if self._time_over():
-                    if _rf:
-                        _rf.cancel()
-                        try:
-                            await _rf
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                    _panel_timed_out = True
+            for p in panels:
+                if self._turns_over():
                     break
-                # [FIX-T5]
-                await self._nominate(chair, p,
-                    text=f"패널 {p['name']} 의원님, 질의에 응답해 주십시오.")
-                if _rf is not None and _rf_member is not None and _rf_member["id"] == p["id"]:
-                    _ro, _rs = await _rf
-                    _rf = None
-                    _rf_member = None
-                else:
-                    if _rf is not None:
-                        _rf.cancel()
-                        try:
-                            await _rf
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                        _rf = None
-                        _rf_member = None
-                    _ro, _rs = await self.prepare_speech(chair, p, fmt_guide, max(1, self.rounds - 1))
-                _ni = _ri + 1
-                if _ni < len(panels) and not self._time_over():
-                    _rf_member = panels[_ni]
-                    _rf = asyncio.create_task(self.prepare_speech(chair, _rf_member, fmt_guide, max(1, self.rounds - 1)))
-                else:
-                    _rf = None
-                    _rf_member = None
+                await self._nominate(chair, p, text=f"패널 {p['name']} 의원님, 질의에 응답해 주십시오.")
+                _ro, _rs = await self.prepare_speech(chair, p, fmt_guide, max(1, self.rounds - 1))
                 await self.deliver_speech(chair, p, _ro, _rs, non_chair, fmt_guide, max(1, self.rounds - 1))
 
-        await self.run_conclusion(chair, timed_out=_panel_timed_out or self._time_over())
+        await self.run_conclusion(chair, timed_out=self._turns_over())
 
     # ══════════════════════════════════════════════
     # 4. 자유토론
@@ -1580,51 +1237,49 @@ class DebateEngine:
             "순서 제한 없이 누구든 자유롭게 발언합니다.\n"
             "앞선 발언들을 면밀히 검토하고 논리적 타당성만으로 반응을 선택하세요.\n"
             "새로운 근거·데이터([DATA]), 시각화([GRAPHIC]), 표([TABLE])를 적극 활용하세요.\n"
-            f"시간 또는 발언 수 한도 종료 후 의장이 즉시 최종 의결을 진행합니다. 최대 {MAX_SPEECH_LEN}자."
+            f"최대 {self.max_free_turns}회 발언 후 의장이 즉시 최종 의결을 진행합니다. 최대 {MAX_SPEECH_LEN}자."
         )
 
-        deadline_mins  = self.duration
-        warn_threshold = deadline_mins * 0.8
+        warn_threshold = int(self.max_free_turns * 0.8)
 
         open_text = await self.chair_speak(
             chair,
             f"지금부터 AI 의회 본회의를 개회합니다. "
-            f"오늘 상정된 안건은 \"{self.issue}\"입니다. "
-            f"이 안건은 다양한 관점에서 심층적 검토가 필요한 사안으로, "
-            f"본 의회는 자유토론 형식으로 논의를 진행합니다. "
-            f"총 {deadline_mins}분 또는 최대 {self.max_free_turns}회 발언 한도 내에서 "
-            "순서 제한 없이 자유롭게 발언하실 수 있습니다. "
-            "시간 또는 발언 한도 종료 후에는 즉시 최종 의결로 이행합니다.",
-            max_chars=CHAIR_MAX_LEN + 150,
+            f"오늘 상정된 안건은 '{self.issue}'입니다. "
+            f"이 안건의 사회적·정책적 배경과 현시점 논의 필요성을 2~3문장으로 소개하고, "
+            f"이 자유토론에서 집중적으로 다루어져야 할 핵심 쟁점 2~3가지를 구체적으로 예고해 주세요. "
+            f"본 토론은 자유토론 형식으로 최대 {self.max_free_turns}회 발언 한도 내에서 "
+            "순서 제한 없이 자유롭게 발언할 수 있습니다. "
+            "의원들이 실증 데이터, 통계, 문헌 근거를 적극 활용해 논거를 전개해 줄 것을 당부하며, "
+            "발언 한도 종료 후에는 즉시 최종 의결로 이행합니다.",
+            max_chars=CHAIR_MAX_LEN + 250,
+            is_opening=True,
         )
         self.ctx.push(f"[의장 {chair['name']}]", open_text)
         await self.send_speech(chair, open_text, "NORMAL", True)
-        await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
 
         warned    = False
         turn      = 0
         non_chair = [m for m in self.members if m["id"] != chair["id"]]
 
-        while not self._time_over() and turn < self.max_free_turns:
-            elapsed = self._elapsed_minutes()
+        while not self._turns_over() and turn < self.max_free_turns:
 
-            if not warned and elapsed >= warn_threshold:
+            # 80% 턴 소진 경고
+            if not warned and turn >= warn_threshold:
                 warned = True
-                remaining_sec   = int((deadline_mins - elapsed) * 60)
-                remaining_turns = self.max_free_turns - turn
+                remaining = self.max_free_turns - turn
                 warn_text = await self.chair_speak(
                     chair,
-                    f"시간 알림: 자유토론 종료까지 약 {remaining_sec}초, "
-                    f"잔여 발언 {remaining_turns}회 남았습니다. "
+                    f"발언 한도 알림: 잔여 발언 {remaining}회 남았습니다. "
                     "핵심 주장을 마무리해 주시기 바랍니다.",
-                    max_chars=140,
+                    max_chars=120,
                 )
                 self.ctx.push(f"[의장 {chair['name']}]", warn_text)
                 await self.send_speech(chair, warn_text, "NORMAL", True)
-                await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
-                if self._time_over() or turn >= self.max_free_turns:
+                if self._turns_over() or turn >= self.max_free_turns:
                     break
 
+            # 발언자 선택
             speaker = None
             if self.ctx.all_logs:
                 last_log  = self.ctx.all_logs[-1]
@@ -1647,14 +1302,14 @@ class DebateEngine:
 
             await self.send("status",
                 message=f"[자유토론] {speaker['name']} 의원 발언 준비 중... "
-                        f"({int(elapsed)}분 {int((elapsed % 1)*60)}초 / {deadline_mins}분 "
-                        f"| {turn+1}/{self.max_free_turns}회)")
+                        f"({turn+1}/{self.max_free_turns}턴)")
 
             _fo, _fs = await self.prepare_speech(chair, speaker, fmt_guide, 1, free_mode=True)
             await self.deliver_speech(chair, speaker, _fo, _fs, non_chair, fmt_guide, 1, free_mode=True)
             turn += 1
 
-            if turn > 0 and turn % 5 == 0 and not self._time_over() and turn < self.max_free_turns:
+            # 5턴마다 중간 정리
+            if turn > 0 and turn % 5 == 0 and not self._turns_over() and turn < self.max_free_turns:
                 inter = await self.chair_speak(
                     chair,
                     "잠시 중간 정리를 하겠습니다. 현재까지의 주요 찬반 논점을 요약하고 자유토론을 계속합니다.",
@@ -1662,7 +1317,6 @@ class DebateEngine:
                 )
                 self.ctx.push(f"[의장 {chair['name']}]", inter)
                 await self.send_speech(chair, inter, "NORMAL", True)
-                await self._wait_for_ready(SPEECH_ACK_TIMEOUT)
 
-        print(f"[Engine] 자유토론 종료: {turn}회 발언 / {self._elapsed_minutes():.1f}분 경과")
-        await self.run_conclusion(chair, timed_out=self._time_over())
+        print(f"[Engine] 자유토론 종료: {turn}회 발언")
+        await self.run_conclusion(chair, timed_out=self._turns_over())

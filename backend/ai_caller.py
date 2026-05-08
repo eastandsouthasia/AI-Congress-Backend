@@ -365,3 +365,146 @@ async def call_member(member: dict, messages: list, temperature: float = 0.5) ->
         fallback_text = f"{name} 의원은 더 많은 논의가 필요하다고 판단합니다."
         print(f"[{name}] 모든 엔진 실패 → 최소 응답 반환")
         return fallback_text
+
+
+# ─────────────────────────────────────────────
+# 사전 리서치: 안건 관련 최신 정보 수집
+#
+# 전략:
+#   1차: Gemini grounding (Google Search 실시간 연동) — 가장 최신 정보
+#   2차: OpenRouter perplexity-style 검색 모델 폴백
+#   3차: 일반 LLM(Groq/Gemini)으로 학습 기반 요약 — 검색 없이도 유용한 배경 지식
+#
+# 반환: 최대 600자 이내의 리서치 요약 텍스트 (실패 시 빈 문자열)
+# ─────────────────────────────────────────────
+async def call_research(issue: str, member_name: str, lens: str) -> str:
+    """
+    안건(issue)에 대해 해당 의원의 전문 렌즈(lens) 관점에서
+    최신 정보·통계·사례를 수집하여 발언에 활용 가능한 형태로 반환.
+
+    Args:
+        issue:       토론 안건 (예: "기본소득 도입")
+        member_name: 의원 이름 (로그용)
+        lens:        의원의 학습 기반 설명 (예: "Google 학습 기반 — 웹·학술·다국어")
+
+    Returns:
+        리서치 요약 문자열 (최대 600자). 실패 시 "" 반환.
+    """
+
+    research_prompt = (
+        f"토론 안건: \"{issue}\"\n\n"
+        f"당신은 {member_name}({lens})입니다.\n"
+        "위 안건에 대해 발언에 직접 활용할 수 있는 최신 사실·통계·사례·연구를 수집하세요.\n\n"
+        "반드시 포함할 내용:\n"
+        "1. 핵심 현황 수치 (최근 3년 이내 통계, 출처·연도 명시)\n"
+        "2. 국내외 주요 사례 또는 정책 동향\n"
+        "3. 찬반 논쟁에서 자주 인용되는 핵심 데이터 1~2개\n\n"
+        "형식: 불릿 없이 간결한 문장. 600자 이내. 출처와 연도를 반드시 명시.\n"
+        "불확실한 정보는 '추정' 또는 '불확실'로 표시하세요."
+    )
+
+    # ── 1차: Gemini grounding (Google Search 연동) ──
+    if GEMINI_API_KEY:
+        try:
+            sem = _ENGINE_SEMAPHORES["gemini"]
+            async with sem:
+                await _BUCKETS["gemini"].acquire()
+
+                system_text = (
+                    f"당신은 {member_name}({lens})입니다. "
+                    "Google 검색으로 찾은 최신 정보를 바탕으로 토론 준비 자료를 작성하세요."
+                )
+                contents = [{"role": "user", "parts": [{"text": research_prompt}]}]
+                url = (
+                    f"https://generativelanguage.googleapis.com/v1beta"
+                    f"/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+                )
+                payload = {
+                    "contents": contents,
+                    "system_instruction": {"parts": [{"text": system_text}]},
+                    "tools": [{"google_search": {}}],   # Grounding: 실시간 Google 검색
+                    "generationConfig": {
+                        "temperature": 0.3,
+                        "maxOutputTokens": 600,
+                    },
+                }
+                async with httpx.AsyncClient(timeout=25) as client:
+                    r = await client.post(url, json=payload)
+                    if r.status_code == 200:
+                        result = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                        print(f"[Research/{member_name}] Gemini grounding 성공 ({len(result)}자)")
+                        return result[:700]
+                    else:
+                        print(f"[Research/{member_name}] Gemini grounding HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[Research/{member_name}] Gemini grounding 실패: {e}")
+
+    # ── 2차: OpenRouter (sonar/검색 지원 모델) ──
+    if OPENROUTER_API_KEY:
+        try:
+            sem = _ENGINE_SEMAPHORES["openrouter"]
+            async with sem:
+                await _BUCKETS["openrouter"].acquire()
+
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            f"당신은 {member_name}({lens})입니다. "
+                            "웹 검색으로 최신 정보를 찾아 토론 준비 자료를 작성하세요."
+                        ),
+                    },
+                    {"role": "user", "content": research_prompt},
+                ]
+                headers = {
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://ai-congress.app",
+                    "X-Title": "AI Congress Research",
+                }
+                payload = {
+                    "model": "perplexity/sonar",   # 실시간 검색 내장 모델
+                    "messages": messages,
+                    "temperature": 0.3,
+                    "max_tokens": 600,
+                }
+                async with httpx.AsyncClient(timeout=30) as client:
+                    r = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        json=payload, headers=headers,
+                    )
+                    if r.status_code == 200:
+                        result = r.json()["choices"][0]["message"]["content"]
+                        print(f"[Research/{member_name}] OpenRouter sonar 성공 ({len(result)}자)")
+                        return result[:700]
+                    else:
+                        print(f"[Research/{member_name}] OpenRouter sonar HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[Research/{member_name}] OpenRouter sonar 실패: {e}")
+
+    # ── 3차: 일반 LLM — 학습 기반 배경 지식 요약 (검색 없음) ──
+    fallback_messages = [
+        {
+            "role": "system",
+            "content": (
+                f"당신은 {member_name}({lens})입니다. "
+                "당신이 학습한 지식을 바탕으로 아래 안건에 관한 배경 정보를 정리하세요. "
+                "불확실한 내용은 반드시 '추정' 또는 '불확실'로 명시하세요."
+            ),
+        },
+        {"role": "user", "content": research_prompt},
+    ]
+
+    for caller_fn, engine_name in (
+        (lambda m: call_groq(m, temperature=0.3, max_tokens=500), "groq"),
+        (lambda m: call_gemini(m, temperature=0.3, max_tokens=500), "gemini"),
+    ):
+        try:
+            result = await caller_fn(fallback_messages)
+            print(f"[Research/{member_name}] {engine_name} 폴백 성공 ({len(result)}자)")
+            return result[:700]
+        except Exception as e:
+            print(f"[Research/{member_name}] {engine_name} 폴백 실패: {e}")
+
+    print(f"[Research/{member_name}] 모든 리서치 시도 실패 — 빈 문자열 반환")
+    return ""
