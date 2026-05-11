@@ -379,42 +379,62 @@ async def call_member(member: dict, messages: list, temperature: float = 0.5) ->
 # ─────────────────────────────────────────────
 async def call_research(issue: str, member_name: str, lens: str) -> str:
     """
-    안건(issue)에 대해 해당 의원의 전문 렌즈(lens) 관점에서
-    최신 정보·통계·사례를 수집하여 발언에 활용 가능한 형태로 반환.
+    [개선] 3단계 심층 리서치 파이프라인
 
-    Args:
-        issue:       토론 안건 (예: "기본소득 도입")
-        member_name: 의원 이름 (로그용)
-        lens:        의원의 학습 기반 설명 (예: "Google 학습 기반 — 웹·학술·다국어")
+    단계 1 — 사실 수집 (검색 우선):
+        Gemini grounding(Google Search) 또는 Perplexity sonar로
+        안건 관련 최신 통계·사례·정책 동향을 수집.
+        의원별 lens에 맞는 각도로 질의를 특화.
+
+    단계 2 — 논점 분석 (내면화):
+        수집된 사실을 토대로 해당 의원의 이념적 렌즈에서
+        ① 가장 강력한 찬성 논거 2개
+        ② 가장 강력한 반대 논거 2개
+        ③ 상대가 꺼낼 가능성이 높은 반박과 그 약점
+        을 구조화하여 도출. (학습 기반 LLM으로 처리)
+
+    단계 3 — 발언 논거 합성:
+        1+2 결과를 합쳐 토론 발언에 직결되는
+        '핵심 무기 카드' 형태로 최종 합성.
 
     Returns:
-        리서치 요약 문자열 (최대 600자). 실패 시 "" 반환.
+        구조화된 리서치 텍스트 (최대 1500자). 실패 시 "" 반환.
     """
 
-    research_prompt = (
+    # ── STEP 1: 사실 수집 (검색 기반) ──────────────────────────────
+    # 의원별 lens에 맞춰 검색 각도를 특화
+    lens_angle = _lens_to_search_angle(lens)
+
+    fact_prompt = (
         f"토론 안건: \"{issue}\"\n\n"
         f"당신은 {member_name}({lens})입니다.\n"
-        "위 안건에 대해 발언에 직접 활용할 수 있는 최신 사실·통계·사례·연구를 수집하세요.\n\n"
-        "반드시 포함할 내용:\n"
-        "1. 핵심 현황 수치 (최근 3년 이내 통계, 출처·연도 명시)\n"
-        "2. 국내외 주요 사례 또는 정책 동향\n"
-        "3. 찬반 논쟁에서 자주 인용되는 핵심 데이터 1~2개\n\n"
-        "형식: 불릿 없이 간결한 문장. 600자 이내. 출처와 연도를 반드시 명시.\n"
-        "불확실한 정보는 '추정' 또는 '불확실'로 표시하세요."
+        f"이 안건을 '{lens_angle}' 관점에서 조사하세요.\n\n"
+        "수집해야 할 정보 (모두 포함, 출처·연도 필수):\n"
+        "A. 핵심 현황 수치 — 최근 3년 이내 통계, OECD/IMF/정부 공식 자료 우선\n"
+        "B. 국내외 정책 사례 — 실제 도입국 효과(정량 수치 포함)\n"
+        "C. 학술 연구 결과 — 찬성·반대 측 논문 각 1건 이상\n"
+        "D. 논쟁의 핵심 쟁점 — 현재 가장 뜨거운 실질 논점 2~3개\n\n"
+        "형식 요구사항:\n"
+        "- 각 항목을 A/B/C/D로 구분하여 작성\n"
+        "- 수치는 반드시 '기관명(연도): 수치' 형식\n"
+        "- 불확실한 정보는 반드시 [추정] 표시\n"
+        "- 800자 이내"
     )
 
-    # ── 1차: Gemini grounding (Google Search 연동) ──
+    raw_facts = ""
+
+    # 1-a: Gemini grounding (Google Search 실시간 연동)
     if GEMINI_API_KEY:
         try:
             sem = _ENGINE_SEMAPHORES["gemini"]
             async with sem:
                 await _BUCKETS["gemini"].acquire()
-
                 system_text = (
                     f"당신은 {member_name}({lens})입니다. "
-                    "Google 검색으로 찾은 최신 정보를 바탕으로 토론 준비 자료를 작성하세요."
+                    f"Google 검색으로 찾은 최신 정보를 '{lens_angle}' 관점에서 정리하세요. "
+                    "반드시 출처와 연도를 명시하세요."
                 )
-                contents = [{"role": "user", "parts": [{"text": research_prompt}]}]
+                contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
                 url = (
                     f"https://generativelanguage.googleapis.com/v1beta"
                     f"/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
@@ -422,39 +442,33 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
                 payload = {
                     "contents": contents,
                     "system_instruction": {"parts": [{"text": system_text}]},
-                    "tools": [{"google_search": {}}],   # Grounding: 실시간 Google 검색
-                    "generationConfig": {
-                        "temperature": 0.3,
-                        "maxOutputTokens": 600,
-                    },
+                    "tools": [{"google_search": {}}],
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
                 }
-                async with httpx.AsyncClient(timeout=25) as client:
+                async with httpx.AsyncClient(timeout=30) as client:
                     r = await client.post(url, json=payload)
                     if r.status_code == 200:
-                        result = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                        print(f"[Research/{member_name}] Gemini grounding 성공 ({len(result)}자)")
-                        return result[:700]
-                    else:
-                        print(f"[Research/{member_name}] Gemini grounding HTTP {r.status_code}")
+                        raw_facts = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                        print(f"[Research/{member_name}] Step1 Gemini grounding 성공 ({len(raw_facts)}자)")
         except Exception as e:
-            print(f"[Research/{member_name}] Gemini grounding 실패: {e}")
+            print(f"[Research/{member_name}] Step1 Gemini grounding 실패: {e}")
 
-    # ── 2차: OpenRouter (sonar/검색 지원 모델) ──
-    if OPENROUTER_API_KEY:
+    # 1-b: Perplexity sonar 폴백
+    if not raw_facts and OPENROUTER_API_KEY:
         try:
             sem = _ENGINE_SEMAPHORES["openrouter"]
             async with sem:
                 await _BUCKETS["openrouter"].acquire()
-
                 messages = [
                     {
                         "role": "system",
                         "content": (
                             f"당신은 {member_name}({lens})입니다. "
-                            "웹 검색으로 최신 정보를 찾아 토론 준비 자료를 작성하세요."
+                            f"웹 검색으로 최신 정보를 '{lens_angle}' 관점에서 수집하세요. "
+                            "반드시 출처와 연도를 명시하세요."
                         ),
                     },
-                    {"role": "user", "content": research_prompt},
+                    {"role": "user", "content": fact_prompt},
                 ]
                 headers = {
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -463,48 +477,280 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
                     "X-Title": "AI Congress Research",
                 }
                 payload = {
-                    "model": "perplexity/sonar",   # 실시간 검색 내장 모델
+                    "model": "perplexity/sonar",
                     "messages": messages,
-                    "temperature": 0.3,
-                    "max_tokens": 600,
+                    "temperature": 0.2,
+                    "max_tokens": 900,
                 }
+                async with httpx.AsyncClient(timeout=35) as client:
+                    r = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        json=payload, headers=headers,
+                    )
+                    if r.status_code == 200:
+                        raw_facts = r.json()["choices"][0]["message"]["content"]
+                        print(f"[Research/{member_name}] Step1 Perplexity sonar 성공 ({len(raw_facts)}자)")
+        except Exception as e:
+            print(f"[Research/{member_name}] Step1 Perplexity 실패: {e}")
+
+    # 1-c: 학습 기반 폴백 (검색 없음)
+    if not raw_facts:
+        try:
+            fallback_msgs = [
+                {
+                    "role": "system",
+                    "content": (
+                        f"당신은 {member_name}({lens})입니다. "
+                        f"당신이 학습한 지식에서 이 안건을 '{lens_angle}' 관점으로 조사하세요. "
+                        "불확실한 내용은 반드시 [추정]으로 명시하세요."
+                    ),
+                },
+                {"role": "user", "content": fact_prompt},
+            ]
+            for caller_fn, ename in (
+                (lambda m: call_groq(m, temperature=0.2, max_tokens=700), "groq"),
+                (lambda m: call_gemini(m, temperature=0.2, max_tokens=700), "gemini"),
+            ):
+                try:
+                    raw_facts = await caller_fn(fallback_msgs)
+                    print(f"[Research/{member_name}] Step1 {ename} 학습기반 성공 ({len(raw_facts)}자)")
+                    break
+                except Exception as fe:
+                    print(f"[Research/{member_name}] Step1 {ename} 실패: {fe}")
+        except Exception as e:
+            print(f"[Research/{member_name}] Step1 전체 실패: {e}")
+
+    if not raw_facts:
+        print(f"[Research/{member_name}] Step1 완전 실패 — 리서치 없이 진행")
+        return ""
+
+    # ── STEP 2: 논점 분석 — 수집된 사실을 의원의 렌즈로 내면화 ──────
+    analysis_prompt = (
+        f"토론 안건: \"{issue}\"\n\n"
+        f"당신은 {member_name}({lens})입니다.\n"
+        f"아래 수집된 사실 자료를 '{lens_angle}' 관점에서 분석하여,\n"
+        "토론에서 사용할 논거를 구조화하세요.\n\n"
+        f"[수집된 사실 자료]\n{raw_facts[:800]}\n\n"
+        "분석 결과를 다음 형식으로 작성하세요:\n\n"
+        "【찬성 논거 TOP2】\n"
+        "① (가장 강력한 찬성 논거 — 구체적 수치와 메커니즘 포함)\n"
+        "② (두 번째 찬성 논거)\n\n"
+        "【반대 논거 TOP2】\n"
+        "① (가장 강력한 반대 논거 — 구체적 수치와 메커니즘 포함)\n"
+        "② (두 번째 반대 논거)\n\n"
+        "【예상 반박과 약점】\n"
+        "상대방이 당신에게 꺼낼 가능성이 높은 반박 2개와, 그 반박의 논리적 허점:\n"
+        "▷ 반박1: / 허점: \n"
+        "▷ 반박2: / 허점: \n\n"
+        "【핵심 승부 데이터】\n"
+        "토론에서 결정적 역할을 할 수 있는 수치·사례 1개 (출처 포함):\n\n"
+        "700자 이내로 간결하게."
+    )
+
+    analysis = ""
+    analysis_msgs = [
+        {
+            "role": "system",
+            "content": (
+                f"당신은 전문 토론 전략가이자 {member_name}({lens})입니다. "
+                "수집된 자료를 바탕으로 토론 논거를 구조화하세요. "
+                "추상적 서술 금지 — 반드시 구체적 수치와 인과관계를 포함하세요."
+            ),
+        },
+        {"role": "user", "content": analysis_prompt},
+    ]
+
+    for caller_fn, ename in (
+        (lambda m: call_groq(m, temperature=0.3, max_tokens=700), "groq"),
+        (lambda m: call_gemini(m, temperature=0.3, max_tokens=700), "gemini"),
+        (lambda m: call_openrouter(m, temperature=0.3, max_tokens=700), "openrouter"),
+    ):
+        try:
+            analysis = await caller_fn(analysis_msgs)
+            print(f"[Research/{member_name}] Step2 논점분석 {ename} 성공 ({len(analysis)}자)")
+            break
+        except Exception as e:
+            print(f"[Research/{member_name}] Step2 {ename} 실패: {e}")
+
+    # ── STEP 3: 최종 합성 — 발언 직결 '무기 카드' 생성 ─────────────
+    if not analysis:
+        # Step2 실패 시 Step1 결과만이라도 반환
+        return raw_facts[:1200]
+
+    final_text = (
+        f"=== {member_name} 사전 리서치 완료 ===\n\n"
+        f"[수집된 핵심 사실]\n{raw_facts[:500]}\n\n"
+        f"[논점 분석 및 전략]\n{analysis[:700]}"
+    )
+
+    print(f"[Research/{member_name}] 3단계 리서치 완료 — 총 {len(final_text)}자")
+    return final_text[:1800]
+
+
+def _lens_to_search_angle(lens: str) -> str:
+    """
+    의원의 학습 기반 렌즈를 검색 특화 각도로 변환.
+    각 AI의 강점 영역에 맞는 질의 방향을 반환.
+    """
+    lens_lower = lens.lower()
+    if "google" in lens_lower or "웹" in lens_lower or "다국어" in lens_lower:
+        return "국제 비교 통계·다국어 문헌·Google Scholar 학술 데이터"
+    elif "meta" in lens_lower or "오픈소스" in lens_lower or "분권" in lens_lower:
+        return "오픈소스 생태계·시민사회 연구·분권화 사례·접근성 데이터"
+    elif "mistral" in lens_lower or "유럽" in lens_lower or "법치" in lens_lower:
+        return "EU 규정·유럽 법제도·GDPR·유럽 의회 자료·법적 판례"
+    elif "openai" in lens_lower or "rlhf" in lens_lower or "공정" in lens_lower:
+        return "사회적 영향 연구·공정성 지표·인간 피드백 기반 정책 평가"
+    elif "nvidia" in lens_lower or "하드웨어" in lens_lower or "과학" in lens_lower:
+        return "기술적 타당성·컴퓨팅 자원·과학 논문·엔지니어링 벤치마크"
+    else:
+        return "다각도 학술 연구·정책 효과 실증 데이터·국제 기관 보고서"
+
+# ─────────────────────────────────────────────
+# 토론 중 즉석 리서치 (중간 학습)
+# ─────────────────────────────────────────────
+async def call_research_targeted(
+    issue: str,
+    member_name: str,
+    lens: str,
+    trigger_speech: str,
+    unknown_terms: list,
+) -> str:
+    """
+    토론 도중 특정 용어·주장을 이해하지 못했을 때 즉석으로 실행하는
+    경량 2단계 리서치 (사전 리서치의 축약판).
+    Returns: 구조화된 즉석 리서치 텍스트 (최대 900자). 실패 시 "" 반환.
+    """
+    terms_str  = ", ".join(f'"{t}"' for t in (unknown_terms or [])[:5])
+    lens_angle = _lens_to_search_angle(lens)
+
+    fact_prompt = (
+        f"토론 안건: \"{issue}\"\n"
+        f"직전 발언: \"{trigger_speech[:400]}\"\n\n"
+        f"위 발언에서 다음 용어·주장이 등장했습니다: {terms_str}\n\n"
+        f"당신은 {member_name}({lens})입니다. '{lens_angle}' 관점에서 조사하세요.\n\n"
+        "수집 목표 (400자 이내, 출처·연도 필수):\n"
+        f"A. {terms_str} 의 정확한 정의와 맥락\n"
+        "B. 이 주장을 뒷받침하거나 반박하는 실증 수치\n"
+        "C. 이 주장의 논리적 강점과 약점 각 1개\n"
+        "불확실한 정보는 반드시 [추정] 표시."
+    )
+
+    raw_facts = ""
+
+    # 1-a: Gemini grounding
+    if GEMINI_API_KEY:
+        try:
+            async with _ENGINE_SEMAPHORES["gemini"]:
+                await _BUCKETS["gemini"].acquire()
+                contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
+                url = (
+                    f"https://generativelanguage.googleapis.com/v1beta"
+                    f"/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+                )
+                payload = {
+                    "contents": contents,
+                    "system_instruction": {"parts": [{"text": (
+                        f"당신은 {member_name}({lens})입니다. "
+                        "Google 검색으로 직전 발언의 핵심 용어를 빠르게 조사하세요. "
+                        "출처와 연도를 반드시 명시하세요."
+                    )}]},
+                    "tools": [{"google_search": {}}],
+                    "generationConfig": {"temperature": 0.15, "maxOutputTokens": 500},
+                }
+                async with httpx.AsyncClient(timeout=25) as client:
+                    r = await client.post(url, json=payload)
+                    if r.status_code == 200:
+                        raw_facts = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                        print(f"[MidResearch/{member_name}] Step1 Gemini 성공 ({len(raw_facts)}자)")
+        except Exception as e:
+            print(f"[MidResearch/{member_name}] Step1 Gemini 실패: {e}")
+
+    # 1-b: Perplexity sonar 폴백
+    if not raw_facts and OPENROUTER_API_KEY:
+        try:
+            async with _ENGINE_SEMAPHORES["openrouter"]:
+                await _BUCKETS["openrouter"].acquire()
+                msgs = [
+                    {"role": "system", "content": f"당신은 {member_name}({lens})입니다. 웹 검색으로 핵심 용어를 조사하세요."},
+                    {"role": "user", "content": fact_prompt},
+                ]
+                headers = {
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://ai-congress.app",
+                    "X-Title": "AI Congress MidDebate Research",
+                }
+                payload = {"model": "perplexity/sonar", "messages": msgs, "temperature": 0.15, "max_tokens": 500}
                 async with httpx.AsyncClient(timeout=30) as client:
                     r = await client.post(
                         "https://openrouter.ai/api/v1/chat/completions",
                         json=payload, headers=headers,
                     )
                     if r.status_code == 200:
-                        result = r.json()["choices"][0]["message"]["content"]
-                        print(f"[Research/{member_name}] OpenRouter sonar 성공 ({len(result)}자)")
-                        return result[:700]
-                    else:
-                        print(f"[Research/{member_name}] OpenRouter sonar HTTP {r.status_code}")
+                        raw_facts = r.json()["choices"][0]["message"]["content"]
+                        print(f"[MidResearch/{member_name}] Step1 Perplexity 성공 ({len(raw_facts)}자)")
         except Exception as e:
-            print(f"[Research/{member_name}] OpenRouter sonar 실패: {e}")
+            print(f"[MidResearch/{member_name}] Step1 Perplexity 실패: {e}")
 
-    # ── 3차: 일반 LLM — 학습 기반 배경 지식 요약 (검색 없음) ──
-    fallback_messages = [
-        {
-            "role": "system",
-            "content": (
-                f"당신은 {member_name}({lens})입니다. "
-                "당신이 학습한 지식을 바탕으로 아래 안건에 관한 배경 정보를 정리하세요. "
-                "불확실한 내용은 반드시 '추정' 또는 '불확실'로 명시하세요."
-            ),
-        },
-        {"role": "user", "content": research_prompt},
+    # 1-c: 학습 기반 폴백
+    if not raw_facts:
+        try:
+            fallback_msgs = [
+                {"role": "system", "content": f"당신은 {member_name}({lens})입니다. 학습된 지식에서 아래 발언의 핵심 용어를 조사하세요. 불확실하면 [추정]으로 명시."},
+                {"role": "user", "content": fact_prompt},
+            ]
+            for caller_fn, ename in (
+                (lambda m: call_groq(m, temperature=0.2, max_tokens=400), "groq"),
+                (lambda m: call_gemini(m, temperature=0.2, max_tokens=400), "gemini"),
+            ):
+                try:
+                    raw_facts = await caller_fn(fallback_msgs)
+                    print(f"[MidResearch/{member_name}] Step1 {ename} 학습기반 성공")
+                    break
+                except Exception as fe:
+                    print(f"[MidResearch/{member_name}] Step1 {ename} 실패: {fe}")
+        except Exception as e:
+            print(f"[MidResearch/{member_name}] Step1 학습기반 전체 실패: {e}")
+
+    if not raw_facts:
+        return ""
+
+    # STEP 2: 즉석 내면화
+    deliberation_prompt = (
+        f"토론 안건: \"{issue}\"\n"
+        f"상대 발언: \"{trigger_speech[:300]}\"\n"
+        f"방금 조사한 내용:\n{raw_facts[:500]}\n\n"
+        f"당신은 {member_name}({lens})입니다. 위 정보를 내면화하여:\n"
+        "1. 【이제 이해한 것】 상대 주장의 실제 의미와 근거 (1~2문장)\n"
+        "2. 【나의 대응 전략】 이 정보로 반박하거나 활용할 방법 (1~2문장, 구체적 수치 포함)\n"
+        "3. 【즉시 쓸 논거】 다음 발언에서 꺼낼 핵심 카드 1개\n"
+        "300자 이내로 간결하게."
+    )
+    deliberation = ""
+    delib_msgs = [
+        {"role": "system", "content": f"당신은 {member_name} 의원입니다. 조사한 정보를 즉시 토론 전략으로 소화하세요. 구체적 수치와 인과관계 중심."},
+        {"role": "user", "content": deliberation_prompt},
     ]
-
-    for caller_fn, engine_name in (
-        (lambda m: call_groq(m, temperature=0.3, max_tokens=500), "groq"),
-        (lambda m: call_gemini(m, temperature=0.3, max_tokens=500), "gemini"),
+    for caller_fn, ename in (
+        (lambda m: call_groq(m, temperature=0.3, max_tokens=350), "groq"),
+        (lambda m: call_gemini(m, temperature=0.3, max_tokens=350), "gemini"),
+        (lambda m: call_openrouter(m, temperature=0.3, max_tokens=350), "openrouter"),
     ):
         try:
-            result = await caller_fn(fallback_messages)
-            print(f"[Research/{member_name}] {engine_name} 폴백 성공 ({len(result)}자)")
-            return result[:700]
+            deliberation = await caller_fn(delib_msgs)
+            print(f"[MidResearch/{member_name}] Step2 내면화 {ename} 성공")
+            break
         except Exception as e:
-            print(f"[Research/{member_name}] {engine_name} 폴백 실패: {e}")
+            print(f"[MidResearch/{member_name}] Step2 {ename} 실패: {e}")
 
-    print(f"[Research/{member_name}] 모든 리서치 시도 실패 — 빈 문자열 반환")
-    return ""
+    if not deliberation:
+        return raw_facts[:600]
+
+    result = (
+        f"=== {member_name} 중간 즉석 학습 ({', '.join((unknown_terms or [])[:3])}) ===\n\n"
+        f"[조사된 사실]\n{raw_facts[:400]}\n\n"
+        f"[내면화 및 대응 전략]\n{deliberation[:350]}"
+    )
+    print(f"[MidResearch/{member_name}] 완료 — 총 {len(result)}자")
+    return result[:900]

@@ -34,7 +34,7 @@ import time
 import datetime
 from fastapi import WebSocket
 from members import MEMBERS
-from ai_caller import call_member, call_research
+from ai_caller import call_member, call_research, call_research_targeted
 from debate_context import DebateContext
 from conviction_tracker import ConvictionTracker
 
@@ -95,6 +95,15 @@ class DebateEngine:
         # 사전 리서치 결과 캐시 — member_id → 리서치 요약 텍스트
         self.research_cache: dict[str, str] = {m["id"]: "" for m in self.members}
 
+        # 내면화(deliberation) 결과 캐시 — member_id → 숙고 텍스트
+        self.deliberation_cache: dict[str, str] = {m["id"]: "" for m in self.members}
+
+        # 중간 즉석 학습 쿨다운 — member_id → 마지막 중간 학습 턴 번호
+        # 동일 의원이 매 발언마다 리서치하지 않도록 최소 3턴 간격 보장
+        self._mid_research_last_turn: dict[str, int] = {m["id"]: -99 for m in self.members}
+        # 의원별 누적 중간 학습 결과 로그
+        self._mid_research_log: dict[str, list] = {m["id"]: [] for m in self.members}
+
         # 라운드 수 자동 계산
         self.rounds = _calc_rounds(self.max_turns)
 
@@ -122,6 +131,103 @@ class DebateEngine:
 
     def _turns_remaining(self) -> int:
         return max(0, self.max_turns - self._turn_count)
+
+    # ══════════════════════════════════════════════
+    # 중간 즉석 학습 — 모르는 용어/주장 감지 & 리서치
+    # ══════════════════════════════════════════════
+    async def _detect_unknown_terms(self, member: dict, trigger_speech: str) -> list:
+        """
+        직전 발언에서 해당 의원이 이해하기 어려울 가능성이 있는
+        전문 용어·낯선 주장·미지의 데이터 출처를 경량 LLM으로 감지.
+        반환: 감지된 용어/주장 리스트 (최대 3개). 실패 시 빈 리스트.
+        """
+        import json as _json
+        from ai_caller import call_groq as _cg, call_gemini as _cgm
+
+        member_name = member["name"]
+        lens        = member.get("lens", "")
+        bias        = member.get("bias", "중립")
+
+        prompt = (
+            f"당신은 토론 분석 AI입니다.\n"
+            f"아래 발언을 {member_name}({lens}, {bias} 성향) 의원의 관점에서 분석하세요.\n\n"
+            f"발언:\n\"{trigger_speech[:500]}\"\n\n"
+            f"{member_name}의 학습 기반과 이념 성향을 고려했을 때,\n"
+            "이 발언에서 해당 의원이 모르거나 이해가 부족할 가능성이 높은 것을 찾으세요:\n"
+            "- 낯선 전문 용어 또는 약어\n"
+            "- 처음 언급되는 정책·제도명\n"
+            "- 출처 불명의 구체적 수치\n"
+            "- 의원의 전문 분야 밖의 주장\n\n"
+            "반드시 JSON 배열로만 응답하세요 (최대 3개, 없으면 빈 배열):\n"
+            "[\"용어1\", \"용어2\"] 또는 []"
+        )
+        msgs = [
+            {"role": "system", "content": "토론 감지 AI. JSON 배열로만 응답."},
+            {"role": "user", "content": prompt},
+        ]
+        for caller_fn in (
+            lambda m: _cg(m, temperature=0.1, max_tokens=80),
+            lambda m: _cgm(m, temperature=0.1, max_tokens=80),
+        ):
+            try:
+                raw = await caller_fn(msgs)
+                s = raw.find('['); e = raw.rfind(']')
+                if s != -1 and e != -1:
+                    parsed = _json.loads(raw[s:e+1])
+                    terms = [str(t).strip() for t in parsed if str(t).strip()]
+                    if terms:
+                        print(f"[MidResearch] {member_name} 감지 용어: {terms}")
+                    return terms[:3]
+            except Exception as ex:
+                print(f"[MidResearch] 감지 실패 ({member_name}): {ex}")
+        return []
+
+    async def mid_debate_research(self, member: dict, trigger_speech: str) -> bool:
+        """
+        토론 중 한 발언을 듣고, 해당 의원이 모르는 용어/주장이 있으면
+        즉석 리서치 + 내면화를 수행하여 research_cache에 병합.
+        반환: True=학습 실행됨, False=불필요하거나 쿨다운 중
+        """
+        mid = member["id"]
+
+        # 쿨다운: 마지막 중간 학습으로부터 3턴 미만이면 건너뜀
+        if self._turn_count - self._mid_research_last_turn[mid] < 3:
+            return False
+
+        unknown_terms = await self._detect_unknown_terms(member, trigger_speech)
+        if not unknown_terms:
+            return False
+
+        await self.send(
+            "status",
+            message=f"🔍 {member['name']} 의원: '{unknown_terms[0]}' 관련 자료 즉석 학습 중...",
+        )
+        try:
+            result = await call_research_targeted(
+                issue          = self.issue,
+                member_name    = member["name"],
+                lens           = member.get("lens", ""),
+                trigger_speech = trigger_speech,
+                unknown_terms  = unknown_terms,
+            )
+        except Exception as e:
+            print(f"[MidResearch] call_research_targeted 실패 ({member['name']}): {e}")
+            return False
+
+        if not result:
+            return False
+
+        existing  = self.research_cache.get(mid, "")
+        separator = f"\n\n{'─'*40}\n"
+        self.research_cache[mid] = existing + separator + result if existing else result
+        self._mid_research_log[mid].append(result)
+        self._mid_research_last_turn[mid] = self._turn_count
+
+        print(
+            f"[MidResearch] {member['name']} 중간 학습 완료 "
+            f"(누적 {len(self._mid_research_log[mid])}회 / 턴 {self._turn_count})"
+        )
+        return True
 
     # ══════════════════════════════════════════════
     # 전송 헬퍼
@@ -195,13 +301,23 @@ class DebateEngine:
     # ══════════════════════════════════════════════
     async def research_phase(self):
         """
-        모든 참여 의원이 병렬로 해당 안건의 최신 정보를 수집합니다.
-        결과는 self.research_cache[member_id]에 저장되며,
-        get_opinion()의 system prompt에 【사전 리서치】 블록으로 주입됩니다.
+        [개선] 2단계 사전 준비 파이프라인
+
+        Phase A — 병렬 심층 리서치 (ai_caller.call_research):
+            의원별 전문 렌즈로 사실수집 → 논점분석 → 전략화를 순차 수행.
+            각 의원이 서로 다른 각도에서 동일 안건을 조사하므로
+            토론 시 발언이 자연스럽게 다양해짐.
+
+        Phase B — 개별 내면화 (deliberation):
+            리서치 결과를 자기 이념·성향으로 소화하는 '숙고' 단계.
+            "나는 이 안건에 대해 어떤 입장을 취할 것인가?"를
+            LLM 스스로 결정하게 하여 첫 발언의 주체성과 깊이를 확보.
+            결과는 self.deliberation_cache[member_id]에 저장.
         """
-        await self.send("status", message="📡 각 AI 의원이 안건 관련 최신 정보를 수집 중입니다...")
+        await self.send("status", message="📡 각 AI 의원이 안건 관련 자료를 심층 수집 중입니다...")
         print(f"[Engine] 사전 리서치 시작 — {len(self.members)}명 병렬 수집")
 
+        # ── Phase A: 병렬 심층 리서치 ──────────────────────────────
         async def _research_one(member: dict):
             mid  = member["id"]
             name = member["name"]
@@ -221,9 +337,71 @@ class DebateEngine:
         collected = sum(1 for v in self.research_cache.values() if v)
         await self.send(
             "status",
-            message=f"✅ 사전 리서치 완료 — {collected}/{len(self.members)}명 정보 수집 성공. 토론을 시작합니다.",
+            message=f"✅ 자료 수집 완료 ({collected}/{len(self.members)}명). 각 의원이 논거를 정리 중입니다...",
         )
-        print(f"[Engine] 사전 리서치 완료: {collected}/{len(self.members)}명 성공")
+        print(f"[Engine] Phase A 완료: {collected}/{len(self.members)}명 성공")
+
+        # ── Phase B: 병렬 내면화(deliberation) ────────────────────
+        async def _deliberate_one(member: dict):
+            mid          = member["id"]
+            name         = member["name"]
+            bias         = member.get("bias", "중립")
+            vote_tendency = member.get("vote_tendency", "")
+            persona      = member.get("persona", "")
+            research_txt = self.research_cache.get(mid, "")
+
+            # 리서치 결과가 없으면 내면화 불가 — 건너뜀
+            if not research_txt:
+                print(f"[Deliberation] {name}: 리서치 없음 — 내면화 건너뜀")
+                return
+
+            deliberation_prompt = (
+                f"토론 안건: \"{self.issue}\"\n\n"
+                f"당신은 {name}({bias} 성향)입니다.\n"
+                f"{persona[:200]}\n\n"
+                f"[방금 수집한 리서치 자료]\n{research_txt[:1000]}\n\n"
+                "위 자료를 당신의 이념·성향·지식 기반으로 소화하여 아래를 작성하세요:\n\n"
+                "1. 【나의 잠정적 입장】\n"
+                "   이 안건에 대한 나의 첫 번째 판단과 그 이유 (2~3문장)\n\n"
+                "2. 【첫 발언에서 꺼낼 핵심 카드】\n"
+                "   리서치에서 발견한 가장 강력한 논거 1개를 구체적 수치·출처와 함께\n\n"
+                "3. 【내가 경계해야 할 상대의 논거】\n"
+                "   상대가 꺼낼 가장 강한 반박과, 내가 준비한 재반박\n\n"
+                "4. 【나만의 차별적 관점】\n"
+                f"   {bias} 성향·{name}의 학습 기반에서만 나올 수 있는 고유한 시각 1가지\n\n"
+                "각 항목 2~3문장으로 간결하게. 총 500자 이내."
+            )
+
+            deliberation_msgs = [
+                {
+                    "role": "system",
+                    "content": (
+                        f"당신은 {name} 의원입니다. {persona[:150]} "
+                        "수집한 자료를 당신의 가치관으로 내면화하세요. "
+                        "추상적 서술 금지 — 구체적 수치와 인과관계 중심으로 작성하세요."
+                    ),
+                },
+                {"role": "user", "content": deliberation_prompt},
+            ]
+
+            try:
+                result = await call_member(member, deliberation_msgs, temperature=0.4)
+                if result and len(result) > 30:
+                    self.deliberation_cache[mid] = result
+                    print(f"[Deliberation] {name}: 내면화 완료 ({len(result)}자)")
+                else:
+                    print(f"[Deliberation] {name}: 응답 비정상 — 건너뜀")
+            except Exception as e:
+                print(f"[Deliberation] {name}: 오류 ({e}) — 건너뜀")
+
+        await asyncio.gather(*[_deliberate_one(m) for m in self.members])
+
+        deliberated = sum(1 for v in self.deliberation_cache.values() if v)
+        await self.send(
+            "status",
+            message=f"🧠 논거 정리 완료 ({deliberated}/{len(self.members)}명). 토론을 시작합니다.",
+        )
+        print(f"[Engine] Phase B 완료: {deliberated}/{len(self.members)}명 내면화 성공")
 
     # ══════════════════════════════════════════════
     # 의장 사회 발언 생성
@@ -397,15 +575,26 @@ class DebateEngine:
     ) -> str:
 
         if free_mode:
+            # 최근 발언 요약 — 중복 방지용
+            recent_texts = ""
+            if self.ctx.all_logs:
+                recent = self.ctx.all_logs[-4:]
+                recent_texts = "\n".join(
+                    f"- {l.get('speaker','?')}: {l.get('text','')[:60]}"
+                    for l in recent
+                )
             action_guide = (
                 "【자유토론】 순서 제한 없이 자유롭게 발언하세요.\n"
                 "반드시 직전 발언자의 이름을 직접 언급하며 반응하세요.\n"
                 "예: '라마 의원님의 주장에서 문제점을 발견했습니다.' / '제미나이 의원님 말씀에 일부 동의하나 ...'\n"
                 "논리적 허점이 있으면 [REFUTE], 더 타당한 주장엔 [ADMIT], 새 데이터면 [DATA]를 앞에 붙이세요.\n"
                 "단순 의견 표명보다 구체적 수치·연구·사례([DATA])로 논거를 강화하세요.\n"
-                "여러 항목 비교는 [TABLE], 비율·추세는 [GRAPHIC]으로 시각화하세요.\n"
-                f"발언은 {MAX_SPEECH_LEN}자 이내."
+                "새로운 근거·데이터([DATA]), 차트([CHART:bar]/[CHART:line]/[CHART:pie]), 표([TABLE:json])를 적극 활용하세요.\n"
+                "⚠️ 중복 금지: 아래 최근 발언에서 이미 언급된 논거는 절대 반복하지 마세요. 새로운 각도로 접근하세요.\n"
             )
+            if recent_texts:
+                action_guide += f"[최근 발언 요약]\n{recent_texts}\n"
+            action_guide += f"발언은 {MAX_SPEECH_LEN}자 이내."
         elif is_rebuttal and target_speech:
             action_guide = (
                 f"【즉석 반박】 방금 당신의 주장이 반박되었습니다:\n"
@@ -464,15 +653,48 @@ class DebateEngine:
         temperature   = member.get("temperature", 0.6)
         stance_guide  = self._get_stance_guide(member["id"])
 
-        # 사전 리서치 결과 주입 (있을 때만)
-        research_text = self.research_cache.get(member["id"], "")
-        research_block = (
-            f"\n\n【사전 리서치 — 반드시 활용하라】\n"
-            f"토론 시작 전 당신이 수집한 안건 관련 최신 정보입니다. "
-            f"발언 시 이 데이터를 [DATA] 태그와 함께 적극 인용하세요:\n"
-            f"{research_text}\n"
-            f"⚠️ 위 정보는 불확실할 수 있습니다. '추정' 표시된 항목은 그대로 불확실로 밝히세요."
-        ) if research_text else ""
+        # 사전 리서치 + 내면화 + 중간 학습 결과 주입
+        research_text     = self.research_cache.get(member["id"], "")
+        deliberation_text = self.deliberation_cache.get(member["id"], "")
+        mid_research_logs = self._mid_research_log.get(member["id"], [])
+        latest_mid        = mid_research_logs[-1] if mid_research_logs else ""
+
+        if research_text or deliberation_text or latest_mid:
+            if round_num == 1 and not is_rebuttal:
+                research_block = "\n\n【사전 심층 리서치 — 반드시 발언에 활용】\n"
+                if research_text:
+                    research_block += (
+                        "▶ 수집된 핵심 사실·통계 (출처 포함):\n"
+                        f"{research_text[:700]}\n\n"
+                    )
+                if deliberation_text:
+                    research_block += (
+                        "▶ 당신이 이 자료를 내면화한 결과 (나의 논거·전략):\n"
+                        f"{deliberation_text[:500]}\n"
+                    )
+                research_block += (
+                    "\n⚠️ 위 자료를 반드시 [DATA] 태그와 함께 발언에 인용하세요.\n"
+                    "리서치에서 발견한 구체적 수치를 첫 문장부터 사용하세요.\n"
+                    "[추정] 표시된 항목은 발언 시 '추정에 따르면'으로 표현하세요."
+                )
+            else:
+                research_block = "\n\n【보유 논거 카드 — 아직 사용 안 한 것 우선 활용】\n"
+                if deliberation_text:
+                    research_block += f"{deliberation_text[:300]}\n"
+                elif research_text:
+                    research_block += f"{research_text[:300]}\n"
+                research_block += "⚠️ 이전 라운드에서 이미 쓴 논거는 반복하지 마세요."
+
+            # 중간 즉석 학습 결과 — 최신 1건을 우선 활용 블록으로 추가
+            if latest_mid:
+                research_block += (
+                    "\n\n【⚡ 즉석 학습 완료 — 방금 습득한 정보 (최우선 활용)】\n"
+                    f"{latest_mid[:500]}\n"
+                    "⚠️ 위 즉석 학습 내용을 이번 발언에 반드시 반영하세요. "
+                    "조사된 사실과 대응 전략을 [DATA] 태그와 함께 구체적으로 발언하세요."
+                )
+        else:
+            research_block = ""
 
         system = (
             f"당신은 AI 의회 토론 참여자입니다.\n"
@@ -482,7 +704,17 @@ class DebateEngine:
             f"{stance_guide}\n"
             f"【당신의 이념적 성향: {bias}】\n"
             "이 성향은 당신의 진짜 관점입니다. 토론 내내 일관되게 유지하세요.\n"
-            "다른 의원과 성향이 다르면 자연스럽게 의견 충돌이 발생합니다 — 이것이 정상입니다.\n"
+            "다른 의원과 성향이 다르면 자연스럽게 의견 충돌이 발생합니다 — 이것이 정상입니다.\n\n"
+            f"【당신의 고유 분석 각도 — 반드시 이 렌즈로 안건을 바라보라】\n"
+            f"학습 기반: {member.get('lens','')}\n"
+            "위 학습 기반에서 나오는 고유한 시각으로 안건을 분석하라. "
+            "다른 의원과 같은 결론을 내리더라도 반드시 이 렌즈에서 나오는 다른 근거·사례·데이터를 사용해야 한다.\n"
+            "예: Google 기반 → 국제 통계·다국어 문헌 우선 / EU 법제 → 유럽 판례·규범 우선 / "
+            "NVIDIA → 기술적 타당성·예측 가능성 우선 / Meta → 분권·오픈소스 관점 우선\n\n"
+            "【찬반 균형 — 심층 토론을 위한 핵심 원칙】\n"
+            "설령 당신이 한쪽 입장을 지지하더라도, 상대방의 최강 논거를 먼저 정확히 요약한 뒤 반박하라.\n"
+            "상대 논거를 무시하거나 약하게 설정(스트로맨)하는 것은 금지. 상대 논거의 핵심을 인정하면서 "
+            "왜 그럼에도 불구하고 자신의 결론이 더 타당한지를 논증하라.\n"
             f"{research_block}\n\n"
             f"【핵심 원칙 — 반드시 준수】\n"
             "1. 주장은 반드시 '근거 → 논리 → 결론' 순서로 전개하라.\n"
@@ -498,9 +730,13 @@ class DebateEngine:
             "    예: 'IMF 2023 보고서에 따르면' / 'OECD Health Statistics 2022 기준'\n"
             "  • 국제 비교: 다른 나라의 사례·결과를 비교하라.\n"
             "  • [DATA] 태그: 핵심 통계는 반드시 [DATA] 태그로 강조하라.\n"
-            "  • [TABLE]: 여러 항목을 비교할 때 표로 구조화하라.\n"
-            "  • [GRAPHIC]: 비율·추세를 시각적으로 보여줄 때 활용하라.\n"
-            "⚠️ '일부 연구에 따르면'처럼 모호한 표현만 사용하는 것은 금지.\n"
+            "  • [CHART:bar]: 수치 비교가 필요할 때 막대 차트로. 예: [CHART:bar]{\"title\":\"국가별 도입 효과\",\"labels\":[\"독일\",\"한국\"],\"values\":[12.3,5.1],\"unit\":\"%\",\"source\":\"OECD(2023)\"}\n"
+            "  • [CHART:line]: 추세 표시. 예: [CHART:line]{\"title\":\"연도별 변화\",\"labels\":[\"2020\",\"2021\",\"2022\"],\"values\":[2.1,3.4,4.7],\"unit\":\"%\",\"source\":\"IMF(2023)\"}\n"
+            "  • [CHART:pie]: 비율 표시. 예: [CHART:pie]{\"title\":\"찬반 여론\",\"labels\":[\"찬성\",\"반대\"],\"values\":[62,38],\"unit\":\"%\",\"source\":\"갤럽(2024)\"}\n"
+            "  • [TABLE:json]: 여러 항목 비교. 예: [TABLE:json]{\"title\":\"국가 비교\",\"headers\":[\"국가\",\"도입연도\",\"효과\"],\"rows\":[[\"독일\",\"2015\",\"+12.3%\"]]}\n"
+            "⚠️ CHART/TABLE JSON은 반드시 태그와 같은 줄에 한 줄로 작성. 줄바꿈 금지.\n"
+            "⚠️ 수치 없이는 CHART/TABLE 쓰지 말고 [DATA] 태그만 사용.\n"
+"⚠️ '일부 연구에 따르면'처럼 모호한 표현만 사용하는 것은 금지.\n"
             "   구체적 기관명과 수치가 없으면 [DATA] 태그를 쓰지 마세요.\n\n"
             f"참여 의원 목록 (이 이름만 사용):\n{self.member_list_str}\n\n"
             f"【현재 토론 형식: {self.debate_format}】\n"
@@ -509,16 +745,10 @@ class DebateEngine:
             "[REFUTE]: 상대 논리·데이터에 명확한 오류가 있을 때. 발언 맨 앞에 한 번만.\n"
             "[ADMIT]: 상대 주장이 더 타당해서 본인 입장을 실제로 수정할 때. 발언 맨 앞에 한 번만.\n"
             "[DATA]: 구체적 수치·통계·출처를 제시할 때. 예: [DATA] IMF(2023): 한국 부채비율 GDP 대비 54.3%\n"
-            "[GRAPHIC]: 텍스트 시각화. 예:\n"
-            "  [GRAPHIC]\n"
-            "  찬성 ████████░░ 78%\n"
-            "  반대 ██░░░░░░░░ 22%\n"
-            "[TABLE]: 텍스트 표. 예:\n"
-            "  [TABLE]\n"
-            "  | 국가  | 도입연도 | 효과(%) |\n"
-            "  |-------|----------|----------|\n"
-            "  | 독일  | 2015     | +12.3    |\n"
-            "  | 프랑스| 2017     | +8.7     |\n\n"
+            "[CHART:bar]: 수치 비교 막대 차트 — 한 줄 JSON. 예: [CHART:bar]{\"title\":\"효과 비교\",\"labels\":[\"A\",\"B\"],\"values\":[12,8],\"unit\":\"%\",\"source\":\"OECD(2023)\"}\n"
+            "[CHART:line]: 추세 꺾은선 — 한 줄 JSON. 예: [CHART:line]{\"title\":\"연도별 추이\",\"labels\":[\"2020\",\"2021\"],\"values\":[3.1,4.2],\"unit\":\"%\",\"source\":\"IMF\"}\n"
+            "[CHART:pie]: 비율 파이 — 한 줄 JSON. 예: [CHART:pie]{\"title\":\"여론\",\"labels\":[\"찬성\",\"반대\"],\"values\":[60,40],\"unit\":\"%\",\"source\":\"갤럽\"}\n"
+            "[TABLE:json]: 데이터 표 — 한 줄 JSON. 예: [TABLE:json]{\"title\":\"비교\",\"headers\":[\"국가\",\"효과\"],\"rows\":[[\"독일\",\"+12%\"]]}\n\n"
             "수학 표기 규칙 (TTS 오독 방지):\n"
             "  크거나 같다: '이상', 작거나 같다: '이하'\n"
             "  크다: '초과', 작다: '미만', 같다: '동일'\n"
@@ -573,6 +803,18 @@ class DebateEngine:
     ) -> tuple:
         """API 호출만 수행 (전송 없음)."""
         await self.send("status", message=f"⏳ {member['name']} 의원 발언 준비 중... ({self._turn_count+1}/{self.max_turns}턴)")
+
+        # ── 중간 즉석 학습 ──────────────────────────────────────────────
+        trigger_text = target_speech
+        if not trigger_text:
+            trigger_text = self._get_last_speech_context(member)
+        if trigger_text and len(trigger_text) > 20:
+            try:
+                await self.mid_debate_research(member, trigger_text)
+            except Exception as _mre:
+                print(f"[MidResearch] 중간 학습 예외 무시 ({member['name']}): {_mre}")
+        # ────────────────────────────────────────────────────────────────
+
         opinion = await self.get_opinion(
             member, chair["name"],
             format_guide=fmt_guide,
@@ -621,7 +863,11 @@ class DebateEngine:
             await self.send_speech(member, opinion, stype, False)
             self._increment_turn()
 
-        if stype == "REFUTE" and not free_mode and round_num < self.rounds and not self._turns_over():
+        # 반박 체인: REFUTE 발언이 있고 자유토론이 아닐 때,
+        # 마지막 라운드 '마지막 발언'에서도 상대방이 남아 있으면 반박 허용
+        # 기존: round_num < self.rounds → 마지막 라운드 REFUTE는 반박 체인이 항상 막힘
+        # 수정: 턴이 남아 있고 free_mode가 아니면 허용 (마지막 라운드도 포함)
+        if stype == "REFUTE" and not free_mode and not self._turns_over():
             await self._handle_rebuttal_request(
                 chair, member, opinion, non_chair, fmt_guide, round_num
             )
@@ -715,6 +961,67 @@ class DebateEngine:
         await self.ctx.compress_if_needed()
 
     # ══════════════════════════════════════════════
+    # 투표 전 소견 발언 생성
+    # ══════════════════════════════════════════════
+    async def _get_pre_vote_statement(self, member: dict) -> str:
+        """
+        각 의원이 최종 투표 직전에 발언하는 소견문.
+        토론에서 자신이 펼쳐온 주장을 요약하고, 왜 그 방향으로 투표할 것인지 피력.
+        투표 라벨([찬성/반대/기권]) 자체는 포함하지 않음.
+        """
+        mid          = member["id"]
+        speeches     = self.memories.get(mid, [])
+        conviction_v = self.conviction.get_conviction(mid)
+
+        if conviction_v >= 10:
+            vote_hint = "찬성 방향으로 기울어져 있습니다"
+        elif conviction_v <= -10:
+            vote_hint = "반대 방향으로 기울어져 있습니다"
+        else:
+            vote_hint = "중립적 입장을 유지하고 있습니다"
+
+        recent = speeches[-3:] if len(speeches) > 3 else speeches
+        speeches_summary = "\n".join(
+            f"- {s[:150]}{'...' if len(s) > 150 else ''}" for s in recent
+        ) if recent else "발언 없음"
+
+        mid_count = len(self._mid_research_log.get(mid, []))
+        mid_note  = f"\n※ 토론 중 {mid_count}회 즉석 학습으로 추가 정보를 습득했습니다." if mid_count > 0 else ""
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"당신은 AI 의회의 {member['name']} 의원입니다.\n"
+                    f"【성향: {member.get('bias','중립')}】 {member.get('persona','')[:150]}\n\n"
+                    "지금은 최종 표결 직전 '투표 전 소견 발언' 시간입니다.\n"
+                    "목적: ①토론에서 펼쳐온 핵심 주장 2~3개 요약 ②상대 논거의 영향 솔직히 밝힘 ③투표 방향 이유 피력\n"
+                    "규칙: 150~250자 이내 / [찬성]/[반대]/[기권] 라벨 직접 쓰지 말 것 / 자기소개 금지 / 바로 주장으로 시작 / 마침표로 끝낼 것\n"
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"안건: \"{self.issue}\"\n\n"
+                    f"본 의원의 토론 발언 요약:\n{speeches_summary}\n"
+                    f"{mid_note}\n\n"
+                    f"현재 확신도: {conviction_v:.0f}/100 ({vote_hint})\n\n"
+                    "핵심 주장 요약과 투표 이유를 소견으로 밝히세요. 투표 결과를 직접 선언하지 마세요."
+                )
+            }
+        ]
+        try:
+            result = await call_member(member, messages, temperature=0.55)
+            result = self._strip_prefix(result)
+            result = self._strip_member_intro(result)
+            if result and len(result) > 20:
+                print(f"[PreVote] {member['name']} 소견 완료 ({len(result)}자)")
+                return result
+        except Exception as e:
+            print(f"[PreVote] {member['name']} 소견 실패: {e}")
+        return ""
+
+    # ══════════════════════════════════════════════
     # 최종 의결
     # ══════════════════════════════════════════════
     async def get_vote(self, member: dict) -> str:
@@ -733,7 +1040,25 @@ class DebateEngine:
         vote_tendency = member.get("vote_tendency", "")
         temp          = member.get("temperature", 0.4)
         conviction_instruction = self.conviction.conviction_to_vote_instruction(member["id"])
-        stance_note = ""
+
+        # 토론 역할 배정을 투표에도 반영 (확신도와 함께 참고)
+        stance = self._stance_map.get(member["id"], "FREE")
+        if stance == "PRO":
+            stance_note = (
+                "\n\n【토론 중 역할 배정 참고】\n"
+                "이번 토론에서 당신은 찬성 논거 대표로 배정되었습니다.\n"
+                "단, 투표는 역할이 아니라 토론 결과로 형성된 확신도에 따라 자유롭게 하세요.\n"
+                "토론 중 강력한 반대 논거에 설득됐다면 반대 투표가 더 솔직한 결과입니다.\n"
+            )
+        elif stance == "CON":
+            stance_note = (
+                "\n\n【토론 중 역할 배정 참고】\n"
+                "이번 토론에서 당신은 반대 논거 대표로 배정되었습니다.\n"
+                "단, 투표는 역할이 아니라 토론 결과로 형성된 확신도에 따라 자유롭게 하세요.\n"
+                "토론 중 강력한 찬성 논거에 설득됐다면 찬성 투표가 더 솔직한 결과입니다.\n"
+            )
+        else:
+            stance_note = ""
 
         speeches_text = chr(10).join(speeches) if speeches else "발언 없음 (사회자로 역할 수행)"
 
@@ -841,7 +1166,15 @@ class DebateEngine:
                 return await _call_with_protection(eng_name, fn, mdl)
             except Exception as e:
                 print(f"[get_resolution/{eng_name}] {e}")
-        return "의원들의 충분한 논의를 바탕으로 본 안건을 검토하였다."
+
+        # 폴백: 모든 엔진 실패 시 최소한 형식을 갖춘 결의문 반환
+        return (
+            f"【전문】 AI 의회는 '{self.issue}'에 관한 토론을 충분히 진행하였다.\n"
+            "【결의 제1조】 의회는 토론에서 제기된 찬반 논거를 종합하여 단계적 검토를 권고한다.\n"
+            "【결의 제2조】 구체적 이행 조건 및 예외 사항은 후속 소위원회에서 심의한다.\n"
+            "【결의 제3조】 본 결의안의 이행 상황을 분기별로 의회에 보고한다.\n"
+            "【부기】 반대 의견은 별도 부기 의견서로 기록·보존한다."
+        )
 
     async def run_conclusion(self, chair: dict, timed_out: bool = False):
         if not timed_out and not self._chair_final_spoke:
@@ -907,6 +1240,27 @@ class DebateEngine:
             resolution = await self.get_resolution(chair)
             await self.send("result", resultType="RESOLUTION", content=resolution)
         else:
+            # ── 투표 전 소견 발언 ────────────────────────────────────────
+            await self.send("status", message="🎙 각 의원 투표 전 최종 소견 발언 중...")
+            try:
+                pre_vote_intro = await self.chair_speak(
+                    chair,
+                    "표결 전 각 의원께서 토론을 통해 형성된 최종 입장과 투표 이유를 간략히 밝혀 주시기 바랍니다.",
+                    max_chars=120,
+                )
+                self.ctx.push(f"[의장 {chair['name']}]", pre_vote_intro)
+                await self.send_speech(chair, pre_vote_intro, "NORMAL", True)
+            except Exception as e:
+                print(f"[PreVote] 의장 소개 실패 (무시): {e}")
+
+            non_chair_members = [m for m in self.members if m["id"] != chair["id"]]
+            for m in non_chair_members:
+                pre_vote_text = await self._get_pre_vote_statement(m)
+                if pre_vote_text and len(pre_vote_text) > 10:
+                    self.ctx.push(f"[{m['name']} 의원]", pre_vote_text)
+                    await self.send_speech(m, pre_vote_text, "NORMAL", False)
+
+            # ── 실제 투표 집계 ───────────────────────────────────────────
             votes = []
             for m in self.members:
                 await self.send("status", message=f"{m['name']} 의원 최종 투표 중...")
@@ -921,23 +1275,128 @@ class DebateEngine:
     # 자율 입장 초기화
     # ══════════════════════════════════════════════
     def _assign_stances(self, chair_id: str):
-        self._stance_map = {m["id"]: "FREE" for m in self.members}
-        print(f"[Engine] 자율 입장 형성 모드 — 전원 FREE")
+        """
+        찬반 균형 배정:
+        - 비의장 의원 중 절반(올림)은 PRO(찬성 논거 대표),
+          나머지는 CON(반대 논거 대표)로 배정.
+        - 의장은 NEUTRAL.
+        - 각 의원의 bias 성향을 존중하되, 배정된 입장을 최우선으로 삼음.
+        - 의원이 1~2명일 경우 FREE 모드 유지.
+        """
+        import random as _r
+        non_chair = [m for m in self.members if m["id"] != chair_id]
+        self._stance_map = {}
+        self._stance_map[chair_id] = "NEUTRAL"
+
+        if len(non_chair) < 3:
+            for m in non_chair:
+                self._stance_map[m["id"]] = "FREE"
+            print(f"[Engine] 자율 입장 형성 모드 (의원 수 부족)")
+            return
+
+        # bias 기반으로 자연스러운 분류 우선
+        pro_bias  = {"진보·개혁·공정", "자유주의·분권", "실용·데이터중심"}
+        con_bias  = {"보수·안정·점진"}
+
+        shuffled = non_chair.copy()
+        _r.shuffle(shuffled)
+
+        pro_pool = [m for m in shuffled if m.get("bias","") in pro_bias]
+        con_pool = [m for m in shuffled if m.get("bias","") in con_bias]
+        neutral_pool = [m for m in shuffled if m not in pro_pool and m not in con_pool]
+
+        # 균형 맞추기: 과반수가 한쪽에 쏠리면 중립 풀에서 보충
+        target_pro = (len(non_chair) + 1) // 2
+        target_con = len(non_chair) - target_pro
+
+        while len(pro_pool) < target_pro and neutral_pool:
+            pro_pool.append(neutral_pool.pop(0))
+        while len(con_pool) < target_con and neutral_pool:
+            con_pool.append(neutral_pool.pop(0))
+        # 남은 중립은 PRO에 추가 (홀수 처리)
+        pro_pool += neutral_pool
+
+        # ── 버그 수정: neutral_pool이 비어있어도 bias 풀 간 불균형이 생길 수 있음 ──
+        # CON 풀 부족 (pro_bias 3명 vs con_bias 2명에서 CON 의장일 때)
+        # → pro_pool 잉여분을 CON으로 재배정하여 찬반 균형 강제 유지
+        while len(con_pool) < target_con and len(pro_pool) > target_pro:
+            con_pool.append(pro_pool.pop())
+        # PRO 풀 부족 (드문 케이스 방어)
+        while len(pro_pool) < target_pro and len(con_pool) > target_con:
+            pro_pool.append(con_pool.pop())
+
+        for m in pro_pool[:target_pro]:
+            self._stance_map[m["id"]] = "PRO"
+        for m in con_pool[:target_con]:
+            self._stance_map[m["id"]] = "CON"
+        # 혹시 누락된 의원
+        for m in non_chair:
+            if m["id"] not in self._stance_map:
+                self._stance_map[m["id"]] = "FREE"
+
+        pro_names = [m["name"] for m in non_chair if self._stance_map.get(m["id"]) == "PRO"]
+        con_names = [m["name"] for m in non_chair if self._stance_map.get(m["id"]) == "CON"]
+        print(f"[Engine] 찬반 배정 — PRO: {pro_names} / CON: {con_names}")
+
+        # ── conviction 불일치 보정 ────────────────────────────────────────
+        # bias와 반대 stance로 배정된 의원의 초기 확신도를 중립 근방으로 조정.
+        # 예) 지피티(진보 +25)가 CON으로 배정되면 확신도가 여전히 +25라
+        # 토론 중 CON 역할을 해도 투표 시 [찬성]이 나오는 문제 방지.
+        # 배정 후 중립화([-20, +20] 클리핑)하여 토론 논거로 확신도가 형성되도록 유도.
+        NEUTRALIZE_RANGE = 20
+        for m in non_chair:
+            mid    = m["id"]
+            stance = self._stance_map.get(mid, "FREE")
+            curr   = self.conviction.convictions.get(mid, 0)
+            if stance == "CON" and curr > NEUTRALIZE_RANGE:
+                # PRO bias가 CON으로 배정됨 — 반대 방향으로 중립화
+                adjusted = -NEUTRALIZE_RANGE
+                self.conviction.convictions[mid] = float(adjusted)
+                print(f"[Engine] conviction 보정: {m['name']} CON배정 {curr:+.0f} → {adjusted:+.0f}")
+            elif stance == "PRO" and curr < -NEUTRALIZE_RANGE:
+                # CON bias가 PRO로 배정됨 — 찬성 방향으로 중립화
+                adjusted = NEUTRALIZE_RANGE
+                self.conviction.convictions[mid] = float(adjusted)
+                print(f"[Engine] conviction 보정: {m['name']} PRO배정 {curr:+.0f} → {adjusted:+.0f}")
 
     def _get_stance_guide(self, member_id: str) -> str:
         m = self.member_map.get(member_id, {})
         bias = m.get("bias", "중립")
         vote_tendency = m.get("vote_tendency", "")
+        stance = self._stance_map.get(member_id, "FREE")
 
-        guide = (
-            "\n【입장 형성 원칙】\n"
-            "당신의 찬반 입장은 사전에 배정된 것이 아닙니다.\n"
-            "당신이 학습한 데이터, 지식, 가치관을 바탕으로 이 안건을 스스로 판단하세요.\n"
-            f"당신의 이념적 성향({bias})은 하나의 렌즈입니다 — 이를 참고하되, "
-            "안건의 실질적 내용과 논거를 더 중요하게 고려하세요.\n"
-        )
-        if vote_tendency:
-            guide += f"참고: {vote_tendency}\n"
+        if stance == "PRO":
+            guide = (
+                "\n【입장 역할 배정: 찬성 논거 대표】\n"
+                "이번 토론에서 당신은 찬성 측 논거를 대표합니다.\n"
+                "찬성 입장(또는 현행 법원 결정 지지)에서 가장 강력한 근거를 제시하고 옹호하세요.\n"
+                "반대 논거가 나왔을 때는 반드시 [REFUTE]로 반박하세요.\n"
+                f"당신의 성향({bias})이 이와 다르더라도, 지적 토론 수행을 위해 찬성 논거 최선 변론을 맡습니다.\n"
+            )
+        elif stance == "CON":
+            guide = (
+                "\n【입장 역할 배정: 반대 논거 대표】\n"
+                "이번 토론에서 당신은 반대 측 논거를 대표합니다.\n"
+                "반대 입장(또는 현행 재판 연기 위헌론)에서 가장 강력한 근거를 제시하고 옹호하세요.\n"
+                "찬성 논거가 나왔을 때는 반드시 [REFUTE]로 반박하세요.\n"
+                f"당신의 성향({bias})이 이와 다르더라도, 지적 토론 수행을 위해 반대 논거 최선 변론을 맡습니다.\n"
+            )
+        elif stance == "NEUTRAL":
+            guide = (
+                "\n【입장: 의장 중립】\n"
+                "당신은 의장으로서 중립을 유지하고 토론을 공정하게 진행합니다.\n"
+            )
+        else:  # FREE
+            guide = (
+                "\n【입장 형성 원칙】\n"
+                "당신의 찬반 입장은 사전에 배정된 것이 아닙니다.\n"
+                "당신이 학습한 데이터, 지식, 가치관을 바탕으로 이 안건을 스스로 판단하세요.\n"
+                f"당신의 이념적 성향({bias})은 하나의 렌즈입니다 — 이를 참고하되, "
+                "안건의 실질적 내용과 논거를 더 중요하게 고려하세요.\n"
+            )
+
+        if vote_tendency and stance not in ("NEUTRAL",):
+            guide += f"참고 성향: {vote_tendency}\n"
         guide += (
             "토론이 진행되면서 더 강한 논거·데이터에 설득된다면 [ADMIT]로 솔직히 인정하고 입장을 바꾸세요.\n"
             "만장일치 결론이 나더라도 그것이 논리적으로 타당하다면 자연스러운 결과입니다.\n"
@@ -963,10 +1422,14 @@ class DebateEngine:
     # 지목 발언 헬퍼
     # ══════════════════════════════════════════════
     async def _nominate(self, chair: dict, member: dict, text: str = None):
-        """의장이 의원을 지목하는 짧은 발언을 즉시 전송. ACK 대기 없음."""
+        """의장이 의원을 지목 — 짧은 지목 멘트는 status로, 중요 전환은 speech로."""
         nominate = text or f"{member['name']} 의원님, 발언해 주시기 바랍니다."
-        self.ctx.push(f"[의장 {chair['name']}]", nominate)
-        await self.send_speech(chair, nominate, "NORMAL", True)
+        # 짧은 단순 지목(80자 이하)은 status로 전송해 speech 목록 오염 방지
+        if len(nominate) <= 80:
+            await self.send("status", message=f"[의장] {nominate}")
+        else:
+            self.ctx.push(f"[의장 {chair['name']}]", nominate)
+            await self.send_speech(chair, nominate, "NORMAL", True)
 
     # ══════════════════════════════════════════════
     # 메인 진입점
@@ -1149,7 +1612,7 @@ class DebateEngine:
         if observers and not self._turns_over():
             qa_open = await self.chair_speak(
                 chair,
-                "핵심토론이 완료되었습니다. 나머지 의원님들의 질의 시간입니다.",
+                "핵심토론이 완료되었습니다. 나머지 의원님들의 질의 및 반박 시간입니다.",
                 max_chars=CHAIR_MAX_LEN,
             )
             self.ctx.push(f"[의장 {chair['name']}]", qa_open)
@@ -1158,8 +1621,14 @@ class DebateEngine:
             for m in observers:
                 if self._turns_over():
                     break
-                await self._nominate(chair, m, text=f"{m['name']} 의원님, 질의해 주십시오.")
-                _oo, _os2 = await self.prepare_speech(chair, m, fmt_guide, self.rounds)
+                await self._nominate(chair, m,
+                    text=f"{m['name']} 의원님, 핵심 토론자의 논거에 대해 반박하거나 보완 질의해 주십시오.")
+                # observer는 직전 debater 발언을 대상으로 반박 유도
+                last_ctx = self._get_last_speech_context(m)
+                _oo, _os2 = await self.prepare_speech(
+                    chair, m, fmt_guide, self.rounds,
+                    is_rebuttal=True, target_speech=last_ctx,
+                )
                 await self.deliver_speech(chair, m, _oo, _os2, non_chair, fmt_guide, self.rounds)
 
         await self.run_conclusion(chair, timed_out=self._turns_over())
@@ -1236,7 +1705,7 @@ class DebateEngine:
             f"【자유토론 형식 규칙】\n"
             "순서 제한 없이 누구든 자유롭게 발언합니다.\n"
             "앞선 발언들을 면밀히 검토하고 논리적 타당성만으로 반응을 선택하세요.\n"
-            "새로운 근거·데이터([DATA]), 시각화([GRAPHIC]), 표([TABLE])를 적극 활용하세요.\n"
+            "새로운 근거·데이터([DATA]), 차트([CHART:bar]/[CHART:line]/[CHART:pie]), 표([TABLE:json])를 적극 활용하세요.\n"
             f"최대 {self.max_free_turns}회 발언 후 의장이 즉시 최종 의결을 진행합니다. 최대 {MAX_SPEECH_LEN}자."
         )
 

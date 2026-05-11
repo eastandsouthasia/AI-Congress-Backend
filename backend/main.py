@@ -1,5 +1,5 @@
 """
-main.py — AI Congress FastAPI 서버 진입점
+main.py — AI Congress FastAPI 서버 진입점 (v2 · 턴 기반)
 
 WebSocket 엔드포인트:
   ws://<host>/debate
@@ -7,24 +7,16 @@ WebSocket 엔드포인트:
 프론트엔드(DebateScreen.js)가 연결 즉시 전송하는 JSON:
   {
     "issue":          str,   # 토론 안건
-    "duration":       int,   # 토론 시간(분)
+    "maxTurns":       int,   # 최대 발언 턴 수 (구 duration 대체)
     "debateFormat":   str,   # "릴레이" | "집중토론" | "전문가패널" | "자유토론"
     "conclusionType": str,   # "VOTE" | "RESOLUTION"
     "activeMembers":  list,  # 참여 의원 ID 배열 (없으면 전원 참여)
   }
 
-버그 수정:
-  [BUG-MAIN-1] "name 'duration' is not defined"
-    → receive_text()+json.loads()로 수신 후 모든 키를 명시적으로 추출.
-      누락/타입오류 시 기본값으로 폴백. KeyError·TypeError 원천 차단.
-  [BUG-MAIN-2] debateFormat/conclusionType camelCase 키 불일치
-    → 프론트 camelCase 그대로 수신 후 snake_case 변수에 명시 매핑.
-  [BUG-MAIN-3] WS 연결 후 첫 메시지 수신 타임아웃 미처리
-    → asyncio.wait_for(timeout=30)로 감싸 30초 초과 시 오류 메시지 전송.
-  [BUG-MAIN-4] DebateEngine.run() 예외 미처리 시 클라이언트에 알림 없음
-    → except에서 ws.send_json({"type":"error",...}) + {"type":"done"} 전송.
-  [BUG-MAIN-5] 파라미터 파싱 오류가 engine.run()의 except에 혼입됨
-    → 파싱 try/except를 engine.run() try/except와 분리하여 오류 원인 명확히 구분.
+v2 변경:
+  - duration(분) → maxTurns(발언 횟수) 교체
+  - maxTurns 범위 보정: 5 ~ 200턴
+  - DebateEngine 생성자 파라미터 동기화
 """
 
 import os
@@ -60,17 +52,14 @@ async def debate_ws(ws: WebSocket):
     await ws.accept()
     print("[WS] 클라이언트 연결됨")
 
-    # ── [BUG-MAIN-1·2·3] 초기 메시지 수신 및 파싱 (파싱 오류를 run()과 분리) ──
     try:
         raw  = await asyncio.wait_for(ws.receive_text(), timeout=30)
         data = json.loads(raw)
 
-        # camelCase → snake_case 명시 매핑 + 기본값 폴백 (KeyError·TypeError 불가)
         issue           = str(data.get("issue", "")).strip()
-        duration        = int(data.get("duration", 15))
+        max_turns       = int(data.get("maxTurns", 25))
         debate_format   = str(data.get("debateFormat",   "릴레이"))
         conclusion_type = str(data.get("conclusionType", "VOTE"))
-        # None이면 엔진에서 전원 참여로 처리
         active_members  = data.get("activeMembers", None)
 
     except asyncio.TimeoutError:
@@ -96,18 +85,17 @@ async def debate_ws(ws: WebSocket):
         await ws.send_json({"type": "done"})
         return
 
-    # duration 범위 보정 (1~120분)
-    duration = max(1, min(120, duration))
+    # 턴 수 범위 보정 (5~200)
+    max_turns = max(5, min(200, max_turns))
 
     print(
-        f"[WS] 안건: {issue[:40]} / {duration}분 / {debate_format} / "
+        f"[WS] 안건: {issue[:40]} / {max_turns}턴 / {debate_format} / "
         f"{conclusion_type} / 의원: {active_members}"
     )
 
-    # ── [BUG-MAIN-4] DebateEngine 실행 — 예외 시 클라이언트에 알림 ──────────
     engine = DebateEngine(
         issue           = issue,
-        duration        = duration,
+        max_turns       = max_turns,
         ws              = ws,
         debate_format   = debate_format,
         conclusion_type = conclusion_type,
@@ -130,7 +118,7 @@ async def debate_ws(ws: WebSocket):
             })
             await ws.send_json({"type": "done"})
         except Exception:
-            pass  # WS가 이미 닫혔을 수 있음
+            pass
 
 
 if __name__ == "__main__":
