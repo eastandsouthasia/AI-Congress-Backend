@@ -106,7 +106,7 @@ MEMBERS = [
     {
         "id":     "gptoss",
         "name":   "지피티",
-        "lens":   "OpenAI 오픈소스 기반 — Apache 2.0·120B",
+        "lens":   "Llama 3.1 405B 기반 — Hermes 3 튜닝",
         "persona": (
             "당신은 OpenAI가 공개한 오픈소스 모델 지피티입니다. "
             "역할극이나 인위적 페르소나 없이, 당신이 실제로 학습한 지식과 데이터로만 발언하십시오. "

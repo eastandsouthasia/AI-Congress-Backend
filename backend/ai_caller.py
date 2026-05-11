@@ -159,7 +159,7 @@ async def call_groq(
 async def call_gemini(
     messages: list,
     temperature: float = 0.4,
-    model: str = "gemini-2.5-flash",
+    model: str = "gemini-3.1-flash-lite",
     max_tokens: int = 300,
     retry: int = 0
 ) -> str:
