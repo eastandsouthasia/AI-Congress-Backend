@@ -7,27 +7,25 @@ import VotingScreen from "./src/screens/VotingScreen";
 import HistoryScreen from "./src/screens/HistoryScreen";
 
 export default function App() {
-  const [screen, setScreen]           = useState("input");
-  const [issue, setIssue]             = useState("");
-  const [duration, setDuration]       = useState(15);
-  const [debateFormat, setDebateFormat]     = useState("릴레이");
+  const [screen, setScreen]               = useState("input");
+  const [issue, setIssue]                 = useState("");
+  const [maxTurns, setMaxTurns]           = useState(25);   // duration → maxTurns
+  const [debateFormat, setDebateFormat]   = useState("릴레이");
   const [conclusionType, setConclusionType] = useState("VOTE");
-  // ✅ 참여 의원 ID 목록 (기본: 전원)
-  const [activeMembers, setActiveMembers]   = useState(MEMBERS.map(m => m.id));
-  const [result, setResult]           = useState(null);
+  const [activeMembers, setActiveMembers] = useState(MEMBERS.map(m => m.id));
+  const [result, setResult]               = useState(null);
   const [debateHistory, setDebateHistory] = useState([]);
-  const [conviction, setConviction]   = useState({});  // 의원별 최종 확신도
+  const [conviction, setConviction]       = useState({});
 
-  // ✅ activeMembers까지 5번째 파라미터로 수신
   const handleStart = (
     submittedIssue,
-    submittedDuration,
+    submittedMaxTurns,
     submittedFormat,
     submittedConclusion,
     submittedMembers,
   ) => {
     setIssue(submittedIssue);
-    setDuration(submittedDuration || 15);
+    setMaxTurns(submittedMaxTurns || 25);
     setDebateFormat(submittedFormat || "릴레이");
     setConclusionType(submittedConclusion || "VOTE");
     setActiveMembers(submittedMembers || MEMBERS.map(m => m.id));
@@ -55,10 +53,10 @@ export default function App() {
       {screen === "debate" && (
         <DebateScreen
           issue={issue}
-          duration={duration}
+          maxTurns={maxTurns}
           debateFormat={debateFormat}
           conclusionType={conclusionType}
-          activeMembers={activeMembers}   // ✅ 추가
+          activeMembers={activeMembers}
           onFinish={handleFinish}
         />
       )}
@@ -70,14 +68,17 @@ export default function App() {
           history={debateHistory}
           members={MEMBERS}
           conviction={conviction}
-          onClose={() => { setResult(null); setDebateHistory([]); setConviction({}); setScreen("input"); }}
+          onClose={() => {
+            setResult(null);
+            setDebateHistory([]);
+            setConviction({});
+            setScreen("input");
+          }}
         />
       )}
 
       {screen === "history" && (
-        <HistoryScreen
-          onBack={() => setScreen("input")}
-        />
+        <HistoryScreen onBack={() => setScreen("input")} />
       )}
     </View>
   );

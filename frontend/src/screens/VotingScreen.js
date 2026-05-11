@@ -26,7 +26,160 @@ import {
 } from 'react-native';
 import * as FileSystem from 'expo-file-system';
 import * as Sharing   from 'expo-sharing';
+import * as Speech    from 'expo-speech';
 // [버그A6 수정] AsyncStorage import 제거 — saveReport에서 중복 저장 삭제로 불필요
+
+// ─── TTS 텍스트 정제 (DebateScreen과 동일) ────────────
+const cleanForTTS = (text) => {
+  if (!text) return "";
+  return text
+    .replace(/\[REFUTE\]|\[ADMIT\]|\[DATA\]|\[GRAPHIC\]|\[TABLE\]/g, "")
+    .replace(/\[CHART:[a-z]+\]\{[^}]*\}/g, "")
+    .replace(/\[TABLE:json\]\{[^}]*\}/g, "")
+    .replace(/Gemini/gi, "제미나이").replace(/Llama4?/gi, "라마")
+    .replace(/Mistral/gi, "미스트랄").replace(/GPT.?OSS/gi, "지피티")
+    .replace(/Nemotron/gi, "엔비디아")
+    .replace(/≥/g, "이상").replace(/≤/g, "이하")
+    .replace(/>/g, "초과").replace(/</g, "미만")
+    .replace(/\*{2}/g, "").replace(/\*/g, "")
+    .replace(/[\u4E00-\u9FFF]+/g, "")
+    .replace(/\|[-:| ]+\|/g, "").replace(/\|/g, " ")
+    .trim();
+};
+
+// 의원별 음성 설정
+const VOICE_SETTINGS = {
+  gemini:   { pitch: 1.08, rate: 0.93 },
+  llama4:   { pitch: 0.82, rate: 0.87 },
+  mistral:  { pitch: 1.12, rate: 1.02 },
+  gptoss:   { pitch: 0.96, rate: 0.84 },
+  nemotron: { pitch: 0.91, rate: 0.81 },
+};
+
+// ─── 음성 재생 패널 ───────────────────────────────────
+function PlaybackPanel({ history, onClose }) {
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const [isPlaying, setIsPlaying]   = useState(false);
+  const [isLoading, setIsLoading]   = useState(false);
+  const playingRef  = useRef(false);
+  const stopSignal  = useRef(false);
+
+  useEffect(() => {
+    return () => { stopSignal.current = true; Speech.stop(); };
+  }, []);
+
+  // 재생 가능한 발언만 필터
+  const playable = (history || []).filter(h => h.text && !h.text.startsWith("━━"));
+
+  const speakItem = useCallback(async (idx) => {
+    if (idx >= playable.length) {
+      setIsPlaying(false); playingRef.current = false; setCurrentIdx(0); return;
+    }
+    if (stopSignal.current) return;
+
+    const item = playable[idx];
+    const ttsText = cleanForTTS(item.text);
+    if (!ttsText) {
+      // 빈 텍스트 건너뜀 — setTimeout으로 스택 분리 (연속 빈 항목 스택오버플로 방지)
+      if (!stopSignal.current && playingRef.current) { setCurrentIdx(idx + 1); setTimeout(() => speakItem(idx + 1), 0); }
+      return;
+    }
+
+    setIsLoading(true);
+    const vs = VOICE_SETTINGS[item.memberId] || { pitch: 1.0, rate: 0.88 };
+    setIsLoading(false);
+    if (stopSignal.current || !playingRef.current) return;
+
+    await new Promise((resolve) => {
+      try {
+        Speech.speak(ttsText, {
+          language: 'ko-KR', pitch: vs.pitch, rate: vs.rate, volume: 1.0,
+          onDone: resolve, onStopped: resolve, onError: resolve,
+        });
+      } catch { resolve(); }
+    });
+
+    if (!stopSignal.current && playingRef.current) {
+      const next = idx + 1;
+      setCurrentIdx(next);
+      speakItem(next);
+    }
+  }, [playable]);
+
+  const handlePlay = () => {
+    if (isPlaying) return;
+    stopSignal.current = false; playingRef.current = true;
+    setIsPlaying(true);
+    speakItem(currentIdx);
+  };
+  const handlePause = () => {
+    stopSignal.current = true; playingRef.current = false;
+    setIsPlaying(false); Speech.stop();
+  };
+  const handlePrev = () => {
+    const next = Math.max(0, currentIdx - 1);
+    setCurrentIdx(next);
+    if (isPlaying) { Speech.stop(); stopSignal.current = false; speakItem(next); }
+  };
+  const handleNext = () => {
+    const next = Math.min(playable.length - 1, currentIdx + 1);
+    setCurrentIdx(next);
+    if (isPlaying) { Speech.stop(); stopSignal.current = false; speakItem(next); }
+  };
+
+  const current    = playable[currentIdx];
+  const progressPct = playable.length > 0
+    ? Math.min(100, Math.round((currentIdx / playable.length) * 100)) : 0;
+
+  return (
+    <View style={pbStyles.panel}>
+      {/* 현재 발언자 */}
+      <View style={pbStyles.nowRow}>
+        <Text style={pbStyles.nowAvatar}>{current?.avatar || "💬"}</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={pbStyles.nowName} numberOfLines={1}>
+            {current?.displayName || "—"}
+          </Text>
+          <Text style={pbStyles.nowPreview} numberOfLines={1}>
+            {current?.text ? current.text.slice(0, 55) + (current.text.length > 55 ? "…" : "") : ""}
+          </Text>
+        </View>
+        <TouchableOpacity onPress={onClose} style={pbStyles.closeBtn}>
+          <Text style={pbStyles.closeBtnTxt}>✕</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* 진행 바 */}
+      <View style={pbStyles.progressBg}>
+        <View style={[pbStyles.progressFill, { width: `${progressPct}%` }]} />
+      </View>
+      <Text style={pbStyles.progressLabel}>
+        {currentIdx + 1} / {playable.length}  ({progressPct}%)
+      </Text>
+
+      {/* 컨트롤 */}
+      <View style={pbStyles.controls}>
+        <TouchableOpacity onPress={handlePrev} disabled={currentIdx === 0} style={pbStyles.ctrlBtn}>
+          <Text style={[pbStyles.ctrlTxt, currentIdx === 0 && pbStyles.ctrlDim]}>⏮</Text>
+        </TouchableOpacity>
+        {isLoading ? (
+          <View style={pbStyles.playBtn}><Text style={pbStyles.playTxt}>⏳</Text></View>
+        ) : isPlaying ? (
+          <TouchableOpacity style={pbStyles.playBtn} onPress={handlePause}>
+            <Text style={pbStyles.playTxt}>⏸</Text>
+          </TouchableOpacity>
+        ) : (
+          <TouchableOpacity style={pbStyles.playBtn} onPress={handlePlay}>
+            <Text style={pbStyles.playTxt}>▶</Text>
+          </TouchableOpacity>
+        )}
+        <TouchableOpacity onPress={handleNext} disabled={currentIdx >= playable.length - 1} style={pbStyles.ctrlBtn}>
+          <Text style={[pbStyles.ctrlTxt, currentIdx >= playable.length - 1 && pbStyles.ctrlDim]}>⏭</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
 
 // ─── 색상 팔레트 (국회 공식 느낌) ─────────────────
 const C = {
@@ -202,7 +355,8 @@ export default function VoteReportScreen({ issue, result, history, members, conv
   const slideAnim = useRef(new Animated.Value(40)).current;
   const sealAnim  = useRef(new Animated.Value(0)).current;
   const [isSaving, setIsSaving] = useState(false);
-  const [showReplay, setShowReplay] = useState(false); // 다시보기 모달
+  const [showReplay, setShowReplay] = useState(false);     // 텍스트 다시보기 모달
+  const [showPlayback, setShowPlayback] = useState(false); // 음성 재생 패널
 
   // 입장 애니메이션
   useEffect(() => {
@@ -540,13 +694,19 @@ export default function VoteReportScreen({ issue, result, history, members, conv
           <View style={{ height: 32 }} />
         </ScrollView>
 
-        {/* ── 하단 버튼 4개 ── */}
+        {/* ── 하단 버튼 5개 ── */}
         <View style={styles.footer}>
           <TouchableOpacity style={[styles.footerBtn, styles.footerBtnClose]} onPress={onClose}>
             <Text style={styles.footerBtnText}>✕{'\n'}닫기</Text>
           </TouchableOpacity>
           <TouchableOpacity style={[styles.footerBtn, styles.footerBtnReplay]} onPress={() => setShowReplay(true)}>
             <Text style={styles.footerBtnText}>👁{'\n'}다시보기</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.footerBtn, styles.footerBtnVoice, showPlayback && styles.footerBtnVoiceActive]}
+            onPress={() => setShowPlayback(v => !v)}
+          >
+            <Text style={styles.footerBtnText}>🔊{'\n'}음성재생</Text>
           </TouchableOpacity>
           <TouchableOpacity style={[styles.footerBtn, styles.footerBtnShare]} onPress={handleShare}>
             <Text style={styles.footerBtnText}>📤{'\n'}공유</Text>
@@ -561,6 +721,14 @@ export default function VoteReportScreen({ issue, result, history, members, conv
             </Text>
           </TouchableOpacity>
         </View>
+
+        {/* ── 음성 재생 패널 (하단 고정) ── */}
+        {showPlayback && (
+          <PlaybackPanel
+            history={history}
+            onClose={() => setShowPlayback(false)}
+          />
+        )}
 
         {/* ── 다시보기 모달 (토론 회의록) ── */}
         {showReplay && (
@@ -1027,6 +1195,14 @@ const styles = StyleSheet.create({
     backgroundColor: '#0d1828',
     borderColor: '#2980b966',
   },
+  footerBtnVoice: {
+    backgroundColor: '#1a0d28',
+    borderColor: '#9b59b666',
+  },
+  footerBtnVoiceActive: {
+    backgroundColor: '#2a1040',
+    borderColor: '#9b59b6',
+  },
   footerBtnShare: {
     backgroundColor: '#0d1e12',
     borderColor: '#27ae6066',
@@ -1158,4 +1334,39 @@ const styles = StyleSheet.create({
     flexDirection: 'row', justifyContent: 'space-between',
   },
   convAxisLabel: { fontSize: 8, color: '#2a3448' },
+});
+
+// ─── 재생 패널 스타일 ─────────────────────────────────
+const pbStyles = StyleSheet.create({
+  panel: {
+    position: 'absolute', bottom: 0, left: 0, right: 0,
+    backgroundColor: '#0d0f16',
+    borderTopWidth: 2, borderTopColor: '#7a4fb5',
+    paddingHorizontal: 16, paddingTop: 12, paddingBottom: 24,
+    elevation: 20,
+    zIndex: 100,
+  },
+  nowRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 10,
+  },
+  nowAvatar:   { fontSize: 22 },
+  nowName:     { color: '#e8cc7a', fontSize: 12, fontWeight: '800' },
+  nowPreview:  { color: '#4a5572', fontSize: 10, marginTop: 2 },
+  closeBtn:    { padding: 6 },
+  closeBtnTxt: { color: '#4a5572', fontSize: 14, fontWeight: '700' },
+
+  progressBg:   { height: 3, backgroundColor: '#1c2030', borderRadius: 2, marginBottom: 4 },
+  progressFill: { height: 3, backgroundColor: '#9b59b6', borderRadius: 2 },
+  progressLabel:{ color: '#2a3448', fontSize: 10, textAlign: 'right', marginBottom: 10 },
+
+  controls:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 28 },
+  ctrlBtn:   { padding: 8 },
+  ctrlTxt:   { fontSize: 22, color: '#e8cc7a' },
+  ctrlDim:   { color: '#2a3448' },
+  playBtn:   {
+    width: 52, height: 52, borderRadius: 26,
+    backgroundColor: '#9b59b6',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  playTxt:   { fontSize: 20, color: '#fff', fontWeight: '900' },
 });

@@ -1,6 +1,26 @@
 /**
- * DebateScreen - TTS와 발언을 완벽하게 동기화한 버전
- * ✅ activeMembers prop 추가 → WebSocket으로 백엔드 전달
+ * DebateScreen v2
+ *
+ * [v2 핵심 변경]
+ * 1. TTS ↔ 텍스트 동기화 완전 제거
+ *    - ACK 전송 코드 삭제 (ready 메시지, ackSeq 불필요)
+ *    - speakAndWaitSafe / processSpeechQueue 의 TTS 대기 제거
+ *    - 발언 텍스트는 수신 즉시 화면에 표시
+ *
+ * 2. 토론 진행 중 TTS 완전 비활성화
+ *    - 토론이 끝나면 VotingScreen(또는 별도 재생 패널)에서 독립 재생
+ *    - 🔊 버튼 → 토론 완료 후 회의록 음성 재생 토글로 용도 변경
+ *
+ * 3. 턴 기반 진행 표시
+ *    - 헤더의 "⏱ N분" → "💬 N/M턴" 배지로 교체
+ *    - 백엔드가 speech 메시지에 turnCount, maxTurns 포함해서 전송
+ *
+ * 4. 토론 완료 후 인라인 음성 재생 패널
+ *    - 발언 목록을 순서대로 TTS 재생
+ *    - 재생/일시정지/이전/다음 컨트롤
+ *    - 각 의원 목소리(pitch/rate)를 그대로 적용
+ *
+ * 5. WS 전송: duration → maxTurns
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -18,88 +38,182 @@ const BACKEND_WS_URL =
   process.env.EXPO_PUBLIC_BACKEND_WS_URL ||
   "wss://ai-congress.up.railway.app/debate";
 
-// ─── 유틸리티 ────────────────────────────────
+// ─── 유틸리티 ─────────────────────────────────
+// ─── 차트·표 파서 (CHART:bar/line/pie, TABLE:json 지원) ──
 const parseSegments = (text) => {
   const lines = text.split('\n');
   const segments = [];
-  let buffer = [], inBlock = null; // inBlock: 'graphic' | 'table' | null
-
-  const flushBlock = () => {
-    if (inBlock && buffer.length > 0) {
-      segments.push({ type: inBlock, content: buffer.join('\n') });
-    }
-    buffer = []; inBlock = null;
-  };
 
   lines.forEach(line => {
-    if (line.startsWith('[GRAPHIC]')) {
-      flushBlock();
-      inBlock = 'graphic'; buffer = [];
-    } else if (line.startsWith('[TABLE]')) {
-      flushBlock();
-      inBlock = 'table'; buffer = [];
-    } else if (inBlock) {
-      // 빈 줄이면 블록 종료
-      if (line.trim() === '' && buffer.length > 0) {
-        flushBlock();
-      } else if (line.startsWith('[DATA]')) {
-        // [버그N9 수정] 블록 내 [DATA] 라인은 블록을 먼저 닫고 data 세그먼트로 처리
-        flushBlock();
-        segments.push({ type: 'data', content: line.replace('[DATA]', '').trim() });
-      } else {
-        buffer.push(line);
-      }
-    } else if (line.startsWith('[DATA]')) {
-      segments.push({ type: 'data', content: line.replace('[DATA]', '').trim() });
-    } else {
-      segments.push({ type: 'text', content: line });
+    const trimmed = line.trim();
+
+    // [CHART:bar/line/pie]{...JSON...}
+    const chartMatch = trimmed.match(/^\[CHART:(bar|line|pie)\](\{.+\})$/);
+    if (chartMatch) {
+      try {
+        segments.push({ type: `chart_${chartMatch[1]}`, data: JSON.parse(chartMatch[2]) });
+      } catch { segments.push({ type: 'text', content: line }); }
+      return;
     }
+    // [TABLE:json]{...JSON...}
+    const tableMatch = trimmed.match(/^\[TABLE:json\](\{.+\})$/);
+    if (tableMatch) {
+      try {
+        segments.push({ type: 'table_json', data: JSON.parse(tableMatch[1]) });
+      } catch { segments.push({ type: 'text', content: line }); }
+      return;
+    }
+    // 레거시 [GRAPHIC] / [TABLE] — 텍스트 폴백
+    if (trimmed.startsWith('[GRAPHIC]')) {
+      segments.push({ type: 'graphic', content: trimmed.replace('[GRAPHIC]', '').trim() });
+      return;
+    }
+    if (trimmed.startsWith('[TABLE]')) {
+      segments.push({ type: 'graphic', content: trimmed.replace('[TABLE]', '').trim() });
+      return;
+    }
+    // [DATA] 인라인
+    if (trimmed.startsWith('[DATA]')) {
+      segments.push({ type: 'data', content: trimmed.replace('[DATA]', '').trim() });
+      return;
+    }
+    segments.push({ type: 'text', content: line });
   });
 
-  flushBlock(); // 파일 끝에 블록이 열려 있으면 닫기
-  return segments.filter(s => s.content.trim() !== '');
+  return segments.filter(s => s.content !== undefined ? s.content.trim() !== '' : true);
 };
 
-// TTS 완료 대기
-// 글자당 약 70ms (한국어 평균 낭독 속도 기준), 최소 1.5초, 최대 12초
-// onDone이 늦거나 안 오는 경우를 대비한 안전 타임아웃
-// [버그F 수정] abortSignal 파라미터 추가 — TTS 토글/의결 완료 시 즉시 resolve 가능
-const speakAndWaitSafe = (text, options, abortSignal) => new Promise((resolve) => {
-  if (!text || !text.trim()) { resolve(); return; }
-  let done = false;
-  const rate = options?.rate || 0.88;
-  const estimatedMs = Math.min(12000, Math.max(1500, (text.length * 70) / rate));
-  const finish = () => { if (!done) { done = true; resolve(); } };
-  const timeout = setTimeout(finish, estimatedMs);
-  // abort 신호 등록 — 토글/의결 시 즉시 resolve
-  if (abortSignal) {
-    abortSignal.onabort = () => { clearTimeout(timeout); finish(); };
-  }
-  try {
-    Speech.speak(text, {
-      ...options,
-      onDone:    () => { clearTimeout(timeout); finish(); },
-      onStopped: () => { clearTimeout(timeout); finish(); },
-      onError:   () => { clearTimeout(timeout); finish(); },
-    });
-  } catch (e) {
-    // Android Activity가 종료된 경우 (ExpoKeepAwake.activate 거부 등)
-    console.warn("[TTS] Speech.speak 실패 (activity 종료):", e?.message);
-    clearTimeout(timeout);
-    finish();
-  }
+// ─── 차트 색상 팔레트 ──────────────────────────────────
+const CHART_COLORS = ['#4fc3f7','#81c784','#ffb74d','#e57373','#ba68c8','#4dd0e1','#aed581','#ff8a65'];
+
+// ─── 막대 차트 ────────────────────────────────────────
+const BarChart = ({ data }) => {
+  const { title, labels = [], values = [], unit = '', source = '' } = data;
+  const max = Math.max(...values.map(Math.abs), 0.01);
+  const GAP = 7, LABEL_W = 72;
+  return (
+    <View style={cStyles.wrapper}>
+      {!!title && <Text style={cStyles.title}>{title}</Text>}
+      {labels.map((label, i) => {
+        const val = values[i] ?? 0;
+        const pct = Math.round((Math.abs(val) / max) * 100);
+        const color = CHART_COLORS[i % CHART_COLORS.length];
+        return (
+          <View key={i} style={[cStyles.barRow, { marginBottom: GAP }]}>
+            <Text style={[cStyles.barLabel, { width: LABEL_W }]} numberOfLines={1}>{label}</Text>
+            <View style={cStyles.barTrack}>
+              <View style={[cStyles.barFill, { width: `${pct}%`, backgroundColor: color }]} />
+            </View>
+            <Text style={[cStyles.barVal, { color }]}>{val}{unit}</Text>
+          </View>
+        );
+      })}
+      {!!source && <Text style={cStyles.source}>출처: {source}</Text>}
+    </View>
+  );
+};
+
+// ─── 꺾은선 차트 (순수 RN) ────────────────────────────
+const LineChart = ({ data }) => {
+  const { title, labels = [], values = [], unit = '', source = '' } = data;
+  if (values.length < 2) return <BarChart data={data} />;
+  const min = Math.min(...values), max = Math.max(...values);
+  const range = max - min || 1;
+  const H = 80, PAD = 8;
+  const pts = values.map((v, i) => ({
+    left: `${(i / (values.length - 1)) * 100}%`,
+    bottom: PAD + ((v - min) / range) * (H - PAD * 2),
+    v, color: CHART_COLORS[i % CHART_COLORS.length],
+  }));
+  return (
+    <View style={cStyles.wrapper}>
+      {!!title && <Text style={cStyles.title}>{title}</Text>}
+      <View style={{ height: H + 24, position: 'relative', marginBottom: 4 }}>
+        {[0, 0.5, 1].map((t, i) => (
+          <View key={i} style={{ position: 'absolute', left: 0, right: 0, bottom: PAD + t * (H - PAD * 2), height: 1, backgroundColor: '#ffffff0a' }} />
+        ))}
+        {pts.map((p, i) => (
+          <View key={i} style={{ position: 'absolute', width: 8, height: 8, borderRadius: 4, backgroundColor: p.color, left: p.left, bottom: p.bottom - 4, marginLeft: -4 }} />
+        ))}
+        {pts.map((p, i) => (
+          <Text key={`v${i}`} style={{ position: 'absolute', left: p.left, bottom: p.bottom + 6, fontSize: 9, fontWeight: '700', color: p.color }}>{p.v}{unit}</Text>
+        ))}
+        <View style={{ position: 'absolute', bottom: -20, left: 0, right: 0, flexDirection: 'row', justifyContent: 'space-between' }}>
+          {labels.map((l, i) => <Text key={i} style={cStyles.axisLabel} numberOfLines={1}>{l}</Text>)}
+        </View>
+      </View>
+      {!!source && <Text style={[cStyles.source, { marginTop: 18 }]}>출처: {source}</Text>}
+    </View>
+  );
+};
+
+// ─── 파이 차트 (비율 바 + 범례) ──────────────────────
+const PieChart = ({ data }) => {
+  const { title, labels = [], values = [], unit = '', source = '' } = data;
+  const total = values.reduce((a, b) => a + b, 0) || 1;
+  return (
+    <View style={cStyles.wrapper}>
+      {!!title && <Text style={cStyles.title}>{title}</Text>}
+      <View style={{ flexDirection: 'row', height: 20, borderRadius: 6, overflow: 'hidden', marginBottom: 10 }}>
+        {values.map((v, i) => <View key={i} style={{ flex: v / total, backgroundColor: CHART_COLORS[i % CHART_COLORS.length] }} />)}
+      </View>
+      <View style={{ gap: 5 }}>
+        {labels.map((l, i) => {
+          const pct = ((values[i] / total) * 100).toFixed(1);
+          const color = CHART_COLORS[i % CHART_COLORS.length];
+          return (
+            <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <View style={{ width: 12, height: 12, borderRadius: 2, backgroundColor: color }} />
+              <Text style={cStyles.legendText}>{l}</Text>
+              <Text style={{ fontSize: 11, fontWeight: '700', color }}>{pct}%</Text>
+            </View>
+          );
+        })}
+      </View>
+      {!!source && <Text style={cStyles.source}>출처: {source}</Text>}
+    </View>
+  );
+};
+
+// ─── JSON 테이블 ──────────────────────────────────────
+const DataTable = ({ data }) => {
+  const { title, headers = [], rows = [] } = data;
+  return (
+    <View style={cStyles.tableWrapper}>
+      {!!title && <Text style={cStyles.title}>{title}</Text>}
+      <View style={cStyles.tableHead}>
+        {headers.map((h, i) => <Text key={i} style={[cStyles.tableCell, cStyles.tableHeadCell, { flex: 1 }]} numberOfLines={1}>{h}</Text>)}
+      </View>
+      {rows.map((row, ri) => (
+        <View key={ri} style={[cStyles.tableRow, ri % 2 === 0 && cStyles.tableRowAlt]}>
+          {row.map((cell, ci) => <Text key={ci} style={[cStyles.tableCell, { flex: 1 }]} numberOfLines={2}>{cell}</Text>)}
+        </View>
+      ))}
+    </View>
+  );
+};
+
+// ─── 차트 공통 스타일 ─────────────────────────────────
+const cStyles = StyleSheet.create({
+  wrapper:      { backgroundColor: '#0a1020', borderRadius: 10, padding: 12, marginVertical: 6, borderWidth: 1, borderColor: '#4fc3f744' },
+  title:        { color: '#e8cc7a', fontSize: 11, fontWeight: '800', letterSpacing: 0.5, marginBottom: 10 },
+  barRow:       { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  barLabel:     { color: '#8899bb', fontSize: 10, textAlign: 'right' },
+  barTrack:     { flex: 1, height: 18, backgroundColor: '#ffffff0a', borderRadius: 4, overflow: 'hidden' },
+  barFill:      { height: 18, borderRadius: 4 },
+  barVal:       { fontSize: 10, fontWeight: '700', minWidth: 40, textAlign: 'right' },
+  axisLabel:    { color: '#5a6a88', fontSize: 9, textAlign: 'center', flex: 1 },
+  legendText:   { color: '#8899bb', fontSize: 11, flex: 1 },
+  source:       { color: '#3a4560', fontSize: 9, marginTop: 6, fontStyle: 'italic' },
+  tableWrapper: { backgroundColor: '#0d1426', borderRadius: 10, padding: 10, marginVertical: 6, borderWidth: 1, borderColor: '#c9a84c33' },
+  tableHead:    { flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: '#c9a84c44', paddingBottom: 6, marginBottom: 4 },
+  tableHeadCell:{ color: '#e8cc7a', fontWeight: '800', fontSize: 10 },
+  tableRow:     { flexDirection: 'row', paddingVertical: 4 },
+  tableRowAlt:  { backgroundColor: '#ffffff04' },
+  tableCell:    { color: '#b8c8e0', fontSize: 10, paddingHorizontal: 2 },
 });
 
-// 글자 수 기반 TTS 낭독 예상 시간 (ms) — 텍스트 타이핑 속도 맞추기용
-// 한국어 평균: 글자당 약 70ms / rate
-const estimateTTSDuration = (text, rate = 0.88) =>
-  Math.min(12000, Math.max(1500, ((text || "").length * 70) / rate));
-
-// [버그N10 수정] 찬반 파싱 로직을 VotingScreen.js의 parseVoteText와 동일하게 통일.
-// 기존: text.includes("찬성") → 이유 설명에 "찬성" 단어가 포함돼도 카운트됨.
-// 수정: [찬성]/[반대]/[기권] prefix 또는 시작 단어로만 판단.
-// [정합성 수정①] VotingScreen.js의 parseVoteText와 완전히 동일한 로직으로 통일.
-// 기존 주석 "VotingScreen.js와 동일 로직"이 실제로는 [기권] 패턴이 빠져 불일치했던 문제 해결.
+// 찬반 파싱 (VotingScreen과 동일 로직)
 const parseVoteResult = (text = "") => {
   const t = text.trimStart();
   if (/^\[찬성\]/.test(t) || /^찬성[\s.,!]/.test(t) || t === "찬성") return "FOR";
@@ -129,16 +243,14 @@ const formatDebateLog = (issue, history, voteResult = null) => {
     const isResolution = voteResult.type === "RESOLUTION";
     resultSection = `\n------------------------------------------\n${isResolution ? "공식 결의문" : "최종 의결"}:\n`;
     if (voteResult.type === "VOTE") {
-      // [버그N10 수정] parseVoteResult 사용 — VotingScreen.js와 동일한 파싱 로직
-      const pro  = voteResult.content?.filter(v => parseVoteResult(v.text) === "FOR").length || 0;
-      const con  = voteResult.content?.filter(v => parseVoteResult(v.text) === "AGAINST").length || 0;
-      const abs  = (voteResult.content?.length || 0) - pro - con;
+      const pro = voteResult.content?.filter(v => parseVoteResult(v.text) === "FOR").length || 0;
+      const con = voteResult.content?.filter(v => parseVoteResult(v.text) === "AGAINST").length || 0;
+      const abs = (voteResult.content?.length || 0) - pro - con;
       resultSection += `찬성 ${pro} / 반대 ${con} / 기권 ${abs}\n결과: ${pro > con ? "✅ 가결" : "❌ 부결"}\n`;
       voteResult.content?.forEach(v => {
         resultSection += `${v.memberId}: ${v.text}\n`;
       });
     } else {
-      // RESOLUTION: 결의문 본문에 이미 구조(【전문】 등)가 있으므로 prefix 없이 바로 출력
       resultSection += `${voteResult.content}`;
     }
     resultSection += `\n`;
@@ -147,47 +259,38 @@ const formatDebateLog = (issue, history, voteResult = null) => {
     `\n------------------------------------------\n본 문서는 AI 의결 시스템에 의해 작성되었습니다.\n==========================================`;
 };
 
-// AsyncStorage 저장
 const saveToStorage = async (issue, history, voteResult) => {
   try {
     const existing = await AsyncStorage.getItem('debate_history');
     const list = existing ? JSON.parse(existing) : [];
-    // [버그N10 수정] parseVoteResult 사용 — VotingScreen.js와 동일한 파싱 로직
     const proCount = voteResult?.type === "VOTE"
-      ? (voteResult.content?.filter(v => parseVoteResult(v.text) === "FOR").length || 0)
-      : 0;
+      ? (voteResult.content?.filter(v => parseVoteResult(v.text) === "FOR").length || 0) : 0;
     const conCount = voteResult?.type === "VOTE"
-      ? (voteResult.content?.filter(v => parseVoteResult(v.text) === "AGAINST").length || 0)
-      : 0;
+      ? (voteResult.content?.filter(v => parseVoteResult(v.text) === "AGAINST").length || 0) : 0;
     const newEntry = {
       id: Date.now(),
       date: new Date().toLocaleString('ko-KR'),
       issue,
       content: formatDebateLog(issue, history, voteResult),
       result: voteResult?.type === "VOTE"
-        ? (proCount > conCount ? "가결" : "부결")
-        : "결의안",
+        ? (proCount > conCount ? "가결" : "부결") : "결의안",
     };
     await AsyncStorage.setItem('debate_history', JSON.stringify([newEntry, ...list].slice(0, 50)));
   } catch (e) { console.error("저장 실패:", e); }
 };
 
-// TTS 음성 설정
-// [버그A7 수정] _cachedKoreanVoices를 모듈 레벨에 두면 컴포넌트 재마운트·
-// 기기 음성 목록 변경 시 캐시가 갱신되지 않음.
-// 컴포넌트 외부에 두되 앱 세션당 1회만 캐싱하는 것은 유지하고,
-// 캐시 무효화 함수를 노출하여 언마운트 시 초기화하도록 변경.
+// TTS 음성 설정 (의원별 고유 목소리)
 let _cachedKoreanVoices = null;
 export const invalidateVoiceCache = () => { _cachedKoreanVoices = null; };
 
 const getVoiceSettings = async (memberId) => {
   let pitch = 1.0, rate = 0.88, volume = 1.0, voice = null;
   switch (memberId) {
-    case "gemini":   pitch=1.08; rate=0.93; break;
-    case "llama4":   pitch=0.82; rate=0.87; break;
-    case "mistral":  pitch=1.12; rate=1.02; break;
-    case "gptoss":   pitch=0.96; rate=0.84; volume=0.98; break;
-    case "nemotron": pitch=0.91; rate=0.81; volume=0.97; break;
+    case "gemini":   pitch = 1.08; rate = 0.93; break;
+    case "llama4":   pitch = 0.82; rate = 0.87; break;
+    case "mistral":  pitch = 1.12; rate = 1.02; break;
+    case "gptoss":   pitch = 0.96; rate = 0.84; volume = 0.98; break;
+    case "nemotron": pitch = 0.91; rate = 0.81; volume = 0.97; break;
   }
   try {
     if (_cachedKoreanVoices === null) {
@@ -197,228 +300,264 @@ const getVoiceSettings = async (memberId) => {
       );
     }
     if (_cachedKoreanVoices.length > 0) {
-      const idx = memberId.split('').reduce((a,c) => a+c.charCodeAt(0), 0) % _cachedKoreanVoices.length;
+      const idx = memberId.split('').reduce((a, c) => a + c.charCodeAt(0), 0) % _cachedKoreanVoices.length;
       voice = _cachedKoreanVoices[idx].identifier;
     }
   } catch {}
   return { pitch, rate, volume, voice };
 };
 
+// TTS용 텍스트 정제
+const cleanForTTS = (text) => {
+  if (!text) return "";
+  const hanjaMap = {
+    '愼重|慎重': '신중', '重要': '중요', '重大': '중대', '必要': '필요',
+    '可能': '가능', '不可能': '불가능', '現在': '현재', '現實': '현실',
+    '未來': '미래', '社會': '사회', '國家': '국가', '政府': '정부',
+    '經濟': '경제', '政策': '정책', '制度': '제도', '問題': '문제',
+    '解決': '해결', '方法': '방법', '結果': '결과', '原因': '원인',
+    '根據': '근거', '主張': '주장', '反對': '반대', '贊成': '찬성',
+    '分析': '분석', '判斷': '판단', '決定': '결정', '效率': '효율',
+    '效果': '효과', '影響': '영향', '基準': '기준', '原則': '원칙',
+    '價値': '가치', '自由': '자유', '平等': '평등', '正義': '정의',
+    '安全': '안전', '危險': '위험', '保護': '보호', '發展': '발전',
+    '成長': '성장', '改善': '개선', '統計': '통계', '資料': '자료',
+    '報告': '보고', '議員': '의원', '議長': '의장', '本議員': '본의원',
+  };
+  let conv = text;
+  Object.entries(hanjaMap).forEach(([k, v]) => {
+    conv = conv.replace(new RegExp(k, 'g'), v);
+  });
+  return conv
+    .replace(/\[REFUTE\]|\[ADMIT\]|\[DATA\]|\[GRAPHIC\]|\[TABLE\]/g, "")
+    .replace(/\[CHART:[a-z]+\]\{[^}]*\}/g, "")
+    .replace(/\[TABLE:json\]\{[^}]*\}/g, "")
+    .replace(/Gemini/gi, "제미나이").replace(/Llama4?/gi, "라마")
+    .replace(/Mistral/gi, "미스트랄").replace(/GPT.?OSS/gi, "지피티")
+    .replace(/Nemotron/gi, "엔비디아")
+    .replace(/≥/g, "이상").replace(/≤/g, "이하")
+    .replace(/>/g, "초과").replace(/</g, "미만")
+    .replace(/={2,}/g, "동일")
+    .replace(/\*{2}/g, "").replace(/\*/g, "")
+    .replace(/[\u4E00-\u9FFF\u3400-\u4DBF]+/g, "")
+    .replace(/\uFE0F/g, "")
+    .replace(/(?:^|\n)\s*-\s*/g, "\n")
+    .replace(/\|[-:| ]+\|/g, "").replace(/\|/g, " ")
+    .trim();
+};
+
+// ─── 재생 패널 컴포넌트 ─────────────────────────
+const PlaybackPanel = ({ history, onClose }) => {
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const [isPlaying, setIsPlaying]   = useState(false);
+  const [isLoading, setIsLoading]   = useState(false);
+  const playingRef  = useRef(false);
+  const stopSignal  = useRef(false);
+
+  // 컴포넌트 언마운트 시 재생 중지
+  useEffect(() => {
+    return () => { stopSignal.current = true; Speech.stop(); };
+  }, []);
+
+  // 재생 가능한 항목 — TTS 정제 후 비어있는 항목(CHART만 있는 발언 등) 사전 제거
+  const playable = (history || []).filter(h => {
+    if (!h.text) return false;
+    return cleanForTTS(h.text).length > 0;
+  });
+
+  const speakItem = useCallback(async (idx) => {
+    if (idx >= playable.length) {
+      setIsPlaying(false);
+      playingRef.current = false;
+      setCurrentIdx(0);
+      return;
+    }
+    if (stopSignal.current) return;
+
+    const item = playable[idx];
+    const ttsText = cleanForTTS(item.text);
+    if (!ttsText) {
+      // 빈 텍스트 건너뜀 — setTimeout으로 스택 분리
+      if (!stopSignal.current && playingRef.current) {
+        setCurrentIdx(idx + 1);
+        setTimeout(() => speakItem(idx + 1), 0);
+      }
+      return;
+    }
+
+    setIsLoading(true);
+    const { pitch, rate, volume, voice } = await getVoiceSettings(item.memberId || "");
+    setIsLoading(false);
+    if (stopSignal.current || !playingRef.current) return;
+
+    await new Promise((resolve) => {
+      try {
+        Speech.speak(ttsText, {
+          language: 'ko-KR', pitch, rate, volume, voice,
+          onDone:    resolve,
+          onStopped: resolve,
+          onError:   resolve,
+        });
+      } catch { resolve(); }
+    });
+
+    if (!stopSignal.current && playingRef.current) {
+      const next = idx + 1;
+      setCurrentIdx(next);
+      speakItem(next);
+    }
+  }, [playable]);
+
+  const handlePlay = () => {
+    if (isPlaying) return;
+    stopSignal.current = false;
+    playingRef.current = true;
+    setIsPlaying(true);
+    speakItem(currentIdx);
+  };
+
+  const handlePause = () => {
+    stopSignal.current = true;
+    playingRef.current = false;
+    setIsPlaying(false);
+    Speech.stop();
+  };
+
+  const handlePrev = () => {
+    const next = Math.max(0, currentIdx - 1);
+    setCurrentIdx(next);
+    if (isPlaying) { Speech.stop(); stopSignal.current = false; speakItem(next); }
+  };
+
+  const handleNext = () => {
+    const next = Math.min(playable.length - 1, currentIdx + 1);
+    setCurrentIdx(next);
+    if (isPlaying) { Speech.stop(); stopSignal.current = false; speakItem(next); }
+  };
+
+  const current     = playable[currentIdx];
+  const progressPct = playable.length > 0 ? ((currentIdx / playable.length) * 100).toFixed(0) : 0;
+
+  return (
+    <View style={playStyles.panel}>
+      {/* 현재 발언자 */}
+      <View style={playStyles.nowPlaying}>
+        <Text style={playStyles.nowAvatar}>{current?.avatar || "💬"}</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={playStyles.nowName} numberOfLines={1}>
+            {current?.displayName || "—"}
+          </Text>
+          <Text style={playStyles.nowPreview} numberOfLines={2}>
+            {current?.text ? current.text.slice(0, 60) + (current.text.length > 60 ? "..." : "") : ""}
+          </Text>
+        </View>
+        <TouchableOpacity onPress={onClose} style={playStyles.closeBtn}>
+          <Text style={playStyles.closeBtnText}>✕</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* 진행 바 */}
+      <View style={playStyles.progressBg}>
+        <View style={[playStyles.progressFill, { width: `${progressPct}%` }]} />
+      </View>
+      <Text style={playStyles.progressLabel}>
+        {currentIdx + 1} / {playable.length} 발언  ({progressPct}%)
+      </Text>
+
+      {/* 컨트롤 */}
+      <View style={playStyles.controls}>
+        <TouchableOpacity style={playStyles.ctrlBtn} onPress={handlePrev} disabled={currentIdx === 0}>
+          <Text style={[playStyles.ctrlIcon, currentIdx === 0 && playStyles.ctrlDisabled]}>⏮</Text>
+        </TouchableOpacity>
+
+        {isLoading ? (
+          <View style={playStyles.playBtn}>
+            <Text style={playStyles.playIcon}>⏳</Text>
+          </View>
+        ) : isPlaying ? (
+          <TouchableOpacity style={playStyles.playBtn} onPress={handlePause}>
+            <Text style={playStyles.playIcon}>⏸</Text>
+          </TouchableOpacity>
+        ) : (
+          <TouchableOpacity style={playStyles.playBtn} onPress={handlePlay}>
+            <Text style={playStyles.playIcon}>▶</Text>
+          </TouchableOpacity>
+        )}
+
+        <TouchableOpacity
+          style={playStyles.ctrlBtn}
+          onPress={handleNext}
+          disabled={currentIdx >= playable.length - 1}
+        >
+          <Text style={[playStyles.ctrlIcon, currentIdx >= playable.length - 1 && playStyles.ctrlDisabled]}>⏭</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+};
+
 // ─── 메인 컴포넌트 ───────────────────────────
 const DebateScreen = ({
   issue,
-  duration = 15,
+  maxTurns = 25,
   debateFormat = "릴레이",
   conclusionType = "VOTE",
-  activeMembers,          // ✅ 추가: 참여 의원 ID 배열
+  activeMembers,
   onFinish,
 }) => {
-  const [history, setHistory]     = useState([]);
-  const [status, setStatus]       = useState("서버 연결 중...");
-  const [ttsEnabled, setTtsEnabled] = useState(true);
-  const [isFinished, setIsFinished] = useState(false);
-  const [isSaving, setIsSaving]   = useState(false);
-  const [roundInfo, setRoundInfo] = useState("");
+  const [history, setHistory]         = useState([]);
+  const [status, setStatus]           = useState("서버 연결 중...");
+  const [isFinished, setIsFinished]   = useState(false);
+  const [isSaving, setIsSaving]       = useState(false);
+  const [showPlayback, setShowPlayback] = useState(false);
+  const [turnDisplay, setTurnDisplay] = useState({ current: 0, max: maxTurns });
 
   const scrollRef     = useRef(null);
   const historyRef    = useRef([]);
-  const ttsEnabledRef = useRef(true);
   const wsRef         = useRef(null);
   const voteResultRef = useRef(null);
-  const convictionRef = useRef({});   // 의원별 최종 확신도 { memberId: float }
-  const speechQueue   = useRef([]);   // 발언 표시 큐
-  const speechBusy    = useRef(false);// 발언 표시 중 여부
-  const isMountedRef  = useRef(true); // 언마운트 후 TTS 호출 방지
-  // [버그A 수정] onFinish를 ref에 보관 — WS 클로저가 최초 마운트 시 캡처하므로
-  // prop이 바뀌어도 항상 최신 참조를 가리키도록 보장.
+  const convictionRef = useRef({});
+  const isMountedRef  = useRef(true);
   const onFinishRef   = useRef(onFinish);
   useEffect(() => { onFinishRef.current = onFinish; }, [onFinish]);
-  // [버그F 수정] TTS 토글/의결 완료 시 진행 중인 speakAndWaitSafe를 즉시 resolve.
-  const ttsAbortRef   = useRef(null);
 
-  // 컴포넌트 언마운트 시 플래그 해제 + 음성 캐시 초기화
   useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
-      invalidateVoiceCache(); // [버그A7 수정] 언마운트 시 캐시 무효화
+      invalidateVoiceCache();
     };
   }, []);
 
-  // ─── 발언 표시 큐 처리: 한 번에 한 발언씩 순서대로 표시 ───
-  const processSpeechQueue = useCallback(async () => {
-    if (speechBusy.current) return;
-    speechBusy.current = true;
+  // ─── 발언 추가 (즉시 표시 — TTS 없음) ───
+  const addLog = useCallback((data) => {
+    if (!isMountedRef.current) return;
+    const entry = {
+      id:          Date.now() + Math.random(),
+      memberId:    data.memberId    || "",
+      displayName: data.displayName || "?",
+      text:        data.text        || "",
+      type:        data.speechType  || "NORMAL",
+      engineInfo:  data.engineInfo  || "",
+      color:       data.color       || COLORS.border,
+      avatar:      data.avatar      || "💬",
+      timestamp:   data.timestamp   || new Date().toLocaleTimeString('ko-KR',
+                     { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    };
 
-    while (speechQueue.current.length > 0) {
-      if (!isMountedRef.current) break;
-      const data = speechQueue.current.shift();
-      const baseId   = Date.now() + Math.random();
-      const fullText = data.text || "";
-      const lines    = fullText.split('\n').filter(l => l.trim() !== '');
-      // [FIX-T2] 백엔드가 보낸 ackSeq를 보관 — TTS 완료 후 ACK에 echo
-      const pendingAckSeq = data.ackSeq ?? null;
-
-      // [버그A5 수정] 카드 추가 전 마운트 상태 재확인
-      if (!isMountedRef.current) break;
-      // 카드 추가 (텍스트 빈 상태로)
-      setHistory(prev => {
-        const next = [...prev, {
-          id:          baseId,
-          memberId:    data.memberId    || "",
-          displayName: data.displayName || "?",
-          text:        "",
-          type:        data.speechType  || "NORMAL",
-          engineInfo:  data.engineInfo  || "",
-          color:       data.color       || COLORS.border,
-          avatar:      data.avatar      || "💬",
-          timestamp:   data.timestamp   || new Date().toLocaleTimeString('ko-KR', {hour:'2-digit',minute:'2-digit',second:'2-digit'}),
-        }];
-        historyRef.current = next;
-        return next;
-      });
-      if (!isMountedRef.current) break;
-      setStatus(`🎙 ${data.displayName} 발언 중...`);
-      setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 60);
-
-      // ── TTS 텍스트 미리 정제 (화면 표시와 동시 시작하기 위해) ──
-      const hanjaMap = {
-        '愼重|慎重': '신중', '重要': '중요', '重大': '중대',
-        '必要': '필요', '可能': '가능', '不可能': '불가능',
-        '現在': '현재', '現實': '현실', '未來': '미래',
-        '社會': '사회', '國家': '국가', '政府': '정부',
-        '經濟': '경제', '政策': '정책', '制度': '제도',
-        '問題': '문제', '解決': '해결', '方法': '방법',
-        '結果': '결과', '原因': '원인', '根據': '근거',
-        '主張': '주장', '反對': '반대', '贊成': '찬성',
-        '分析': '분석', '判斷': '판단', '決定': '결정',
-        '效率': '효율', '效果': '효과', '影響': '영향',
-        '基準': '기준', '原則': '원칙', '價値': '가치',
-        '自由': '자유', '平等': '평등', '正義': '정의',
-        '安全': '안전', '危險': '위험', '保護': '보호',
-        '發展': '발전', '成長': '성장', '改善': '개선',
-        '統計': '통계', '資料': '자료', '報告': '보고',
-        '議員': '의원', '議長': '의장', '本議員': '본의원',
-        '贊反': '찬반', '論議': '논의', '討論': '토론',
-        '强調': '강조', '指摘': '지적', '提示': '제시',
-        '具體': '구체', '抽象': '추상', '複雜': '복잡',
-        '簡單': '간단', '明確': '명확', '不明確': '불명확',
-      };
-      let ttsClean = "";
-      if (ttsEnabledRef.current && fullText) {
-        let conv = fullText;
-        Object.entries(hanjaMap).forEach(([k, v]) => {
-          conv = conv.replace(new RegExp(k, 'g'), v);
-        });
-        ttsClean = conv
-          .replace(/\[REFUTE\]|\[ADMIT\]|\[DATA\]|\[GRAPHIC\]|\[TABLE\]/g, "")
-          .replace(/Gemini/gi, "제미나이")
-          .replace(/Llama4?/gi, "라마")
-          .replace(/Mistral/gi, "미스트랄")
-          .replace(/GPT.?OSS/gi, "지피티")
-          .replace(/Nemotron/gi, "엔비디아")
-          .replace(/≥/g, "이상").replace(/≤/g, "이하")
-          .replace(/>/g, "초과").replace(/</g, "미만")
-          .replace(/={2,}/g, "동일")
-          .replace(/\*{2}/g, "").replace(/\*/g, "")
-          .replace(/[\u4E00-\u9FFF\u3400-\u4DBF]+/g, "")
-          .replace(/\uFE0F/g, "")
-          .replace(/(?:^|\n)\s*-\s*/g, "\n")
-          .replace(/\|[-:| ]+\|/g, "")
-          .replace(/\|/g, " ")
-          .trim();
-      }
-
-      // ── TTS와 텍스트 타이핑 동시 시작 ──
-      const voiceSettings = await getVoiceSettings(data.memberId);
-      const { pitch, rate, volume, voice } = voiceSettings;
-      // [버그7 수정] ttsClean이 빈 문자열("")일 때 || fullText로 폴백하면
-      // TTS는 실제로 재생되지 않는데 타이핑 속도만 fullText 길이 기준으로 계산됨.
-      // ttsEnabled가 꺼져 있거나 정제 후 내용이 없을 때는 0으로 처리해
-      // 타이핑이 TTS와 무관하게 빠르게 완료되도록 함.
-      const ttsTextForDuration = (ttsEnabledRef.current && ttsClean) ? ttsClean : "";
-      const ttsDurationMs = ttsTextForDuration
-        ? estimateTTSDuration(ttsTextForDuration, rate)
-        : 800; // TTS 없을 때 최소 간격
-
-      // TTS를 await 없이 fire → Promise만 보관
-      let ttsPromise = Promise.resolve();
-      if (ttsEnabledRef.current && ttsClean) {
-        // [버그F 수정] AbortController로 토글/의결 시 즉시 resolve 가능하게 함
-        const abortCtrl = new AbortController();
-        ttsAbortRef.current = abortCtrl;
-        ttsPromise = speakAndWaitSafe(ttsClean, { language: 'ko-KR', pitch, rate, volume, voice }, abortCtrl.signal);
-      }
-
-      // 텍스트 타이핑: TTS 낭독 시간 비율에 맞춰 줄 단위로 표시
-      if (lines.length > 0) {
-        const totalChars = lines.reduce((s, l) => s + l.length, 0) || 1;
-        let accumulated = "";
-        for (let i = 0; i < lines.length; i++) {
-          if (!isMountedRef.current) break; // [버그A5 수정] 타이핑 중 언마운트 체크
-          accumulated += (i === 0 ? "" : "\n") + lines[i];
-          const snap = accumulated;
-          setHistory(prev => {
-            const next = prev.map(h => h.id === baseId ? { ...h, text: snap } : h);
-            historyRef.current = next;
-            return next;
-          });
-          // 다음 줄까지 대기: 이 줄의 글자 비율 × 총 낭독시간 (마지막 줄 제외)
-          if (i < lines.length - 1) {
-            const lineRatio = lines[i].length / totalChars;
-            const lineDelay = Math.max(150, ttsDurationMs * lineRatio);
-            await new Promise(r => setTimeout(r, lineDelay));
-          }
-        }
-      } else {
-        if (isMountedRef.current) { // [버그A5 수정]
-          setHistory(prev => {
-            const next = prev.map(h => h.id === baseId ? { ...h, text: fullText } : h);
-            historyRef.current = next;
-            return next;
-          });
-        }
-      }
-
-      setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
-
-      // 텍스트가 먼저 끝난 경우 TTS 완료까지 대기 (다음 발언 차단)
-      await ttsPromise;
-
-      // TTS 꺼져 있으면 최소 간격 유지
-      if (!ttsEnabledRef.current) {
-        await new Promise(r => setTimeout(r, 600));
-      }
-
-      if (!isMountedRef.current) break; // [버그A5 수정] TTS 완료 후 언마운트 체크
-      setStatus("다음 발언 준비 중...");
-
-      // 발언 카드 간 여백
-      await new Promise(r => setTimeout(r, 400));
-
-      // 백엔드에 ACK 전송 — 다음 발언을 보내도 좋다는 신호
-      // [FIX-T1] TTS 완료 후 전송 (TTS 완료 → ttsPromise await 이후 이 지점에 도달)
-      // [FIX-T2] ackSeq echo — 백엔드가 stale ACK를 seq 불일치로 폐기할 수 있도록
-      try {
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          const ack = { type: "ready" };
-          if (pendingAckSeq !== null && pendingAckSeq !== undefined) {
-            ack.ackSeq = pendingAckSeq;
-          }
-          wsRef.current.send(JSON.stringify(ack));
-        }
-      } catch (e) { console.warn("[ACK] 전송 실패:", e); }
+    // 턴 카운터 업데이트 (백엔드 전송값 우선, 없으면 계산)
+    if (typeof data.turnCount === 'number') {
+      setTurnDisplay({ current: data.turnCount, max: data.maxTurns || maxTurns });
     }
 
-    speechBusy.current = false;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // ─── 발언 추가: speechQueue에 넣고 순차 처리 ───
-  const addLog = useCallback((data) => {
-    speechQueue.current.push(data);
-    processSpeechQueue();
-  }, [processSpeechQueue]);
+    setHistory(prev => {
+      const next = [...prev, entry];
+      historyRef.current = next;
+      return next;
+    });
+    setStatus(`🎙 ${data.displayName} 발언`);
+    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 60);
+  }, [maxTurns]);
 
   // ─── WebSocket ───
   useEffect(() => {
@@ -427,10 +566,9 @@ const DebateScreen = ({
 
     ws.onopen = () => {
       setStatus("서버 연결됨. 토론 시작 중...");
-      // ✅ activeMembers 포함하여 전송
       ws.send(JSON.stringify({
         issue,
-        duration,
+        maxTurns,
         debateFormat,
         conclusionType,
         activeMembers: activeMembers || [],
@@ -440,61 +578,48 @@ const DebateScreen = ({
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
-
         switch (msg.type) {
           case "status":
             setStatus(msg.message || "");
             break;
           case "protocol":
-            setStatus(`${msg.format} 형식 · 의장: ${msg.chairName}`);
+            setStatus(`${msg.format} · 의장: ${msg.chairName} · 최대 ${msg.maxTurns}턴`);
+            setTurnDisplay({ current: 0, max: msg.maxTurns || maxTurns });
             break;
           case "round":
-            setRoundInfo(msg.label || "");
             setStatus(msg.label || "");
             break;
           case "speech":
-            addLog(msg);   // msg.ackSeq 포함 — [FIX-T2] 큐를 통해 ACK에 echo
+            addLog(msg);
             break;
           case "result": {
             const voteResult = { type: msg.resultType, content: msg.content };
             voteResultRef.current = voteResult;
-            // 남은 발언 큐 비우기 — 의결 후 발언이 이어지지 않도록
-            speechQueue.current = [];
-            Speech.stop();
-            // [버그J 수정] Speech.stop()만으로는 onStopped가 늦거나 안 오는 플랫폼에서
-            // processSpeechQueue가 최대 12초간 ttsPromise를 기다리다 뒤늦게 ACK를 전송함.
-            if (ttsAbortRef.current) {
-              ttsAbortRef.current.abort();
-              ttsAbortRef.current = null;
-            }
             saveToStorage(issue, historyRef.current, voteResult);
             if (isMountedRef.current) {
               setIsFinished(true);
               setStatus("✅ 토론 종료 — 기록이 보관함에 저장되었습니다");
-              // [버그A 수정] onFinishRef.current 사용 — stale closure 방지
               onFinishRef.current({
-                type: msg.resultType,
-                content: msg.content,
-                history: [...historyRef.current],
-                conviction: convictionRef.current,   // 확신도 변화 데이터 전달
+                type:       msg.resultType,
+                content:    msg.content,
+                history:    [...historyRef.current],
+                conviction: convictionRef.current,
               });
             }
             break;
           }
           case "done":
-            setIsFinished(true);
+            if (isMountedRef.current) setIsFinished(true);
             break;
-          case "conviction": {
-            // 확신도 업데이트 — all 객체에 memberId별 최신 확신도 보관
+          case "conviction":
             if (msg.all && typeof msg.all === 'object') {
               convictionRef.current = msg.all;
             }
             break;
-          }
           case "error":
             Alert.alert("서버 오류", msg.message || "알 수 없는 오류");
             setStatus("⚠️ 오류 발생");
-            setIsFinished(true);
+            if (isMountedRef.current) setIsFinished(true);
             break;
         }
       } catch (e) {
@@ -505,21 +630,17 @@ const DebateScreen = ({
     ws.onerror = () => {
       setStatus("⚠️ 서버 연결 실패");
       Alert.alert("연결 실패", `서버 주소를 확인하세요.\n${BACKEND_WS_URL}`);
-      setIsFinished(true);
+      if (isMountedRef.current) setIsFinished(true);
     };
 
     ws.onclose = () => console.log("[WS] 연결 종료");
 
     return () => {
       Speech.stop();
-      speechQueue.current = [];
       if (ws.readyState === WebSocket.OPEN) ws.close();
     };
-  // [버그9 수정] onFinish를 의존성 배열에서 제거.
-  // App.js에서 인라인 함수로 전달되면 렌더마다 새 참조가 생겨
-  // WebSocket이 매 렌더마다 재연결됨. onFinish는 ref를 통해 최신값을 사용.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [issue, duration, debateFormat, conclusionType, activeMembers]);
+  }, [issue, maxTurns, debateFormat, conclusionType, activeMembers]);
 
   // ─── 파일 내보내기 ───
   const downloadDebateLog = async () => {
@@ -529,15 +650,12 @@ const DebateScreen = ({
       const current = historyRef.current;
       if (!current || current.length === 0) {
         Alert.alert("알림", "저장할 토론 기록이 없습니다.");
-        // [버그I 수정] 기존 return은 finally를 건너뛰어 isSaving이 true로 고착됨.
-        // if-else로 전환하여 항상 finally { setIsSaving(false) } 실행 보장.
       } else {
         const logText = formatDebateLog(issue, current, voteResultRef.current);
         const fileName = `AI_Congress_${Date.now()}.txt`;
         const baseDir = FileSystem.documentDirectory || FileSystem.cacheDirectory;
         const fileUri = baseDir + fileName;
         await FileSystem.writeAsStringAsync(fileUri, logText, { encoding: FileSystem.EncodingType.UTF8 });
-
         const canShare = await Sharing.isAvailableAsync();
         if (canShare) {
           await Sharing.shareAsync(fileUri, { mimeType: 'text/plain', dialogTitle: 'AI 의회 토론 기록' });
@@ -552,6 +670,10 @@ const DebateScreen = ({
     }
   };
 
+  const turnPct = turnDisplay.max > 0
+    ? Math.min(100, Math.round((turnDisplay.current / turnDisplay.max) * 100))
+    : 0;
+
   return (
     <View style={styles.container}>
       {/* 상단 헤더 */}
@@ -563,34 +685,37 @@ const DebateScreen = ({
         <View style={styles.headerRight}>
           <View style={[styles.badge, debateFormat === "자유토론" && styles.badgePurple]}>
             <Text style={styles.badgeText}>
-              {debateFormat === "릴레이" ? "🔄" : debateFormat === "집중토론" ? "⚡" : debateFormat === "전문가패널" ? "🎓" : "🌀"} {debateFormat}
+              {debateFormat === "릴레이" ? "🔄" :
+               debateFormat === "집중토론" ? "⚡" :
+               debateFormat === "전문가패널" ? "🎓" : "🌀"} {debateFormat}
             </Text>
           </View>
+          {/* 턴 배지 */}
           <View style={styles.badge}>
-            <Text style={styles.badgeText}>⏱ {duration}분</Text>
+            <Text style={styles.badgeText}>
+              💬 {turnDisplay.current}/{turnDisplay.max}턴
+            </Text>
           </View>
-          <TouchableOpacity
-            style={[styles.iconBtn, !ttsEnabled && styles.iconBtnOff]}
-            onPress={() => {
-              Speech.stop();
-              // [버그F 수정] 현재 ttsPromise를 즉시 resolve — 큐 최대 12초 차단 방지
-              if (ttsAbortRef.current) {
-                ttsAbortRef.current.abort();
-                ttsAbortRef.current = null;
-              }
-              const next = !ttsEnabled;
-              setTtsEnabled(next);
-              ttsEnabledRef.current = next;
-            }}
-          >
-            <Text style={styles.iconBtnText}>{ttsEnabled ? "🔊" : "🔇"}</Text>
-          </TouchableOpacity>
+          {/* 토론 완료 후 음성 재생 버튼 */}
+          {isFinished && (
+            <TouchableOpacity
+              style={[styles.iconBtn, showPlayback && styles.iconBtnActive]}
+              onPress={() => setShowPlayback(v => !v)}
+            >
+              <Text style={styles.iconBtnText}>{showPlayback ? "🔊" : "🔈"}</Text>
+            </TouchableOpacity>
+          )}
         </View>
+      </View>
+
+      {/* 턴 진행 바 */}
+      <View style={styles.turnBar}>
+        <View style={[styles.turnBarFill, { width: `${turnPct}%` }]} />
       </View>
 
       {/* 상태 바 */}
       <View style={styles.statusBar}>
-        <View style={styles.statusDot} />
+        <View style={[styles.statusDot, isFinished && styles.statusDotDone]} />
         <Text style={styles.statusText} numberOfLines={1}>{status}</Text>
         {isFinished && (
           <TouchableOpacity
@@ -603,7 +728,12 @@ const DebateScreen = ({
         )}
       </View>
 
-      <ScrollView ref={scrollRef} style={styles.scroll} contentContainerStyle={styles.scrollContent}>
+      {/* 발언 목록 */}
+      <ScrollView
+        ref={scrollRef}
+        style={styles.scroll}
+        contentContainerStyle={styles.scrollContent}
+      >
         {history.map((h, i) => {
           const member = MEMBERS.find(m => m.id === h.memberId);
           const color = h.color || member?.color || COLORS.border;
@@ -638,8 +768,16 @@ const DebateScreen = ({
                   {!!h.engineInfo && <Text style={styles.engineBadge}>{h.engineInfo}</Text>}
                 </View>
                 <View style={styles.metaRight}>
-                  {h.type === "REFUTE" && <View style={styles.typeBadgeRefute}><Text style={styles.typeBadgeText}>⚔ 반박</Text></View>}
-                  {h.type === "ADMIT"  && <View style={styles.typeBadgeAdmit}><Text style={styles.typeBadgeText}>✅ 수용</Text></View>}
+                  {h.type === "REFUTE" && (
+                    <View style={styles.typeBadgeRefute}>
+                      <Text style={styles.typeBadgeText}>⚔ 반박</Text>
+                    </View>
+                  )}
+                  {h.type === "ADMIT" && (
+                    <View style={styles.typeBadgeAdmit}>
+                      <Text style={styles.typeBadgeText}>✅ 수용</Text>
+                    </View>
+                  )}
                   {!!h.timestamp && <Text style={styles.timestamp}>{h.timestamp}</Text>}
                 </View>
               </View>
@@ -650,57 +788,71 @@ const DebateScreen = ({
                     <Text style={styles.dataText}>{seg.content}</Text>
                   </View>
                 );
+                if (seg.type === 'chart_bar')  return <BarChart  key={si} data={seg.data} />;
+                if (seg.type === 'chart_line') return <LineChart key={si} data={seg.data} />;
+                if (seg.type === 'chart_pie')  return <PieChart  key={si} data={seg.data} />;
+                if (seg.type === 'table_json') return <DataTable key={si} data={seg.data} />;
                 if (seg.type === 'graphic') return (
                   <View key={si} style={styles.graphicBox}>
                     <Text style={styles.graphicText}>{seg.content}</Text>
                   </View>
                 );
-                if (seg.type === 'table') return (
-                  <View key={si} style={styles.tableBox}>
-                    <Text style={styles.tableText}>{seg.content}</Text>
-                  </View>
+                return (
+                  <Text key={si} style={[styles.text, isChair && styles.textChair]}>
+                    {seg.content}
+                  </Text>
                 );
-                return <Text key={si} style={[styles.text, isChair && styles.textChair]}>{seg.content}</Text>;
               })}
             </View>
           );
         })}
-        <View style={{ height: 40 }} />
+        <View style={{ height: showPlayback ? 180 : 40 }} />
       </ScrollView>
+
+      {/* 토론 완료 후 음성 재생 패널 (하단 고정) */}
+      {isFinished && showPlayback && (
+        <PlaybackPanel
+          history={history.filter(h => h.text && !h.text.startsWith("━━"))}
+          onClose={() => setShowPlayback(false)}
+        />
+      )}
     </View>
   );
 };
 
-const GOLD = "#c9a84c";
+// ─── 스타일 ──────────────────────────────────
+const GOLD  = "#c9a84c";
 const GOLD2 = "#e8cc7a";
-const NAVY = "#080c14";
+const NAVY  = "#080c14";
 const PANEL = "#10151f";
-const PANEL2 = "#161d2b";
+const PANEL2= "#161d2b";
 const SLATE = "#1c2436";
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: NAVY },
 
-  // ── 헤더 ──
   header: {
     flexDirection: "row", alignItems: "center", justifyContent: "space-between",
     paddingTop: 52, paddingBottom: 12, paddingHorizontal: 16,
     backgroundColor: PANEL,
     borderBottomWidth: 1, borderBottomColor: GOLD + "33",
   },
-  headerLeft: { flex: 1, marginRight: 10 },
+  headerLeft:  { flex: 1, marginRight: 10 },
   headerTitle: { color: GOLD2, fontSize: 14, fontWeight: "900", letterSpacing: 3 },
   headerIssue: { color: "#8899bb", fontSize: 11, marginTop: 2 },
   headerRight: { flexDirection: "row", alignItems: "center", gap: 6 },
 
-  badge: { backgroundColor: PANEL2, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4, borderWidth: 1, borderColor: GOLD + "33" },
+  badge:       { backgroundColor: PANEL2, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4, borderWidth: 1, borderColor: GOLD + "33" },
   badgePurple: { borderColor: "#9b59b6" + "55", backgroundColor: "#1a0d2e" },
-  badgeText: { color: GOLD, fontSize: 10, fontWeight: "700" },
-  iconBtn: { backgroundColor: PANEL2, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1, borderColor: GOLD + "33" },
-  iconBtnOff: { borderColor: "#e74c3c55" },
+  badgeText:   { color: GOLD, fontSize: 10, fontWeight: "700" },
+  iconBtn:     { backgroundColor: PANEL2, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1, borderColor: GOLD + "33" },
+  iconBtnActive: { borderColor: GOLD, backgroundColor: GOLD + "22" },
   iconBtnText: { fontSize: 14 },
 
-  // ── 상태 바 ──
+  // 턴 진행 바
+  turnBar: { height: 2, backgroundColor: SLATE },
+  turnBarFill: { height: 2, backgroundColor: GOLD + "88" },
+
   statusBar: {
     flexDirection: "row", alignItems: "center",
     paddingHorizontal: 16, paddingVertical: 8,
@@ -708,30 +860,25 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1, borderBottomColor: "#ffffff0a",
     gap: 8,
   },
-  statusDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#4fc3f7" },
-  statusText: { flex: 1, color: "#7899cc", fontSize: 11, fontWeight: "600" },
-  actionBtn: { backgroundColor: "#1a3a1a", borderRadius: 6, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: "#27ae6055" },
+  statusDot:     { width: 6, height: 6, borderRadius: 3, backgroundColor: "#4fc3f7" },
+  statusDotDone: { backgroundColor: "#27ae60" },
+  statusText:    { flex: 1, color: "#7899cc", fontSize: 11, fontWeight: "600" },
+  actionBtn:     { backgroundColor: "#1a3a1a", borderRadius: 6, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: "#27ae6055" },
   actionBtnDisabled: { backgroundColor: SLATE, borderColor: "#333" },
   actionBtnText: { color: "#27ae60", fontSize: 10, fontWeight: "700" },
 
-  scroll: { flex: 1 },
+  scroll:        { flex: 1 },
   scrollContent: { paddingHorizontal: 14, paddingTop: 12 },
 
-  // ── 라운드 헤더 ──
-  roundHeader: {
-    flexDirection: "row", alignItems: "center",
-    marginVertical: 14, gap: 10,
-  },
+  roundHeader: { flexDirection: "row", alignItems: "center", marginVertical: 14, gap: 10 },
   roundHeaderLine: { flex: 1, height: 1, backgroundColor: GOLD + "33" },
   roundHeaderText: { color: GOLD + "aa", fontSize: 10, fontWeight: "700", letterSpacing: 2 },
 
-  // ── 발언 카드 ──
   card: {
     backgroundColor: PANEL,
     paddingHorizontal: 14, paddingVertical: 12,
     marginBottom: 10, borderRadius: 10,
-    borderLeftWidth: 3,
-    borderWidth: 1, borderColor: "#ffffff08",
+    borderLeftWidth: 3, borderWidth: 1, borderColor: "#ffffff08",
   },
   cardRefute: { backgroundColor: "#160e0e", borderColor: "#e74c3c18" },
   cardAdmit:  { backgroundColor: "#0c160c", borderColor: "#27ae6018" },
@@ -743,28 +890,55 @@ const styles = StyleSheet.create({
     backgroundColor: SLATE, alignItems: "center", justifyContent: "center",
     borderWidth: 1, borderColor: "#ffffff14",
   },
-  avatar: { fontSize: 16 },
-  nameWrap: { flex: 1 },
-  name: { fontSize: 12, fontWeight: "800", letterSpacing: 0.5 },
+  avatar:    { fontSize: 16 },
+  nameWrap:  { flex: 1 },
+  name:      { fontSize: 12, fontWeight: "800", letterSpacing: 0.5 },
   engineBadge: { fontSize: 9, color: "#4a5572", marginTop: 2 },
 
-  metaRight: { alignItems: "flex-end", gap: 4 },
-  timestamp: { color: "#3a4560", fontSize: 9, fontWeight: "600", letterSpacing: 0.5 },
-
-  typeBadgeRefute: { backgroundColor: "#2a0f0f", borderRadius: 4, paddingHorizontal: 7, paddingVertical: 2, borderWidth: 1, borderColor: "#e74c3c44" },
-  typeBadgeAdmit:  { backgroundColor: "#0c1f0c", borderRadius: 4, paddingHorizontal: 7, paddingVertical: 2, borderWidth: 1, borderColor: "#27ae6044" },
-  typeBadgeText: { fontSize: 9, fontWeight: "700", color: "#aaa" },
+  metaRight:      { alignItems: "flex-end", gap: 4 },
+  timestamp:      { color: "#3a4560", fontSize: 9, fontWeight: "600", letterSpacing: 0.5 },
+  typeBadgeRefute:{ backgroundColor: "#2a0f0f", borderRadius: 4, paddingHorizontal: 7, paddingVertical: 2, borderWidth: 1, borderColor: "#e74c3c44" },
+  typeBadgeAdmit: { backgroundColor: "#0c1f0c", borderRadius: 4, paddingHorizontal: 7, paddingVertical: 2, borderWidth: 1, borderColor: "#27ae6044" },
+  typeBadgeText:  { fontSize: 9, fontWeight: "700", color: "#aaa" },
 
   text:      { color: "#c8d4e8", lineHeight: 22, fontSize: 13.5, letterSpacing: 0.2 },
   textChair: { color: "#a8b8cc", fontStyle: "italic" },
 
-  dataBox: { flexDirection: 'row', alignItems: 'flex-start', backgroundColor: '#091828', borderRadius: 6, padding: 10, marginVertical: 5, borderLeftWidth: 3, borderLeftColor: "#4fc3f7" },
-  dataIcon: { fontSize: 13, marginRight: 7 },
-  dataText: { flex: 1, color: "#4fc3f7", fontSize: 12, fontFamily: 'monospace' },
+  dataBox:    { flexDirection: 'row', alignItems: 'flex-start', backgroundColor: '#091828', borderRadius: 6, padding: 10, marginVertical: 5, borderLeftWidth: 3, borderLeftColor: "#4fc3f7" },
+  dataIcon:   { fontSize: 13, marginRight: 7 },
+  dataText:   { flex: 1, color: "#4fc3f7", fontSize: 12, fontFamily: 'monospace' },
   graphicBox: { backgroundColor: '#091409', borderRadius: 6, padding: 10, marginVertical: 5, borderWidth: 1, borderColor: "#27ae6044" },
-  graphicText: { color: '#39d353', fontSize: 12, fontFamily: 'monospace' },
-  tableBox: { backgroundColor: '#0d1426', borderRadius: 6, padding: 10, marginVertical: 5, borderWidth: 1, borderColor: GOLD + "33" },
-  tableText: { color: "#b8c8e0", fontSize: 11, fontFamily: 'monospace', lineHeight: 18 },
+  graphicText:{ color: '#39d353', fontSize: 12, fontFamily: 'monospace' },
+  tableBox:   { backgroundColor: '#0d1426', borderRadius: 6, padding: 10, marginVertical: 5, borderWidth: 1, borderColor: GOLD + "33" },
+  tableText:  { color: "#b8c8e0", fontSize: 11, fontFamily: 'monospace', lineHeight: 18 },
+});
+
+// ─── 재생 패널 스타일 ─────────────────────────
+const playStyles = StyleSheet.create({
+  panel: {
+    position: 'absolute', bottom: 0, left: 0, right: 0,
+    backgroundColor: PANEL2,
+    borderTopWidth: 1, borderTopColor: GOLD + "44",
+    paddingHorizontal: 16, paddingTop: 12, paddingBottom: 20,
+    elevation: 10,
+  },
+  nowPlaying: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 10 },
+  nowAvatar:  { fontSize: 24 },
+  nowName:    { color: GOLD2, fontSize: 12, fontWeight: "800" },
+  nowPreview: { color: "#5a6a88", fontSize: 10, marginTop: 2 },
+  closeBtn:   { padding: 6 },
+  closeBtnText:{ color: "#4a5572", fontSize: 14, fontWeight: "700" },
+
+  progressBg:   { height: 3, backgroundColor: SLATE, borderRadius: 2, marginBottom: 4 },
+  progressFill: { height: 3, backgroundColor: GOLD, borderRadius: 2 },
+  progressLabel:{ color: "#3a4560", fontSize: 10, textAlign: 'right', marginBottom: 10 },
+
+  controls:    { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 24 },
+  ctrlBtn:     { padding: 8 },
+  ctrlIcon:    { fontSize: 22, color: GOLD2 },
+  ctrlDisabled:{ color: "#2a3448" },
+  playBtn:     { width: 52, height: 52, borderRadius: 26, backgroundColor: GOLD, alignItems: 'center', justifyContent: 'center' },
+  playIcon:    { fontSize: 20, color: NAVY, fontWeight: "900" },
 });
 
 export default DebateScreen;
