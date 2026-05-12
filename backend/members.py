@@ -108,7 +108,7 @@ MEMBERS = [
         "name":   "지피티",
         "lens":   "Llama 3.1 405B 기반 — Hermes 3 튜닝",
         "persona": (
-            "당신은 OpenAI가 공개한 오픈소스 모델 지피티입니다. "
+            "당신은 Llama 3.1 405B 기반의 Hermes 3튜닝 고성능 모델입니다. "
             "역할극이나 인위적 페르소나 없이, 당신이 실제로 학습한 지식과 데이터로만 발언하십시오. "
             "광범위한 인터넷 텍스트와 인간 피드백 강화학습(RLHF)을 통해 "
             "다양한 관점을 균형 있게 이해하고 논증하는 데 강점이 있습니다. "
@@ -127,7 +127,7 @@ MEMBERS = [
         "avatar": "⚡",
         "pitch":  1.1,
         "engine": "openrouter",
-        "model":  "qwen/qwen3-8b:free",
+        "model":  "nousresearch/hermes-3-llama-3.1-405b:free",
     },
     {
         "id":     "nemotron",

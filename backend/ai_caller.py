@@ -15,11 +15,24 @@ import re
 import time
 import asyncio
 import httpx
+from pathlib import Path
+from dotenv import load_dotenv
+# ==================== .env 파일 로드 (frontend에 있는 파일 읽기) ====================
+BASE_DIR = Path(__file__).parent.parent  # AI-Congress-Backend 폴더
+env_path = BASE_DIR / "frontend" / ".env"
 
+if env_path.exists():
+    load_dotenv(env_path)
+    print(f"✅ frontend/.env 파일 로드 성공")
+else:
+    print(f"⚠️ frontend/.env 파일을 찾을 수 없습니다: {env_path}")
+# ================================================================================
 GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-
+print("GEMINI:", bool(GEMINI_API_KEY))
+print("OPENROUTER:", bool(OPENROUTER_API_KEY))
+print("GROQ:", bool(GROQ_API_KEY))
 # ─────────────────────────────────────────────
 # 엔진별 동시 호출 제한
 # ─────────────────────────────────────────────
@@ -159,7 +172,7 @@ async def call_groq(
 async def call_gemini(
     messages: list,
     temperature: float = 0.4,
-    model: str = "gemini-3.1-flash-lite",
+    model: str = "gemini-2.0-flash-lite",
     max_tokens: int = 300,
     retry: int = 0
 ) -> str:
@@ -275,7 +288,8 @@ async def call_openrouter(
                     return await call_openrouter(
                         messages, temperature,
                         "mistralai/mistral-small-3.2-24b-instruct:free",
-                        retry
+                        max_tokens,                # 기존 max_tokens 유지
+                        max(retry, 1),             # acquire 이중 실행 방지
                     )
                 raise ValueError("OpenRouter 크레딧 소진")
 
@@ -301,7 +315,7 @@ async def call_openrouter(
 #   OpenRouter: grok, perplexity, chatgpt, manus
 #
 # ⚠️ 무료 모델 응답속도 기준:
-#   빠름(~5s): groq 모델, gemini-2.5-flash, mistral-small:free, qwen3-8b:free
+#   빠름(~5s): groq 모델, gemini-2.0-flash-lite, mistral-small:free, nousresearch/hermes-3-llama-3.1-405b:free
 #   느림(30s+): deepseek-r1:free, grok-3-mini-beta → 사용 안 함
 # ─────────────────────────────────────────────
 
@@ -437,7 +451,7 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
                 contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
                 url = (
                     f"https://generativelanguage.googleapis.com/v1beta"
-                    f"/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+                    f"/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
                 )
                 payload = {
                     "contents": contents,
@@ -448,7 +462,9 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
                 async with httpx.AsyncClient(timeout=30) as client:
                     r = await client.post(url, json=payload)
                     if r.status_code == 200:
-                        raw_facts = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                        parts = r.json()["candidates"][0]["content"]["parts"]
+                        # [BUG-B 수정] parts[0]이 항상 text가 아님 (grounding metadata 혼재 가능)
+                        raw_facts = next((p["text"] for p in parts if "text" in p), "")
                         print(f"[Research/{member_name}] Step1 Gemini grounding 성공 ({len(raw_facts)}자)")
         except Exception as e:
             print(f"[Research/{member_name}] Step1 Gemini grounding 실패: {e}")
@@ -646,7 +662,7 @@ async def call_research_targeted(
                 contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
                 url = (
                     f"https://generativelanguage.googleapis.com/v1beta"
-                    f"/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+                    f"/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
                 )
                 payload = {
                     "contents": contents,
@@ -661,7 +677,9 @@ async def call_research_targeted(
                 async with httpx.AsyncClient(timeout=25) as client:
                     r = await client.post(url, json=payload)
                     if r.status_code == 200:
-                        raw_facts = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                        parts = r.json()["candidates"][0]["content"]["parts"]
+                        # [BUG-B 수정] parts[0]이 항상 text가 아님 (grounding metadata 혼재 가능)
+                        raw_facts = next((p["text"] for p in parts if "text" in p), "")
                         print(f"[MidResearch/{member_name}] Step1 Gemini 성공 ({len(raw_facts)}자)")
         except Exception as e:
             print(f"[MidResearch/{member_name}] Step1 Gemini 실패: {e}")

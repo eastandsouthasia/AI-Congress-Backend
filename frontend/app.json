@@ -3,7 +3,11 @@
     "name": "AI Congress",
     "slug": "ai-congress",
     "version": "1.0.0",
+    "orientation": "portrait",
     "icon": "./assets/icon.png",
+    "splash": {
+      "backgroundColor": "#0d1117"
+    },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/icon.png",
@@ -15,6 +19,13 @@
         "MODIFY_AUDIO_SETTINGS"
       ]
     },
+    "ios": {
+      "bundleIdentifier": "com.cryfornation2.aicongress",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "AI Congress uses the microphone for speech synthesis playback."
+      }
+    },
     "web": {
       "favicon": "./assets/favicon.png"
     },
@@ -25,6 +36,7 @@
     },
     "plugins": [
       "expo-sharing"
+ 
     ]
   }
 }

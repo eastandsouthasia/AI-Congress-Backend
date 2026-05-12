@@ -91,6 +91,40 @@ class DebateContext:
         parts.extend(f"{l['speaker']}: {l['text']}" for l in self.all_logs)
         return "\n".join(parts)
 
+    # ── 추가 헬퍼 ─────────────────────────────────────────────
+
+    def recent(self, n: int = 5) -> list[dict]:
+        """최근 n개 발언 반환"""
+        return self.all_logs[-n:]
+
+    def full_text(self, max_chars: int = 3000) -> str:
+        """전체 발언을 하나의 문자열로 반환. max_chars 초과 시 최근 내용 기준으로 자름."""
+        lines = [f"{l['speaker']}: {l['text']}" for l in self.all_logs]
+        text = "\n\n".join(lines)
+        return text[-max_chars:] if len(text) > max_chars else text
+
+    def recent_text(self, n: int = 5, max_chars: int = 2000) -> str:
+        """최근 n개 발언만 문자열로 반환"""
+        lines = [f"{l['speaker']}: {l['text']}" for l in self.all_logs[-n:]]
+        text = "\n\n".join(lines)
+        return text[-max_chars:] if len(text) > max_chars else text
+
+    def get_last_speaker_id(self, members: list) -> str | None:
+        """가장 최근에 발언한 의원 id 반환. 없으면 None."""
+        for log in reversed(self.all_logs):
+            spk = log.get("speaker", "")
+            for m in members:
+                if m["name"] in spk:
+                    return m["id"]
+        return None
+
+    def count_speeches(self, member_name: str) -> int:
+        """특정 의원의 누적 발언 횟수 반환"""
+        return sum(1 for log in self.all_logs if member_name in log.get("speaker", ""))
+
+    def __len__(self):
+        return len(self.all_logs)
+
     async def compress_if_needed(self):
         """발언 수가 COMPRESS_TRIGGER 초과 시 오래된 발언을 LLM으로 압축
 

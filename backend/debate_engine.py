@@ -934,6 +934,10 @@ class DebateEngine:
         if not allow:
             return
 
+        # 반박 발언 생성 전에도 턴 소진 여부 재확인
+        if self._turns_over():
+            return
+
         rebuttal = await self.get_opinion(
             candidate, chair["name"],
             format_guide=fmt_guide,
@@ -1144,7 +1148,7 @@ class DebateEngine:
         order = []
         if engine == "gemini":
             order = [
-                ("gemini",     _cg,  "gemini-2.5-flash"),
+                ("gemini",     _cg,  model),
                 ("groq",       _cgr, "llama-3.3-70b-versatile"),
                 ("openrouter", _cor, "mistralai/mistral-small-3.2-24b-instruct:free"),
             ]
@@ -1736,7 +1740,7 @@ class DebateEngine:
             # 80% 턴 소진 경고
             if not warned and turn >= warn_threshold:
                 warned = True
-                remaining = self.max_free_turns - turn
+                remaining = self._turns_remaining()
                 warn_text = await self.chair_speak(
                     chair,
                     f"발언 한도 알림: 잔여 발언 {remaining}회 남았습니다. "
