@@ -1,14 +1,13 @@
 """
-AI 호출 레이어 - 레이트 리밋 완전 대응 버전
+AI ?�출 ?�이??- ?�이??리밋 ?�전 ?�??버전
 
-핵심 변경사항:
-- 엔진별 글로벌 RPM 토큰버킷 (Groq 20/min, Gemini 12/min, OpenRouter 15/min)
-- claude → Gemini로 이동 (Groq 과부하 해소)
-- chatgpt → OpenRouter mistral로 이동 (Groq 분산)
-- 폴백 순서: 전용엔진 → 다른엔진 교차 → Gemini → 최소응답
-- penalize 축소 (5초) → 회복 시간 단축
-- 429 시 Retry-After 헤더 우선 준수
-"""
+?�심 변경사??
+- ?�진�?글로벌 RPM ?�큰버킷 (Groq 20/min, Gemini 12/min, OpenRouter 15/min)
+- claude ??Gemini�??�동 (Groq 과�????�소)
+- chatgpt ??OpenRouter mistral�??�동 (Groq 분산)
+- ?�백 ?�서: ?�용?�진 ???�른?�진 교차 ??Gemini ??최소?�답
+- penalize 축소 (5�? ???�복 ?�간 ?�축
+- 429 ??Retry-After ?�더 ?�선 준??"""
 
 import os
 import re
@@ -17,15 +16,15 @@ import asyncio
 import httpx
 from pathlib import Path
 from dotenv import load_dotenv
-# ==================== .env 파일 로드 (frontend에 있는 파일 읽기) ====================
-BASE_DIR = Path(__file__).parent.parent  # AI-Congress-Backend 폴더
-env_path = BASE_DIR / "frontend" / ".env"
+# ==================== .env ?�일 로드 (frontend???�는 ?�일 ?�기) ====================
+BASE_DIR = Path(__file__).parent.parent  # AI-Congress-Backend ?�더
+env_path = BASE_DIR / ".env"
 
 if env_path.exists():
     load_dotenv(env_path)
-    print(f"✅ frontend/.env 파일 로드 성공")
+    print(f"??frontend/.env ?�일 로드 ?�공")
 else:
-    print(f"⚠️ frontend/.env 파일을 찾을 수 없습니다: {env_path}")
+    print(f"?�️ frontend/.env ?�일??찾을 ???�습?�다: {env_path}")
 # ================================================================================
 GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
@@ -33,30 +32,26 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 print("GEMINI:", bool(GEMINI_API_KEY))
 print("OPENROUTER:", bool(OPENROUTER_API_KEY))
 print("GROQ:", bool(GROQ_API_KEY))
-# ─────────────────────────────────────────────
-# 엔진별 동시 호출 제한
-# ─────────────────────────────────────────────
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ?�진�??�시 ?�출 ?�한
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 _ENGINE_SEMAPHORES = {
-    "groq":       asyncio.Semaphore(2),  # llama4 + nemotron 동시 처리
+    "groq":       asyncio.Semaphore(2),  # llama4 + nemotron ?�시 처리
     "gemini":     asyncio.Semaphore(1),
-    "openrouter": asyncio.Semaphore(1),  # 2→1: openrouter도 순차처리로 안정화
-}
+    "openrouter": asyncio.Semaphore(1),  # 2??: openrouter???�차처리�??�정??}
 
-# ─────────────────────────────────────────────
-# 토큰 버킷 레이트 리미터
-# ─────────────────────────────────────────────
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ?�큰 버킷 ?�이??리�???# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 class TokenBucket:
     """
-    rpm: 분당 최대 요청 수
-    burst: 순간 최대 토큰 (기본 = rpm의 절반, 최소 1)
+    rpm: 분당 최�? ?�청 ??    burst: ?�간 최�? ?�큰 (기본 = rpm???�반, 최소 1)
     """
     def __init__(self, rpm: int, burst: int = None):
         self.rpm         = rpm
         self.capacity    = burst or max(1, rpm // 2)
         self.tokens      = float(self.capacity)
         self.last_refill = time.monotonic()
-        self._lock       = None  # asyncio.Lock은 이벤트루프 생성 후 초기화
-
+        self._lock       = None  # asyncio.Lock?� ?�벤?�루???�성 ??초기??
     def _ensure_lock(self):
         if self._lock is None:
             self._lock = asyncio.Lock()
@@ -77,41 +72,39 @@ class TokenBucket:
                 return
 
             wait = (1.0 - self.tokens) / (self.rpm / 60.0)
-            print(f"[RateLimit] {wait:.1f}초 대기 중...")
+            print(f"[RateLimit] {wait:.1f}�??��?�?..")
             await asyncio.sleep(wait)
             self.tokens = 0.0
 
     def penalize(self, seconds: float = 5.0):
-        """429 수신 시 토큰 강제 소진. 패널티 5초로 축소 (이전: 10~20초)"""
+        """429 ?�신 ???�큰 강제 ?�진. ?�널??5초로 축소 (?�전: 10~20�?"""
         self.tokens = max(self.tokens - seconds * (self.rpm / 60.0), -self.capacity)
 
 
-# 엔진별 버킷
-# ⚠️ Groq을 20 RPM으로 낮춤: claude+chatgpt가 Groq에서 빠져나가므로
-#    llama4 단독 사용 → 더 여유롭게 운영 가능
-_BUCKETS = {
+# ?�진�?버킷
+# ?�️ Groq??20 RPM?�로 ??��: claude+chatgpt가 Groq?�서 빠져?��?므�?#    llama4 ?�독 ?�용 ?????�유�?�� ?�영 가??_BUCKETS = {
     "groq":       TokenBucket(rpm=20, burst=2),
     "gemini":     TokenBucket(rpm=12, burst=2),
     "openrouter": TokenBucket(rpm=15, burst=2),
 }
 
-# ─────────────────────────────────────────────
-# 문장 완성 보장 (발언 끊김 방지)
-# ─────────────────────────────────────────────
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# 문장 ?�성 보장 (발언 ?��? 방�?)
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 def ensure_complete(text: str) -> str:
     if not text or not text.strip():
         return text
     text = text.strip()
-    if re.search(r'[.!?。！？"\'」』…]$', text):
+    if re.search(r'[.!??�！�?\'?�』�?$', text):
         return text
-    match = re.search(r'^([\s\S]*[.!?。！？"\'」』…])', text)
+    match = re.search(r'^([\s\S]*[.!??�！�?\'?�』�?)', text)
     if match:
         return match.group(1).strip()
     return text
 
-# ─────────────────────────────────────────────
-# Groq 호출
-# ─────────────────────────────────────────────
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# Groq ?�출
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 async def call_groq(
     messages: list,
     temperature: float = 0.5,
@@ -120,10 +113,10 @@ async def call_groq(
     retry: int = 0
 ) -> str:
     if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY 없음")
+        raise ValueError("GROQ_API_KEY ?�음")
 
-    # [BUG-5 수정] retry > 0이면 acquire 건너뜀.
-    # 재귀 호출 시 함수 첫 줄부터 재실행되므로 acquire가 이중 소비되던 문제 수정.
+    # [BUG-5 ?�정] retry > 0?�면 acquire 건너?�.
+    # ?��? ?�출 ???�수 �?줄�????�실?�되므�?acquire가 ?�중 ?�비?�던 문제 ?�정.
     if retry == 0:
         await _BUCKETS["groq"].acquire()
 
@@ -148,10 +141,9 @@ async def call_groq(
             )
             if r.status_code == 429 and retry < 2:
                 _BUCKETS["groq"].penalize(5)
-                # Retry-After 헤더를 최우선으로 준수
-                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 5))
+                # Retry-After ?�더�?최우?�으�?준??                retry_after = int(r.headers.get("Retry-After", (retry + 1) * 5))
                 wait = min(retry_after, 20)
-                print(f"[Groq 429] {wait}초 대기 후 재시도 ({retry+1}/2)")
+                print(f"[Groq 429] {wait}�??��????�시??({retry+1}/2)")
                 await asyncio.sleep(wait)
                 return await call_groq(messages, temperature, model, retry + 1)
 
@@ -161,14 +153,14 @@ async def call_groq(
 
         except httpx.TimeoutException:
             if retry < 1:
-                print(f"[Groq 타임아웃] 재시도 ({retry+1}/1)")
+                print(f"[Groq ?�?�아?? ?�시??({retry+1}/1)")
                 await asyncio.sleep(2)
                 return await call_groq(messages, temperature, model, retry + 1)
-            raise ValueError("Groq 응답 시간 초과")
+            raise ValueError("Groq ?�답 ?�간 초과")
 
-# ─────────────────────────────────────────────
-# Gemini 호출
-# ─────────────────────────────────────────────
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# Gemini ?�출
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 async def call_gemini(
     messages: list,
     temperature: float = 0.4,
@@ -177,9 +169,9 @@ async def call_gemini(
     retry: int = 0
 ) -> str:
     if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY 없음")
+        raise ValueError("GEMINI_API_KEY ?�음")
 
-    # [BUG-5 수정] retry > 0이면 acquire 건너뜀
+    # [BUG-5 ?�정] retry > 0?�면 acquire 건너?�
     if retry == 0:
         await _BUCKETS["gemini"].acquire()
 
@@ -197,7 +189,7 @@ async def call_gemini(
             contents.append({"role": role, "parts": [{"text": m["content"]}]})
 
     if not contents or contents[-1]["role"] == "model":
-        contents.append({"role": "user", "parts": [{"text": "발언하세요."}]})
+        contents.append({"role": "user", "parts": [{"text": "발언?�세??"}]})
 
     url = (
         f"https://generativelanguage.googleapis.com/v1beta"
@@ -220,7 +212,7 @@ async def call_gemini(
                 _BUCKETS["gemini"].penalize(5)
                 retry_after = int(r.headers.get("Retry-After", (retry + 1) * 6))
                 wait = min(retry_after, 20)
-                print(f"[Gemini 429] {wait}초 대기 후 재시도")
+                print(f"[Gemini 429] {wait}�??��????�시??)
                 await asyncio.sleep(wait)
                 return await call_gemini(messages, temperature, model, retry + 1)
 
@@ -232,11 +224,11 @@ async def call_gemini(
             if retry < 1:
                 await asyncio.sleep(2)
                 return await call_gemini(messages, temperature, model, retry + 1)
-            raise ValueError("Gemini 응답 시간 초과")
+            raise ValueError("Gemini ?�답 ?�간 초과")
 
-# ─────────────────────────────────────────────
-# OpenRouter 호출
-# ─────────────────────────────────────────────
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# OpenRouter ?�출
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 async def call_openrouter(
     messages: list,
     temperature: float = 0.5,
@@ -245,9 +237,9 @@ async def call_openrouter(
     retry: int = 0
 ) -> str:
     if not OPENROUTER_API_KEY:
-        raise ValueError("OPENROUTER_API_KEY 없음")
+        raise ValueError("OPENROUTER_API_KEY ?�음")
 
-    # [BUG-5 수정] retry > 0이면 acquire 건너뜀
+    # [BUG-5 ?�정] retry > 0?�면 acquire 건너?�
     if retry == 0:
         await _BUCKETS["openrouter"].acquire()
 
@@ -277,21 +269,21 @@ async def call_openrouter(
                 _BUCKETS["openrouter"].penalize(5)
                 retry_after = int(r.headers.get("Retry-After", (retry + 1) * 6))
                 wait = min(retry_after, 20)
-                print(f"[OpenRouter 429] {wait}초 대기 후 재시도")
+                print(f"[OpenRouter 429] {wait}�??��????�시??)
                 await asyncio.sleep(wait)
                 return await call_openrouter(messages, temperature, model, retry + 1)
 
             if r.status_code == 402:
-                # 크레딧 부족: 다른 무료 모델로 교체
+                # ?�레??부�? ?�른 무료 모델�?교체
                 if model != "mistralai/mistral-small-3.2-24b-instruct:free":
-                    print(f"[OpenRouter 402] 크레딧 부족 → mistral 무료 폴백")
+                    print(f"[OpenRouter 402] ?�레??부�???mistral 무료 ?�백")
                     return await call_openrouter(
                         messages, temperature,
                         "mistralai/mistral-small-3.2-24b-instruct:free",
-                        max_tokens,                # 기존 max_tokens 유지
-                        max(retry, 1),             # acquire 이중 실행 방지
+                        max_tokens,                # 기존 max_tokens ?��?
+                        max(retry, 1),             # acquire ?�중 ?�행 방�?
                     )
-                raise ValueError("OpenRouter 크레딧 소진")
+                raise ValueError("OpenRouter ?�레???�진")
 
             r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"]
@@ -301,46 +293,44 @@ async def call_openrouter(
             if retry < 1:
                 await asyncio.sleep(2)
                 return await call_openrouter(messages, temperature, model, retry + 1)
-            raise ValueError("OpenRouter 응답 시간 초과")
+            raise ValueError("OpenRouter ?�답 ?�간 초과")
 
-# ─────────────────────────────────────────────
-# 의원 엔진 매핑 — ✅ 엔진 분산 재배치
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ?�원 ?�진 매핑 ?????�진 분산 ?�배�?#
+# 변�???문제:
+#   claude + chatgpt + llama4 ??모두 Groq ??Groq RPM ??��
 #
-# 변경 전 문제:
-#   claude + chatgpt + llama4 → 모두 Groq → Groq RPM 폭주
-#
-# 변경 후 분산:
-#   Groq:       llama4 (단독 사용 → 여유로움)
-#   Gemini:     gemini, claude (Gemini는 일 1500회 무료 → 여유 큼)
+# 변�???분산:
+#   Groq:       llama4 (?�독 ?�용 ???�유로�?)
+#   Gemini:     gemini, claude (Gemini????1500??무료 ???�유 ??
 #   OpenRouter: grok, perplexity, chatgpt, manus
 #
-# ⚠️ 무료 모델 응답속도 기준:
+# ?�️ 무료 모델 ?�답?�도 기�?:
 #   빠름(~5s): groq 모델, gemini-2.0-flash-lite, mistral-small:free, nousresearch/hermes-3-llama-3.1-405b:free
-#   느림(30s+): deepseek-r1:free, grok-3-mini-beta → 사용 안 함
-# ─────────────────────────────────────────────
+#   ?�림(30s+): deepseek-r1:free, grok-3-mini-beta ???�용 ????# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 
-# ─────────────────────────────────────────────
-# 엔진별 교차 폴백 순서
-# 1차 실패 시 → 다른 엔진으로 교차 시도 (Groq 단일 폴백 제거)
-# ─────────────────────────────────────────────
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ?�진�?교차 ?�백 ?�서
+# 1�??�패 ?????�른 ?�진?�로 교차 ?�도 (Groq ?�일 ?�백 ?�거)
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 _FALLBACK_ORDER = {
     "groq":       [("gemini", call_gemini), ("openrouter", call_openrouter)],
     "gemini":     [("groq", call_groq),     ("openrouter", call_openrouter)],
     "openrouter": [("gemini", call_gemini), ("groq", call_groq)],
 }
 
-# ─────────────────────────────────────────────
-# 통합 호출: 엔진별 버킷 + 교차 폴백
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ?�합 ?�출: ?�진�?버킷 + 교차 ?�백
 #
-# [정합성 수정②] MEMBER_ENGINE_MAP 제거.
-# 기존: MEMBER_ENGINE_MAP[member_id]를 참조하고 member["engine"]/member["model"]은
-#       표시용으로만 사용 → members.py 수정 시 MEMBER_ENGINE_MAP도 반드시 함께 수정해야
-#       하는 이중관리 문제 존재.
-# 수정: member dict의 "engine"/"model" 필드를 직접 참조.
-#       members.py가 SSOT(단일 진실 공급원)이므로 여기서는 그 값을 그대로 사용.
-#       members.py에서 engine/model을 바꾸면 호출도 자동으로 반영됨.
-# 폴백 기본값: engine 누락 시 "openrouter", model 누락 시 mistral 무료 모델.
-# ─────────────────────────────────────────────
+# [?�합???�정?? MEMBER_ENGINE_MAP ?�거.
+# 기존: MEMBER_ENGINE_MAP[member_id]�?참조?�고 member["engine"]/member["model"]?�
+#       ?�시?�으로만 ?�용 ??members.py ?�정 ??MEMBER_ENGINE_MAP??반드???�께 ?�정?�야
+#       ?�는 ?�중관�?문제 존재.
+# ?�정: member dict??"engine"/"model" ?�드�?직접 참조.
+#       members.py가 SSOT(?�일 진실 공급???��?�??�기?�는 �?값을 그�?�??�용.
+#       members.py?�서 engine/model??바꾸�??�출???�동?�로 반영??
+# ?�백 기본�? engine ?�락 ??"openrouter", model ?�락 ??mistral 무료 모델.
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 async def call_member(member: dict, messages: list, temperature: float = 0.5) -> str:
     member_id = member.get("id", "")
     name      = member.get("name", "?")
@@ -349,7 +339,7 @@ async def call_member(member: dict, messages: list, temperature: float = 0.5) ->
     sem       = _ENGINE_SEMAPHORES.get(engine, _ENGINE_SEMAPHORES["openrouter"])
 
     async with sem:
-        # ── 1차: 전용 엔진 ──
+        # ?�?� 1�? ?�용 ?�진 ?�?�
         try:
             if engine == "gemini":
                 return await call_gemini(messages, temperature, model)
@@ -358,95 +348,90 @@ async def call_member(member: dict, messages: list, temperature: float = 0.5) ->
             else:
                 return await call_groq(messages, temperature, model)
         except Exception as e1:
-            print(f"[{name}/{engine}] 1차 실패: {e1}")
+            print(f"[{name}/{engine}] 1�??�패: {e1}")
 
-        # ── 2차: 교차 폴백 (엔진별 순서대로) ──
+        # ?�?� 2�? 교차 ?�백 (?�진�??�서?��? ?�?�
         for fallback_engine, fallback_fn in _FALLBACK_ORDER.get(engine, []):
             fallback_sem = _ENGINE_SEMAPHORES.get(fallback_engine, _ENGINE_SEMAPHORES["openrouter"])
             try:
-                print(f"[{name}] {fallback_engine} 교차 폴백 시도")
+                print(f"[{name}] {fallback_engine} 교차 ?�백 ?�도")
                 async with fallback_sem:
-                    # [BUG-API-6 수정] retry=1로 전달 → acquire() 스킵
-                    # 1차 실패 시 해당 엔진 버킷은 이미 penalize됐거나 토큰이 소비됨.
-                    # fallback_fn은 다른 엔진이므로 그 엔진의 acquire를 실행해야 하나,
-                    # 폴백은 긴급 경로이므로 버킷 토큰 소비 없이 즉시 시도.
+                    # [BUG-API-6 ?�정] retry=1�??�달 ??acquire() ?�킵
+                    # 1�??�패 ???�당 ?�진 버킷?� ?��? penalize?�거???�큰???�비??
+                    # fallback_fn?� ?�른 ?�진?��?�?�??�진??acquire�??�행?�야 ?�나,
+                    # ?�백?� 긴급 경로?��?�?버킷 ?�큰 ?�비 ?�이 즉시 ?�도.
                     return await fallback_fn(messages, temperature, retry=1)
             except Exception as e2:
-                print(f"[{name}/{fallback_engine}] 교차 폴백 실패: {e2}")
+                print(f"[{name}/{fallback_engine}] 교차 ?�백 ?�패: {e2}")
                 continue
 
-        # ── 3차: 최소 응답 ──
-        fallback_text = f"{name} 의원은 더 많은 논의가 필요하다고 판단합니다."
-        print(f"[{name}] 모든 엔진 실패 → 최소 응답 반환")
+        # ?�?� 3�? 최소 ?�답 ?�?�
+        fallback_text = f"{name} ?�원?� ??많�? ?�의가 ?�요?�다�??�단?�니??"
+        print(f"[{name}] 모든 ?�진 ?�패 ??최소 ?�답 반환")
         return fallback_text
 
 
-# ─────────────────────────────────────────────
-# 사전 리서치: 안건 관련 최신 정보 수집
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ?�전 리서�? ?�건 관??최신 ?�보 ?�집
 #
-# 전략:
-#   1차: Gemini grounding (Google Search 실시간 연동) — 가장 최신 정보
-#   2차: OpenRouter perplexity-style 검색 모델 폴백
-#   3차: 일반 LLM(Groq/Gemini)으로 학습 기반 요약 — 검색 없이도 유용한 배경 지식
-#
-# 반환: 최대 600자 이내의 리서치 요약 텍스트 (실패 시 빈 문자열)
-# ─────────────────────────────────────────────
+# ?�략:
+#   1�? Gemini grounding (Google Search ?�시�??�동) ??가??최신 ?�보
+#   2�? OpenRouter perplexity-style 검??모델 ?�백
+#   3�? ?�반 LLM(Groq/Gemini)?�로 ?�습 기반 ?�약 ??검???�이???�용??배경 지??#
+# 반환: 최�? 600???�내??리서�??�약 ?�스??(?�패 ??�?문자??
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 async def call_research(issue: str, member_name: str, lens: str) -> str:
     """
-    [개선] 3단계 심층 리서치 파이프라인
+    [개선] 3?�계 ?�층 리서�??�이?�라??
+    ?�계 1 ???�실 ?�집 (검???�선):
+        Gemini grounding(Google Search) ?�는 Perplexity sonar�?        ?�건 관??최신 ?�계·?��?·?�책 ?�향???�집.
+        ?�원�?lens??맞는 각도�?질의�??�화.
 
-    단계 1 — 사실 수집 (검색 우선):
-        Gemini grounding(Google Search) 또는 Perplexity sonar로
-        안건 관련 최신 통계·사례·정책 동향을 수집.
-        의원별 lens에 맞는 각도로 질의를 특화.
+    ?�계 2 ???�점 분석 (?�면??:
+        ?�집???�실???��?�??�당 ?�원???�념???�즈?�서
+        ??가??강력??찬성 ?�거 2�?        ??가??강력??반�? ?�거 2�?        ???��?가 꺼낼 가?�성???��? 반박�?�??�점
+        ??구조?�하???�출. (?�습 기반 LLM?�로 처리)
 
-    단계 2 — 논점 분석 (내면화):
-        수집된 사실을 토대로 해당 의원의 이념적 렌즈에서
-        ① 가장 강력한 찬성 논거 2개
-        ② 가장 강력한 반대 논거 2개
-        ③ 상대가 꺼낼 가능성이 높은 반박과 그 약점
-        을 구조화하여 도출. (학습 기반 LLM으로 처리)
-
-    단계 3 — 발언 논거 합성:
-        1+2 결과를 합쳐 토론 발언에 직결되는
-        '핵심 무기 카드' 형태로 최종 합성.
+    ?�계 3 ??발언 ?�거 ?�성:
+        1+2 결과�??�쳐 ?�론 발언??직결?�는
+        '?�심 무기 카드' ?�태�?최종 ?�성.
 
     Returns:
-        구조화된 리서치 텍스트 (최대 1500자). 실패 시 "" 반환.
+        구조?�된 리서�??�스??(최�? 1500??. ?�패 ??"" 반환.
     """
 
-    # ── STEP 1: 사실 수집 (검색 기반) ──────────────────────────────
-    # 의원별 lens에 맞춰 검색 각도를 특화
+    # ?�?� STEP 1: ?�실 ?�집 (검??기반) ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+    # ?�원�?lens??맞춰 검??각도�??�화
     lens_angle = _lens_to_search_angle(lens)
 
     fact_prompt = (
-        f"토론 안건: \"{issue}\"\n\n"
-        f"당신은 {member_name}({lens})입니다.\n"
-        f"이 안건을 '{lens_angle}' 관점에서 조사하세요.\n\n"
-        "수집해야 할 정보 (모두 포함, 출처·연도 필수):\n"
-        "A. 핵심 현황 수치 — 최근 3년 이내 통계, OECD/IMF/정부 공식 자료 우선\n"
-        "B. 국내외 정책 사례 — 실제 도입국 효과(정량 수치 포함)\n"
-        "C. 학술 연구 결과 — 찬성·반대 측 논문 각 1건 이상\n"
-        "D. 논쟁의 핵심 쟁점 — 현재 가장 뜨거운 실질 논점 2~3개\n\n"
-        "형식 요구사항:\n"
-        "- 각 항목을 A/B/C/D로 구분하여 작성\n"
-        "- 수치는 반드시 '기관명(연도): 수치' 형식\n"
-        "- 불확실한 정보는 반드시 [추정] 표시\n"
-        "- 800자 이내"
+        f"?�론 ?�건: \"{issue}\"\n\n"
+        f"?�신?� {member_name}({lens})?�니??\n"
+        f"???�건??'{lens_angle}' 관?�에??조사?�세??\n\n"
+        "?�집?�야 ???�보 (모두 ?�함, 출처·?�도 ?�수):\n"
+        "A. ?�심 ?�황 ?�치 ??최근 3???�내 ?�계, OECD/IMF/?��? 공식 ?�료 ?�선\n"
+        "B. �?��???�책 ?��? ???�제 ?�입�??�과(?�량 ?�치 ?�함)\n"
+        "C. ?�술 ?�구 결과 ??찬성·반�? �??�문 �?1�??�상\n"
+        "D. ?�쟁???�심 ?�점 ???�재 가???�거???�질 ?�점 2~3�?n\n"
+        "?�식 ?�구?�항:\n"
+        "- �???��??A/B/C/D�?구분?�여 ?�성\n"
+        "- ?�치??반드??'기�?�??�도): ?�치' ?�식\n"
+        "- 불확?�한 ?�보??반드??[추정] ?�시\n"
+        "- 800???�내"
     )
 
     raw_facts = ""
 
-    # 1-a: Gemini grounding (Google Search 실시간 연동)
+    # 1-a: Gemini grounding (Google Search ?�시�??�동)
     if GEMINI_API_KEY:
         try:
             sem = _ENGINE_SEMAPHORES["gemini"]
             async with sem:
                 await _BUCKETS["gemini"].acquire()
                 system_text = (
-                    f"당신은 {member_name}({lens})입니다. "
-                    f"Google 검색으로 찾은 최신 정보를 '{lens_angle}' 관점에서 정리하세요. "
-                    "반드시 출처와 연도를 명시하세요."
+                    f"?�신?� {member_name}({lens})?�니?? "
+                    f"Google 검?�으�?찾�? 최신 ?�보�?'{lens_angle}' 관?�에???�리?�세?? "
+                    "반드??출처?� ?�도�?명시?�세??"
                 )
                 contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
                 url = (
@@ -463,13 +448,13 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
                     r = await client.post(url, json=payload)
                     if r.status_code == 200:
                         parts = r.json()["candidates"][0]["content"]["parts"]
-                        # [BUG-B 수정] parts[0]이 항상 text가 아님 (grounding metadata 혼재 가능)
+                        # [BUG-B ?�정] parts[0]????�� text가 ?�님 (grounding metadata ?�재 가??
                         raw_facts = next((p["text"] for p in parts if "text" in p), "")
-                        print(f"[Research/{member_name}] Step1 Gemini grounding 성공 ({len(raw_facts)}자)")
+                        print(f"[Research/{member_name}] Step1 Gemini grounding ?�공 ({len(raw_facts)}??")
         except Exception as e:
-            print(f"[Research/{member_name}] Step1 Gemini grounding 실패: {e}")
+            print(f"[Research/{member_name}] Step1 Gemini grounding ?�패: {e}")
 
-    # 1-b: Perplexity sonar 폴백
+    # 1-b: Perplexity sonar ?�백
     if not raw_facts and OPENROUTER_API_KEY:
         try:
             sem = _ENGINE_SEMAPHORES["openrouter"]
@@ -479,9 +464,9 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
                     {
                         "role": "system",
                         "content": (
-                            f"당신은 {member_name}({lens})입니다. "
-                            f"웹 검색으로 최신 정보를 '{lens_angle}' 관점에서 수집하세요. "
-                            "반드시 출처와 연도를 명시하세요."
+                            f"?�신?� {member_name}({lens})?�니?? "
+                            f"??검?�으�?최신 ?�보�?'{lens_angle}' 관?�에???�집?�세?? "
+                            "반드??출처?� ?�도�?명시?�세??"
                         ),
                     },
                     {"role": "user", "content": fact_prompt},
@@ -505,20 +490,20 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
                     )
                     if r.status_code == 200:
                         raw_facts = r.json()["choices"][0]["message"]["content"]
-                        print(f"[Research/{member_name}] Step1 Perplexity sonar 성공 ({len(raw_facts)}자)")
+                        print(f"[Research/{member_name}] Step1 Perplexity sonar ?�공 ({len(raw_facts)}??")
         except Exception as e:
-            print(f"[Research/{member_name}] Step1 Perplexity 실패: {e}")
+            print(f"[Research/{member_name}] Step1 Perplexity ?�패: {e}")
 
-    # 1-c: 학습 기반 폴백 (검색 없음)
+    # 1-c: ?�습 기반 ?�백 (검???�음)
     if not raw_facts:
         try:
             fallback_msgs = [
                 {
                     "role": "system",
                     "content": (
-                        f"당신은 {member_name}({lens})입니다. "
-                        f"당신이 학습한 지식에서 이 안건을 '{lens_angle}' 관점으로 조사하세요. "
-                        "불확실한 내용은 반드시 [추정]으로 명시하세요."
+                        f"?�신?� {member_name}({lens})?�니?? "
+                        f"?�신???�습??지?�에?????�건??'{lens_angle}' 관?�으�?조사?�세?? "
+                        "불확?�한 ?�용?� 반드??[추정]?�로 명시?�세??"
                     ),
                 },
                 {"role": "user", "content": fact_prompt},
@@ -529,38 +514,38 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
             ):
                 try:
                     raw_facts = await caller_fn(fallback_msgs)
-                    print(f"[Research/{member_name}] Step1 {ename} 학습기반 성공 ({len(raw_facts)}자)")
+                    print(f"[Research/{member_name}] Step1 {ename} ?�습기반 ?�공 ({len(raw_facts)}??")
                     break
                 except Exception as fe:
-                    print(f"[Research/{member_name}] Step1 {ename} 실패: {fe}")
+                    print(f"[Research/{member_name}] Step1 {ename} ?�패: {fe}")
         except Exception as e:
-            print(f"[Research/{member_name}] Step1 전체 실패: {e}")
+            print(f"[Research/{member_name}] Step1 ?�체 ?�패: {e}")
 
     if not raw_facts:
-        print(f"[Research/{member_name}] Step1 완전 실패 — 리서치 없이 진행")
+        print(f"[Research/{member_name}] Step1 ?�전 ?�패 ??리서�??�이 진행")
         return ""
 
-    # ── STEP 2: 논점 분석 — 수집된 사실을 의원의 렌즈로 내면화 ──────
+    # ?�?� STEP 2: ?�점 분석 ???�집???�실???�원???�즈�??�면???�?�?�?�?�?�
     analysis_prompt = (
-        f"토론 안건: \"{issue}\"\n\n"
-        f"당신은 {member_name}({lens})입니다.\n"
-        f"아래 수집된 사실 자료를 '{lens_angle}' 관점에서 분석하여,\n"
-        "토론에서 사용할 논거를 구조화하세요.\n\n"
-        f"[수집된 사실 자료]\n{raw_facts[:800]}\n\n"
-        "분석 결과를 다음 형식으로 작성하세요:\n\n"
-        "【찬성 논거 TOP2】\n"
-        "① (가장 강력한 찬성 논거 — 구체적 수치와 메커니즘 포함)\n"
-        "② (두 번째 찬성 논거)\n\n"
-        "【반대 논거 TOP2】\n"
-        "① (가장 강력한 반대 논거 — 구체적 수치와 메커니즘 포함)\n"
-        "② (두 번째 반대 논거)\n\n"
-        "【예상 반박과 약점】\n"
-        "상대방이 당신에게 꺼낼 가능성이 높은 반박 2개와, 그 반박의 논리적 허점:\n"
-        "▷ 반박1: / 허점: \n"
-        "▷ 반박2: / 허점: \n\n"
-        "【핵심 승부 데이터】\n"
-        "토론에서 결정적 역할을 할 수 있는 수치·사례 1개 (출처 포함):\n\n"
-        "700자 이내로 간결하게."
+        f"?�론 ?�건: \"{issue}\"\n\n"
+        f"?�신?� {member_name}({lens})?�니??\n"
+        f"?�래 ?�집???�실 ?�료�?'{lens_angle}' 관?�에??분석?�여,\n"
+        "?�론?�서 ?�용???�거�?구조?�하?�요.\n\n"
+        f"[?�집???�실 ?�료]\n{raw_facts[:800]}\n\n"
+        "분석 결과�??�음 ?�식?�로 ?�성?�세??\n\n"
+        "?�찬???�거 TOP2??n"
+        "??(가??강력??찬성 ?�거 ??구체???�치?� 메커?�즘 ?�함)\n"
+        "??(??번째 찬성 ?�거)\n\n"
+        "?�반?� ?�거 TOP2??n"
+        "??(가??강력??반�? ?�거 ??구체???�치?� 메커?�즘 ?�함)\n"
+        "??(??번째 반�? ?�거)\n\n"
+        "?�예??반박�??�점??n"
+        "?��?방이 ?�신?�게 꺼낼 가?�성???��? 반박 2개�?, �?반박???�리???�점:\n"
+        "??반박1: / ?�점: \n"
+        "??반박2: / ?�점: \n\n"
+        "?�핵???��? ?�이?��?n"
+        "?�론?�서 결정????��???????�는 ?�치·?��? 1�?(출처 ?�함):\n\n"
+        "700???�내�?간결?�게."
     )
 
     analysis = ""
@@ -568,9 +553,9 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
         {
             "role": "system",
             "content": (
-                f"당신은 전문 토론 전략가이자 {member_name}({lens})입니다. "
-                "수집된 자료를 바탕으로 토론 논거를 구조화하세요. "
-                "추상적 서술 금지 — 반드시 구체적 수치와 인과관계를 포함하세요."
+                f"?�신?� ?�문 ?�론 ?�략가?�자 {member_name}({lens})?�니?? "
+                "?�집???�료�?바탕?�로 ?�론 ?�거�?구조?�하?�요. "
+                "추상???�술 금�? ??반드??구체???�치?� ?�과관계�? ?�함?�세??"
             ),
         },
         {"role": "user", "content": analysis_prompt},
@@ -583,48 +568,48 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
     ):
         try:
             analysis = await caller_fn(analysis_msgs)
-            print(f"[Research/{member_name}] Step2 논점분석 {ename} 성공 ({len(analysis)}자)")
+            print(f"[Research/{member_name}] Step2 ?�점분석 {ename} ?�공 ({len(analysis)}??")
             break
         except Exception as e:
-            print(f"[Research/{member_name}] Step2 {ename} 실패: {e}")
+            print(f"[Research/{member_name}] Step2 {ename} ?�패: {e}")
 
-    # ── STEP 3: 최종 합성 — 발언 직결 '무기 카드' 생성 ─────────────
+    # ?�?� STEP 3: 최종 ?�성 ??발언 직결 '무기 카드' ?�성 ?�?�?�?�?�?�?�?�?�?�?�?�?�
     if not analysis:
-        # Step2 실패 시 Step1 결과만이라도 반환
+        # Step2 ?�패 ??Step1 결과만이?�도 반환
         return raw_facts[:1200]
 
     final_text = (
-        f"=== {member_name} 사전 리서치 완료 ===\n\n"
-        f"[수집된 핵심 사실]\n{raw_facts[:500]}\n\n"
-        f"[논점 분석 및 전략]\n{analysis[:700]}"
+        f"=== {member_name} ?�전 리서�??�료 ===\n\n"
+        f"[?�집???�심 ?�실]\n{raw_facts[:500]}\n\n"
+        f"[?�점 분석 �??�략]\n{analysis[:700]}"
     )
 
-    print(f"[Research/{member_name}] 3단계 리서치 완료 — 총 {len(final_text)}자")
+    print(f"[Research/{member_name}] 3?�계 리서�??�료 ??�?{len(final_text)}??)
     return final_text[:1800]
 
 
 def _lens_to_search_angle(lens: str) -> str:
     """
-    의원의 학습 기반 렌즈를 검색 특화 각도로 변환.
-    각 AI의 강점 영역에 맞는 질의 방향을 반환.
+    ?�원???�습 기반 ?�즈�?검???�화 각도�?변??
+    �?AI??강점 ?�역??맞는 질의 방향??반환.
     """
     lens_lower = lens.lower()
-    if "google" in lens_lower or "웹" in lens_lower or "다국어" in lens_lower:
-        return "국제 비교 통계·다국어 문헌·Google Scholar 학술 데이터"
-    elif "meta" in lens_lower or "오픈소스" in lens_lower or "분권" in lens_lower:
-        return "오픈소스 생태계·시민사회 연구·분권화 사례·접근성 데이터"
-    elif "mistral" in lens_lower or "유럽" in lens_lower or "법치" in lens_lower:
-        return "EU 규정·유럽 법제도·GDPR·유럽 의회 자료·법적 판례"
+    if "google" in lens_lower or "?? in lens_lower or "?�국?? in lens_lower:
+        return "�?�� 비교 ?�계·?�국??문헌·Google Scholar ?�술 ?�이??
+    elif "meta" in lens_lower or "?�픈?�스" in lens_lower or "분권" in lens_lower:
+        return "?�픈?�스 ?�태계·시민사???�구·분권???��?·?�근???�이??
+    elif "mistral" in lens_lower or "?�럽" in lens_lower or "법치" in lens_lower:
+        return "EU 규정·?�럽 법제?�·GDPR·?�럽 ?�회 ?�료·법적 ?��?"
     elif "openai" in lens_lower or "rlhf" in lens_lower or "공정" in lens_lower:
-        return "사회적 영향 연구·공정성 지표·인간 피드백 기반 정책 평가"
-    elif "nvidia" in lens_lower or "하드웨어" in lens_lower or "과학" in lens_lower:
-        return "기술적 타당성·컴퓨팅 자원·과학 논문·엔지니어링 벤치마크"
+        return "?�회???�향 ?�구·공정??지?�·인�??�드�?기반 ?�책 ?��?"
+    elif "nvidia" in lens_lower or "?�드?�어" in lens_lower or "과학" in lens_lower:
+        return "기술???�?�성·컴퓨???�원·과학 ?�문·?��??�어�?벤치마크"
     else:
-        return "다각도 학술 연구·정책 효과 실증 데이터·국제 기관 보고서"
+        return "?�각???�술 ?�구·?�책 ?�과 ?�증 ?�이?�·국??기�? 보고??
 
-# ─────────────────────────────────────────────
-# 토론 중 즉석 리서치 (중간 학습)
-# ─────────────────────────────────────────────
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
+# ?�론 �?즉석 리서�?(중간 ?�습)
+# ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
 async def call_research_targeted(
     issue: str,
     member_name: str,
@@ -633,23 +618,23 @@ async def call_research_targeted(
     unknown_terms: list,
 ) -> str:
     """
-    토론 도중 특정 용어·주장을 이해하지 못했을 때 즉석으로 실행하는
-    경량 2단계 리서치 (사전 리서치의 축약판).
-    Returns: 구조화된 즉석 리서치 텍스트 (최대 900자). 실패 시 "" 반환.
+    ?�론 ?�중 ?�정 ?�어·주장???�해?��? 못했????즉석?�로 ?�행?�는
+    경량 2?�계 리서�?(?�전 리서치의 축약??.
+    Returns: 구조?�된 즉석 리서�??�스??(최�? 900??. ?�패 ??"" 반환.
     """
     terms_str  = ", ".join(f'"{t}"' for t in (unknown_terms or [])[:5])
     lens_angle = _lens_to_search_angle(lens)
 
     fact_prompt = (
-        f"토론 안건: \"{issue}\"\n"
+        f"?�론 ?�건: \"{issue}\"\n"
         f"직전 발언: \"{trigger_speech[:400]}\"\n\n"
-        f"위 발언에서 다음 용어·주장이 등장했습니다: {terms_str}\n\n"
-        f"당신은 {member_name}({lens})입니다. '{lens_angle}' 관점에서 조사하세요.\n\n"
-        "수집 목표 (400자 이내, 출처·연도 필수):\n"
-        f"A. {terms_str} 의 정확한 정의와 맥락\n"
-        "B. 이 주장을 뒷받침하거나 반박하는 실증 수치\n"
-        "C. 이 주장의 논리적 강점과 약점 각 1개\n"
-        "불확실한 정보는 반드시 [추정] 표시."
+        f"??발언?�서 ?�음 ?�어·주장???�장?�습?�다: {terms_str}\n\n"
+        f"?�신?� {member_name}({lens})?�니?? '{lens_angle}' 관?�에??조사?�세??\n\n"
+        "?�집 목표 (400???�내, 출처·?�도 ?�수):\n"
+        f"A. {terms_str} ???�확???�의?� 맥락\n"
+        "B. ??주장???�받침하거나 반박?�는 ?�증 ?�치\n"
+        "C. ??주장???�리??강점�??�점 �?1�?n"
+        "불확?�한 ?�보??반드??[추정] ?�시."
     )
 
     raw_facts = ""
@@ -667,9 +652,9 @@ async def call_research_targeted(
                 payload = {
                     "contents": contents,
                     "system_instruction": {"parts": [{"text": (
-                        f"당신은 {member_name}({lens})입니다. "
-                        "Google 검색으로 직전 발언의 핵심 용어를 빠르게 조사하세요. "
-                        "출처와 연도를 반드시 명시하세요."
+                        f"?�신?� {member_name}({lens})?�니?? "
+                        "Google 검?�으�?직전 발언???�심 ?�어�?빠르�?조사?�세?? "
+                        "출처?� ?�도�?반드??명시?�세??"
                     )}]},
                     "tools": [{"google_search": {}}],
                     "generationConfig": {"temperature": 0.15, "maxOutputTokens": 500},
@@ -678,19 +663,19 @@ async def call_research_targeted(
                     r = await client.post(url, json=payload)
                     if r.status_code == 200:
                         parts = r.json()["candidates"][0]["content"]["parts"]
-                        # [BUG-B 수정] parts[0]이 항상 text가 아님 (grounding metadata 혼재 가능)
+                        # [BUG-B ?�정] parts[0]????�� text가 ?�님 (grounding metadata ?�재 가??
                         raw_facts = next((p["text"] for p in parts if "text" in p), "")
-                        print(f"[MidResearch/{member_name}] Step1 Gemini 성공 ({len(raw_facts)}자)")
+                        print(f"[MidResearch/{member_name}] Step1 Gemini ?�공 ({len(raw_facts)}??")
         except Exception as e:
-            print(f"[MidResearch/{member_name}] Step1 Gemini 실패: {e}")
+            print(f"[MidResearch/{member_name}] Step1 Gemini ?�패: {e}")
 
-    # 1-b: Perplexity sonar 폴백
+    # 1-b: Perplexity sonar ?�백
     if not raw_facts and OPENROUTER_API_KEY:
         try:
             async with _ENGINE_SEMAPHORES["openrouter"]:
                 await _BUCKETS["openrouter"].acquire()
                 msgs = [
-                    {"role": "system", "content": f"당신은 {member_name}({lens})입니다. 웹 검색으로 핵심 용어를 조사하세요."},
+                    {"role": "system", "content": f"?�신?� {member_name}({lens})?�니?? ??검?�으�??�심 ?�어�?조사?�세??"},
                     {"role": "user", "content": fact_prompt},
                 ]
                 headers = {
@@ -707,15 +692,15 @@ async def call_research_targeted(
                     )
                     if r.status_code == 200:
                         raw_facts = r.json()["choices"][0]["message"]["content"]
-                        print(f"[MidResearch/{member_name}] Step1 Perplexity 성공 ({len(raw_facts)}자)")
+                        print(f"[MidResearch/{member_name}] Step1 Perplexity ?�공 ({len(raw_facts)}??")
         except Exception as e:
-            print(f"[MidResearch/{member_name}] Step1 Perplexity 실패: {e}")
+            print(f"[MidResearch/{member_name}] Step1 Perplexity ?�패: {e}")
 
-    # 1-c: 학습 기반 폴백
+    # 1-c: ?�습 기반 ?�백
     if not raw_facts:
         try:
             fallback_msgs = [
-                {"role": "system", "content": f"당신은 {member_name}({lens})입니다. 학습된 지식에서 아래 발언의 핵심 용어를 조사하세요. 불확실하면 [추정]으로 명시."},
+                {"role": "system", "content": f"?�신?� {member_name}({lens})?�니?? ?�습??지?�에???�래 발언???�심 ?�어�?조사?�세?? 불확?�하�?[추정]?�로 명시."},
                 {"role": "user", "content": fact_prompt},
             ]
             for caller_fn, ename in (
@@ -724,30 +709,29 @@ async def call_research_targeted(
             ):
                 try:
                     raw_facts = await caller_fn(fallback_msgs)
-                    print(f"[MidResearch/{member_name}] Step1 {ename} 학습기반 성공")
+                    print(f"[MidResearch/{member_name}] Step1 {ename} ?�습기반 ?�공")
                     break
                 except Exception as fe:
-                    print(f"[MidResearch/{member_name}] Step1 {ename} 실패: {fe}")
+                    print(f"[MidResearch/{member_name}] Step1 {ename} ?�패: {fe}")
         except Exception as e:
-            print(f"[MidResearch/{member_name}] Step1 학습기반 전체 실패: {e}")
+            print(f"[MidResearch/{member_name}] Step1 ?�습기반 ?�체 ?�패: {e}")
 
     if not raw_facts:
         return ""
 
-    # STEP 2: 즉석 내면화
-    deliberation_prompt = (
-        f"토론 안건: \"{issue}\"\n"
-        f"상대 발언: \"{trigger_speech[:300]}\"\n"
-        f"방금 조사한 내용:\n{raw_facts[:500]}\n\n"
-        f"당신은 {member_name}({lens})입니다. 위 정보를 내면화하여:\n"
-        "1. 【이제 이해한 것】 상대 주장의 실제 의미와 근거 (1~2문장)\n"
-        "2. 【나의 대응 전략】 이 정보로 반박하거나 활용할 방법 (1~2문장, 구체적 수치 포함)\n"
-        "3. 【즉시 쓸 논거】 다음 발언에서 꺼낼 핵심 카드 1개\n"
-        "300자 이내로 간결하게."
+    # STEP 2: 즉석 ?�면??    deliberation_prompt = (
+        f"?�론 ?�건: \"{issue}\"\n"
+        f"?��? 발언: \"{trigger_speech[:300]}\"\n"
+        f"방금 조사???�용:\n{raw_facts[:500]}\n\n"
+        f"?�신?� {member_name}({lens})?�니?? ???�보�??�면?�하??\n"
+        "1. ?�이???�해??것�??��? 주장???�제 ?��??� 근거 (1~2문장)\n"
+        "2. ?�나???�???�략?????�보�?반박?�거???�용??방법 (1~2문장, 구체???�치 ?�함)\n"
+        "3. ?�즉?????�거???�음 발언?�서 꺼낼 ?�심 카드 1�?n"
+        "300???�내�?간결?�게."
     )
     deliberation = ""
     delib_msgs = [
-        {"role": "system", "content": f"당신은 {member_name} 의원입니다. 조사한 정보를 즉시 토론 전략으로 소화하세요. 구체적 수치와 인과관계 중심."},
+        {"role": "system", "content": f"?�신?� {member_name} ?�원?�니?? 조사???�보�?즉시 ?�론 ?�략?�로 ?�화?�세?? 구체???�치?� ?�과관�?중심."},
         {"role": "user", "content": deliberation_prompt},
     ]
     for caller_fn, ename in (
@@ -757,18 +741,18 @@ async def call_research_targeted(
     ):
         try:
             deliberation = await caller_fn(delib_msgs)
-            print(f"[MidResearch/{member_name}] Step2 내면화 {ename} 성공")
+            print(f"[MidResearch/{member_name}] Step2 ?�면??{ename} ?�공")
             break
         except Exception as e:
-            print(f"[MidResearch/{member_name}] Step2 {ename} 실패: {e}")
+            print(f"[MidResearch/{member_name}] Step2 {ename} ?�패: {e}")
 
     if not deliberation:
         return raw_facts[:600]
 
     result = (
-        f"=== {member_name} 중간 즉석 학습 ({', '.join((unknown_terms or [])[:3])}) ===\n\n"
-        f"[조사된 사실]\n{raw_facts[:400]}\n\n"
-        f"[내면화 및 대응 전략]\n{deliberation[:350]}"
+        f"=== {member_name} 중간 즉석 ?�습 ({', '.join((unknown_terms or [])[:3])}) ===\n\n"
+        f"[조사???�실]\n{raw_facts[:400]}\n\n"
+        f"[?�면??�??�???�략]\n{deliberation[:350]}"
     )
-    print(f"[MidResearch/{member_name}] 완료 — 총 {len(result)}자")
+    print(f"[MidResearch/{member_name}] ?�료 ??�?{len(result)}??)
     return result[:900]
