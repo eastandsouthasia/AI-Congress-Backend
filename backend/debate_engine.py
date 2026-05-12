@@ -318,6 +318,10 @@ class DebateEngine:
         print(f"[Engine] 사전 리서치 시작 — {len(self.members)}명 병렬 수집")
 
         # ── Phase A: 병렬 심층 리서치 ──────────────────────────────
+        # 1차: 전원 병렬 실행 (150초 제한)
+        # 2차: 1차에서 실패한 의원만 재시도 (150초 추가)
+        # → 모든 의원이 반드시 리서치 결과를 가져야 토론 시작
+
         async def _research_one(member: dict):
             mid  = member["id"]
             name = member["name"]
@@ -328,12 +332,35 @@ class DebateEngine:
                     self.research_cache[mid] = result
                     print(f"[Research] {name}: {len(result)}자 수집 완료")
                 else:
-                    print(f"[Research] {name}: 결과 없음 — 학습 기반으로 진행")
+                    print(f"[Research] {name}: 결과 없음")
             except Exception as e:
-                print(f"[Research] {name}: 오류 발생 ({e}) — 학습 기반으로 진행")
+                print(f"[Research] {name}: 오류 발생 ({e})")
 
-        for m in self.members:
-            await _research_one(m)
+        # 1차 시도 — 전원 병렬, 150초 제한
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*[_research_one(m) for m in self.members]),
+                timeout=150.0,
+            )
+        except asyncio.TimeoutError:
+            print("[Engine] Phase A 1차 150초 타임아웃")
+
+        # 실패한 의원 확인
+        failed = [m for m in self.members if not self.research_cache.get(m["id"])]
+
+        if failed:
+            f_names = ", ".join(m["name"] for m in failed)
+            print(f"[Engine] Phase A 재시도 대상: {f_names}")
+            await self.send("status", message=f"🔄 {f_names} 의원 사전조사 재시도 중...")
+
+            # 2차 시도 — 실패한 의원만 병렬, 150초 추가
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*[_research_one(m) for m in failed]),
+                    timeout=150.0,
+                )
+            except asyncio.TimeoutError:
+                print("[Engine] Phase A 2차 150초 타임아웃")
 
         collected = sum(1 for v in self.research_cache.values() if v)
         await self.send(

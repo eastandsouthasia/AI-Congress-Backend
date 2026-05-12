@@ -38,8 +38,8 @@ print("GROQ:", bool(GROQ_API_KEY))
 # ─────────────────────────────────────────────
 _ENGINE_SEMAPHORES = {
     "groq":       asyncio.Semaphore(2),  # llama4 + nemotron 동시 처리
-    "gemini":     asyncio.Semaphore(1),
-    "openrouter": asyncio.Semaphore(1),  # 2→1: openrouter도 순차처리로 안정화
+    "gemini":     asyncio.Semaphore(2),  # 1→2: 5명 병렬 리서치 시 2명 동시 처리 허용
+    "openrouter": asyncio.Semaphore(2),  # 1→2: Perplexity 폴백도 동시 처리 허용
 }
 
 # ─────────────────────────────────────────────
@@ -413,7 +413,25 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
 
     Returns:
         구조화된 리서치 텍스트 (최대 1500자). 실패 시 "" 반환.
+
+    [병렬 실행 최적화]
+    - 전체 타임아웃 30초: 5명 동시 병렬 호출 시 한 명이 막혀도 나머지를 차단하지 않음
+    - Gemini semaphore 경쟁 감지: 이미 누군가 Gemini를 점유 중이면 즉시 폴백으로 스킵
+    - Step1 우선순위: Gemini(검색) → Perplexity → 학습기반(Groq/Gemini) 순서 유지,
+      단 검색 엔진 대기시간이 길면 학습기반으로 빠르게 전환
     """
+    try:
+        return await asyncio.wait_for(
+            _call_research_inner(issue, member_name, lens),
+            timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        print(f"[Research/{member_name}] ⏰ 30초 타임아웃 — 빈 결과 반환")
+        return ""
+
+
+async def _call_research_inner(issue: str, member_name: str, lens: str) -> str:
+    """call_research 실제 구현 (타임아웃 래퍼 분리)"""
 
     # ── STEP 1: 사실 수집 (검색 기반) ──────────────────────────────
     # 의원별 lens에 맞춰 검색 각도를 특화
@@ -438,76 +456,84 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
     raw_facts = ""
 
     # 1-a: Gemini grounding (Google Search 실시간 연동)
+    # [병렬 최적화] semaphore를 non-blocking으로 확인 — 이미 점유 중이면 즉시 Perplexity로 스킵
     if GEMINI_API_KEY:
-        try:
-            sem = _ENGINE_SEMAPHORES["gemini"]
-            async with sem:
-                await _BUCKETS["gemini"].acquire()
-                system_text = (
-                    f"당신은 {member_name}({lens})입니다. "
-                    f"Google 검색으로 찾은 최신 정보를 '{lens_angle}' 관점에서 정리하세요. "
-                    "반드시 출처와 연도를 명시하세요."
-                )
-                contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
-                url = (
-                    f"https://generativelanguage.googleapis.com/v1beta"
-                    f"/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
-                )
-                payload = {
-                    "contents": contents,
-                    "system_instruction": {"parts": [{"text": system_text}]},
-                    "tools": [{"google_search": {}}],
-                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
-                }
-                async with httpx.AsyncClient(timeout=30) as client:
-                    r = await client.post(url, json=payload)
-                    if r.status_code == 200:
-                        parts = r.json()["candidates"][0]["content"]["parts"]
-                        # [BUG-B 수정] parts[0]이 항상 text가 아님 (grounding metadata 혼재 가능)
-                        raw_facts = next((p["text"] for p in parts if "text" in p), "")
-                        print(f"[Research/{member_name}] Step1 Gemini grounding 성공 ({len(raw_facts)}자)")
-        except Exception as e:
-            print(f"[Research/{member_name}] Step1 Gemini grounding 실패: {e}")
+        sem = _ENGINE_SEMAPHORES["gemini"]
+        if sem._value > 0:  # 사용 가능한 슬롯이 있을 때만 시도
+            try:
+                async with sem:
+                    await _BUCKETS["gemini"].acquire()
+                    system_text = (
+                        f"당신은 {member_name}({lens})입니다. "
+                        f"Google 검색으로 찾은 최신 정보를 '{lens_angle}' 관점에서 정리하세요. "
+                        "반드시 출처와 연도를 명시하세요."
+                    )
+                    contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
+                    url = (
+                        f"https://generativelanguage.googleapis.com/v1beta"
+                        f"/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
+                    )
+                    payload = {
+                        "contents": contents,
+                        "system_instruction": {"parts": [{"text": system_text}]},
+                        "tools": [{"google_search": {}}],
+                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
+                    }
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        r = await client.post(url, json=payload)
+                        if r.status_code == 200:
+                            parts = r.json()["candidates"][0]["content"]["parts"]
+                            # [BUG-B 수정] parts[0]이 항상 text가 아님 (grounding metadata 혼재 가능)
+                            raw_facts = next((p["text"] for p in parts if "text" in p), "")
+                            print(f"[Research/{member_name}] Step1 Gemini grounding 성공 ({len(raw_facts)}자)")
+            except Exception as e:
+                print(f"[Research/{member_name}] Step1 Gemini grounding 실패: {e}")
+        else:
+            print(f"[Research/{member_name}] Step1 Gemini 사용 중 — Perplexity로 즉시 전환")
 
     # 1-b: Perplexity sonar 폴백
+    # [병렬 최적화] semaphore non-blocking 확인 + 타임아웃 단축 (35→20초)
     if not raw_facts and OPENROUTER_API_KEY:
-        try:
-            sem = _ENGINE_SEMAPHORES["openrouter"]
-            async with sem:
-                await _BUCKETS["openrouter"].acquire()
-                messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            f"당신은 {member_name}({lens})입니다. "
-                            f"웹 검색으로 최신 정보를 '{lens_angle}' 관점에서 수집하세요. "
-                            "반드시 출처와 연도를 명시하세요."
-                        ),
-                    },
-                    {"role": "user", "content": fact_prompt},
-                ]
-                headers = {
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://ai-congress.app",
-                    "X-Title": "AI Congress Research",
-                }
-                payload = {
-                    "model": "perplexity/sonar",
-                    "messages": messages,
-                    "temperature": 0.2,
-                    "max_tokens": 900,
-                }
-                async with httpx.AsyncClient(timeout=35) as client:
-                    r = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        json=payload, headers=headers,
-                    )
-                    if r.status_code == 200:
-                        raw_facts = r.json()["choices"][0]["message"]["content"]
-                        print(f"[Research/{member_name}] Step1 Perplexity sonar 성공 ({len(raw_facts)}자)")
-        except Exception as e:
-            print(f"[Research/{member_name}] Step1 Perplexity 실패: {e}")
+        sem = _ENGINE_SEMAPHORES["openrouter"]
+        if sem._value > 0:
+            try:
+                async with sem:
+                    await _BUCKETS["openrouter"].acquire()
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                f"당신은 {member_name}({lens})입니다. "
+                                f"웹 검색으로 최신 정보를 '{lens_angle}' 관점에서 수집하세요. "
+                                "반드시 출처와 연도를 명시하세요."
+                            ),
+                        },
+                        {"role": "user", "content": fact_prompt},
+                    ]
+                    headers = {
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://ai-congress.app",
+                        "X-Title": "AI Congress Research",
+                    }
+                    payload = {
+                        "model": "perplexity/sonar",
+                        "messages": messages,
+                        "temperature": 0.2,
+                        "max_tokens": 900,
+                    }
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        r = await client.post(
+                            "https://openrouter.ai/api/v1/chat/completions",
+                            json=payload, headers=headers,
+                        )
+                        if r.status_code == 200:
+                            raw_facts = r.json()["choices"][0]["message"]["content"]
+                            print(f"[Research/{member_name}] Step1 Perplexity sonar 성공 ({len(raw_facts)}자)")
+            except Exception as e:
+                print(f"[Research/{member_name}] Step1 Perplexity 실패: {e}")
+        else:
+            print(f"[Research/{member_name}] Step1 OpenRouter 사용 중 — 학습기반으로 즉시 전환")
 
     # 1-c: 학습 기반 폴백 (검색 없음)
     if not raw_facts:
@@ -637,6 +663,23 @@ async def call_research_targeted(
     경량 2단계 리서치 (사전 리서치의 축약판).
     Returns: 구조화된 즉석 리서치 텍스트 (최대 900자). 실패 시 "" 반환.
     """
+    try:
+        return await asyncio.wait_for(
+            _call_research_targeted_inner(issue, member_name, lens, trigger_speech, unknown_terms),
+            timeout=20.0,
+        )
+    except asyncio.TimeoutError:
+        print(f"[MidResearch/{member_name}] ⏰ 20초 타임아웃 — 빈 결과 반환")
+        return ""
+
+
+async def _call_research_targeted_inner(
+    issue: str,
+    member_name: str,
+    lens: str,
+    trigger_speech: str,
+    unknown_terms: list,
+) -> str:
     terms_str  = ", ".join(f'"{t}"' for t in (unknown_terms or [])[:5])
     lens_angle = _lens_to_search_angle(lens)
 
@@ -655,34 +698,39 @@ async def call_research_targeted(
     raw_facts = ""
 
     # 1-a: Gemini grounding
+    # [병렬 최적화] semaphore non-blocking 확인
     if GEMINI_API_KEY:
-        try:
-            async with _ENGINE_SEMAPHORES["gemini"]:
-                await _BUCKETS["gemini"].acquire()
-                contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
-                url = (
-                    f"https://generativelanguage.googleapis.com/v1beta"
-                    f"/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
-                )
-                payload = {
-                    "contents": contents,
-                    "system_instruction": {"parts": [{"text": (
-                        f"당신은 {member_name}({lens})입니다. "
-                        "Google 검색으로 직전 발언의 핵심 용어를 빠르게 조사하세요. "
-                        "출처와 연도를 반드시 명시하세요."
-                    )}]},
-                    "tools": [{"google_search": {}}],
-                    "generationConfig": {"temperature": 0.15, "maxOutputTokens": 500},
-                }
-                async with httpx.AsyncClient(timeout=25) as client:
-                    r = await client.post(url, json=payload)
-                    if r.status_code == 200:
-                        parts = r.json()["candidates"][0]["content"]["parts"]
-                        # [BUG-B 수정] parts[0]이 항상 text가 아님 (grounding metadata 혼재 가능)
-                        raw_facts = next((p["text"] for p in parts if "text" in p), "")
-                        print(f"[MidResearch/{member_name}] Step1 Gemini 성공 ({len(raw_facts)}자)")
-        except Exception as e:
-            print(f"[MidResearch/{member_name}] Step1 Gemini 실패: {e}")
+        sem = _ENGINE_SEMAPHORES["gemini"]
+        if sem._value > 0:
+            try:
+                async with sem:
+                    await _BUCKETS["gemini"].acquire()
+                    contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
+                    url = (
+                        f"https://generativelanguage.googleapis.com/v1beta"
+                        f"/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
+                    )
+                    payload = {
+                        "contents": contents,
+                        "system_instruction": {"parts": [{"text": (
+                            f"당신은 {member_name}({lens})입니다. "
+                            "Google 검색으로 직전 발언의 핵심 용어를 빠르게 조사하세요. "
+                            "출처와 연도를 반드시 명시하세요."
+                        )}]},
+                        "tools": [{"google_search": {}}],
+                        "generationConfig": {"temperature": 0.15, "maxOutputTokens": 500},
+                    }
+                    async with httpx.AsyncClient(timeout=15) as client:
+                        r = await client.post(url, json=payload)
+                        if r.status_code == 200:
+                            parts = r.json()["candidates"][0]["content"]["parts"]
+                            # [BUG-B 수정] parts[0]이 항상 text가 아님 (grounding metadata 혼재 가능)
+                            raw_facts = next((p["text"] for p in parts if "text" in p), "")
+                            print(f"[MidResearch/{member_name}] Step1 Gemini 성공 ({len(raw_facts)}자)")
+            except Exception as e:
+                print(f"[MidResearch/{member_name}] Step1 Gemini 실패: {e}")
+        else:
+            print(f"[MidResearch/{member_name}] Step1 Gemini 사용 중 — Perplexity로 즉시 전환")
 
     # 1-b: Perplexity sonar 폴백
     if not raw_facts and OPENROUTER_API_KEY:
