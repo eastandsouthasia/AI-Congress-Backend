@@ -332,7 +332,8 @@ class DebateEngine:
             except Exception as e:
                 print(f"[Research] {name}: 오류 발생 ({e}) — 학습 기반으로 진행")
 
-        await asyncio.gather(*[_research_one(m) for m in self.members])
+        for m in self.members:
+            await _research_one(m)
 
         collected = sum(1 for v in self.research_cache.values() if v)
         await self.send(
