@@ -3,11 +3,12 @@ AI 호출 레이어 - 레이트 리밋 완전 대응 버전
 
 핵심 변경사항:
 - 엔진별 글로벌 RPM 토큰버킷 (Groq 20/min, Gemini 12/min, OpenRouter 15/min)
-- claude → Gemini로 이동 (Groq 과부하 해소)
-- chatgpt → OpenRouter mistral로 이동 (Groq 분산)
+- 멤버 8명 기준 엔진 분산: Groq(llama4), Gemini(gemini), OpenRouter(나머지 6명)
 - 폴백 순서: 전용엔진 → 다른엔진 교차 → Gemini → 최소응답
 - penalize 축소 (5초) → 회복 시간 단축
 - 429 시 Retry-After 헤더 우선 준수
+- _lens_to_search_angle: olmo/trinity/nova 3명 렌즈 분기 추가
+- call_research_targeted 제거: 중간 즉석 학습 폐지 (컨텍스트 누적으로 불필요)
 """
 
 import os
@@ -15,31 +16,18 @@ import re
 import time
 import asyncio
 import httpx
-from pathlib import Path
-from dotenv import load_dotenv
-# ==================== .env 파일 로드 (frontend에 있는 파일 읽기) ====================
-BASE_DIR = Path(__file__).parent.parent  # AI-Congress-Backend 폴더
-env_path = BASE_DIR / "frontend" / ".env"
 
-if env_path.exists():
-    load_dotenv(env_path)
-    print(f"✅ frontend/.env 파일 로드 성공")
-else:
-    print(f"⚠️ frontend/.env 파일을 찾을 수 없습니다: {env_path}")
-# ================================================================================
 GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-print("GEMINI:", bool(GEMINI_API_KEY))
-print("OPENROUTER:", bool(OPENROUTER_API_KEY))
-print("GROQ:", bool(GROQ_API_KEY))
+
 # ─────────────────────────────────────────────
 # 엔진별 동시 호출 제한
 # ─────────────────────────────────────────────
 _ENGINE_SEMAPHORES = {
-    "groq":       asyncio.Semaphore(2),  # llama4 + nemotron 동시 처리
-    "gemini":     asyncio.Semaphore(2),  # 1→2: 5명 병렬 리서치 시 2명 동시 처리 허용
-    "openrouter": asyncio.Semaphore(2),  # 1→2: Perplexity 폴백도 동시 처리 허용
+    "groq":       asyncio.Semaphore(2),  # llama4 단독 사용 (nemotron → openrouter 이동)
+    "gemini":     asyncio.Semaphore(1),
+    "openrouter": asyncio.Semaphore(1),  # 2→1: openrouter도 순차처리로 안정화
 }
 
 # ─────────────────────────────────────────────
@@ -153,7 +141,7 @@ async def call_groq(
                 wait = min(retry_after, 20)
                 print(f"[Groq 429] {wait}초 대기 후 재시도 ({retry+1}/2)")
                 await asyncio.sleep(wait)
-                return await call_groq(messages, temperature, model, retry + 1)
+                return await call_groq(messages, temperature, model, max_tokens, retry + 1)
 
             r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"]
@@ -163,7 +151,7 @@ async def call_groq(
             if retry < 1:
                 print(f"[Groq 타임아웃] 재시도 ({retry+1}/1)")
                 await asyncio.sleep(2)
-                return await call_groq(messages, temperature, model, retry + 1)
+                return await call_groq(messages, temperature, model, max_tokens, retry + 1)
             raise ValueError("Groq 응답 시간 초과")
 
 # ─────────────────────────────────────────────
@@ -172,7 +160,7 @@ async def call_groq(
 async def call_gemini(
     messages: list,
     temperature: float = 0.4,
-    model: str = "gemini-2.0-flash-lite",
+    model: str = "gemini-2.5-flash",
     max_tokens: int = 300,
     retry: int = 0
 ) -> str:
@@ -222,7 +210,7 @@ async def call_gemini(
                 wait = min(retry_after, 20)
                 print(f"[Gemini 429] {wait}초 대기 후 재시도")
                 await asyncio.sleep(wait)
-                return await call_gemini(messages, temperature, model, retry + 1)
+                return await call_gemini(messages, temperature, model, max_tokens, retry + 1)
 
             r.raise_for_status()
             content = r.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -231,7 +219,7 @@ async def call_gemini(
         except httpx.TimeoutException:
             if retry < 1:
                 await asyncio.sleep(2)
-                return await call_gemini(messages, temperature, model, retry + 1)
+                return await call_gemini(messages, temperature, model, max_tokens, retry + 1)
             raise ValueError("Gemini 응답 시간 초과")
 
 # ─────────────────────────────────────────────
@@ -240,7 +228,7 @@ async def call_gemini(
 async def call_openrouter(
     messages: list,
     temperature: float = 0.5,
-    model: str = "mistralai/mistral-small-3.2-24b-instruct:free",
+    model: str = "mistralai/mistral-small-3.1-24b-instruct:free",
     max_tokens: int = 350,
     retry: int = 0
 ) -> str:
@@ -279,17 +267,16 @@ async def call_openrouter(
                 wait = min(retry_after, 20)
                 print(f"[OpenRouter 429] {wait}초 대기 후 재시도")
                 await asyncio.sleep(wait)
-                return await call_openrouter(messages, temperature, model, retry + 1)
+                return await call_openrouter(messages, temperature, model, max_tokens, retry + 1)
 
             if r.status_code == 402:
                 # 크레딧 부족: 다른 무료 모델로 교체
-                if model != "mistralai/mistral-small-3.2-24b-instruct:free":
+                if model != "mistralai/mistral-small-3.1-24b-instruct:free":
                     print(f"[OpenRouter 402] 크레딧 부족 → mistral 무료 폴백")
                     return await call_openrouter(
                         messages, temperature,
-                        "mistralai/mistral-small-3.2-24b-instruct:free",
-                        max_tokens,                # 기존 max_tokens 유지
-                        max(retry, 1),             # acquire 이중 실행 방지
+                        "mistralai/mistral-small-3.1-24b-instruct:free",
+                        max_tokens, retry,
                     )
                 raise ValueError("OpenRouter 크레딧 소진")
 
@@ -300,22 +287,22 @@ async def call_openrouter(
         except httpx.TimeoutException:
             if retry < 1:
                 await asyncio.sleep(2)
-                return await call_openrouter(messages, temperature, model, retry + 1)
+                return await call_openrouter(messages, temperature, model, max_tokens, retry + 1)
             raise ValueError("OpenRouter 응답 시간 초과")
 
 # ─────────────────────────────────────────────
-# 의원 엔진 매핑 — ✅ 엔진 분산 재배치
+# 의원 엔진 매핑 — ✅ 엔진 분산 재배치 (8명 기준)
 #
 # 변경 전 문제:
 #   claude + chatgpt + llama4 → 모두 Groq → Groq RPM 폭주
 #
-# 변경 후 분산:
+# 현재 분산:
 #   Groq:       llama4 (단독 사용 → 여유로움)
-#   Gemini:     gemini, claude (Gemini는 일 1500회 무료 → 여유 큼)
-#   OpenRouter: grok, perplexity, chatgpt, manus
+#   Gemini:     gemini
+#   OpenRouter: mistral, gptoss, nemotron, olmo, trinity, nova
 #
 # ⚠️ 무료 모델 응답속도 기준:
-#   빠름(~5s): groq 모델, gemini-2.0-flash-lite, mistral-small:free, nousresearch/hermes-3-llama-3.1-405b:free
+#   빠름(~5s): groq 모델, gemini-2.5-flash, mistral-small:free
 #   느림(30s+): deepseek-r1:free, grok-3-mini-beta → 사용 안 함
 # ─────────────────────────────────────────────
 
@@ -345,7 +332,7 @@ async def call_member(member: dict, messages: list, temperature: float = 0.5) ->
     member_id = member.get("id", "")
     name      = member.get("name", "?")
     engine    = member.get("engine", "openrouter")
-    model     = member.get("model",  "mistralai/mistral-small-3.2-24b-instruct:free")
+    model     = member.get("model",  "mistralai/mistral-small-3.1-24b-instruct:free")
     sem       = _ENGINE_SEMAPHORES.get(engine, _ENGINE_SEMAPHORES["openrouter"])
 
     async with sem:
@@ -413,25 +400,7 @@ async def call_research(issue: str, member_name: str, lens: str) -> str:
 
     Returns:
         구조화된 리서치 텍스트 (최대 1500자). 실패 시 "" 반환.
-
-    [병렬 실행 최적화]
-    - 전체 타임아웃 30초: 5명 동시 병렬 호출 시 한 명이 막혀도 나머지를 차단하지 않음
-    - Gemini semaphore 경쟁 감지: 이미 누군가 Gemini를 점유 중이면 즉시 폴백으로 스킵
-    - Step1 우선순위: Gemini(검색) → Perplexity → 학습기반(Groq/Gemini) 순서 유지,
-      단 검색 엔진 대기시간이 길면 학습기반으로 빠르게 전환
     """
-    try:
-        return await asyncio.wait_for(
-            _call_research_inner(issue, member_name, lens),
-            timeout=30.0
-        )
-    except asyncio.TimeoutError:
-        print(f"[Research/{member_name}] ⏰ 30초 타임아웃 — 빈 결과 반환")
-        return ""
-
-
-async def _call_research_inner(issue: str, member_name: str, lens: str) -> str:
-    """call_research 실제 구현 (타임아웃 래퍼 분리)"""
 
     # ── STEP 1: 사실 수집 (검색 기반) ──────────────────────────────
     # 의원별 lens에 맞춰 검색 각도를 특화
@@ -456,84 +425,75 @@ async def _call_research_inner(issue: str, member_name: str, lens: str) -> str:
     raw_facts = ""
 
     # 1-a: Gemini grounding (Google Search 실시간 연동)
-    # [병렬 최적화] semaphore를 non-blocking으로 확인 — 이미 점유 중이면 즉시 Perplexity로 스킵
     if GEMINI_API_KEY:
-        sem = _ENGINE_SEMAPHORES["gemini"]
-        if sem._value > 0:  # 사용 가능한 슬롯이 있을 때만 시도
-            try:
-                async with sem:
-                    await _BUCKETS["gemini"].acquire()
-                    system_text = (
-                        f"당신은 {member_name}({lens})입니다. "
-                        f"Google 검색으로 찾은 최신 정보를 '{lens_angle}' 관점에서 정리하세요. "
-                        "반드시 출처와 연도를 명시하세요."
-                    )
-                    contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
-                    url = (
-                        f"https://generativelanguage.googleapis.com/v1beta"
-                        f"/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
-                    )
-                    payload = {
-                        "contents": contents,
-                        "system_instruction": {"parts": [{"text": system_text}]},
-                        "tools": [{"google_search": {}}],
-                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
-                    }
-                    async with httpx.AsyncClient(timeout=20) as client:
-                        r = await client.post(url, json=payload)
-                        if r.status_code == 200:
-                            parts = r.json()["candidates"][0]["content"]["parts"]
-                            # [BUG-B 수정] parts[0]이 항상 text가 아님 (grounding metadata 혼재 가능)
-                            raw_facts = next((p["text"] for p in parts if "text" in p), "")
-                            print(f"[Research/{member_name}] Step1 Gemini grounding 성공 ({len(raw_facts)}자)")
-            except Exception as e:
-                print(f"[Research/{member_name}] Step1 Gemini grounding 실패: {e}")
-        else:
-            print(f"[Research/{member_name}] Step1 Gemini 사용 중 — Perplexity로 즉시 전환")
+        try:
+            sem = _ENGINE_SEMAPHORES["gemini"]
+            async with sem:
+                await _BUCKETS["gemini"].acquire()
+                system_text = (
+                    f"당신은 {member_name}({lens})입니다. "
+                    f"Google 검색으로 찾은 최신 정보를 '{lens_angle}' 관점에서 정리하세요. "
+                    "반드시 출처와 연도를 명시하세요."
+                )
+                contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
+                url = (
+                    f"https://generativelanguage.googleapis.com/v1beta"
+                    f"/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+                )
+                payload = {
+                    "contents": contents,
+                    "system_instruction": {"parts": [{"text": system_text}]},
+                    "tools": [{"google_search": {}}],
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
+                }
+                async with httpx.AsyncClient(timeout=30) as client:
+                    r = await client.post(url, json=payload)
+                    if r.status_code == 200:
+                        raw_facts = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                        print(f"[Research/{member_name}] Step1 Gemini grounding 성공 ({len(raw_facts)}자)")
+        except Exception as e:
+            print(f"[Research/{member_name}] Step1 Gemini grounding 실패: {e}")
 
-    # 1-b: Perplexity sonar 폴백
-    # [병렬 최적화] semaphore non-blocking 확인 + 타임아웃 단축 (35→20초)
+    # 1-b: 무료 모델 폴백 (mistral-small:free)
+    # ⚠️ perplexity/sonar는 유료($1/1M tokens) — 완전 무료 앱이므로 사용 금지
     if not raw_facts and OPENROUTER_API_KEY:
-        sem = _ENGINE_SEMAPHORES["openrouter"]
-        if sem._value > 0:
-            try:
-                async with sem:
-                    await _BUCKETS["openrouter"].acquire()
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": (
-                                f"당신은 {member_name}({lens})입니다. "
-                                f"웹 검색으로 최신 정보를 '{lens_angle}' 관점에서 수집하세요. "
-                                "반드시 출처와 연도를 명시하세요."
-                            ),
-                        },
-                        {"role": "user", "content": fact_prompt},
-                    ]
-                    headers = {
-                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                        "Content-Type": "application/json",
-                        "HTTP-Referer": "https://ai-congress.app",
-                        "X-Title": "AI Congress Research",
-                    }
-                    payload = {
-                        "model": "perplexity/sonar",
-                        "messages": messages,
-                        "temperature": 0.2,
-                        "max_tokens": 900,
-                    }
-                    async with httpx.AsyncClient(timeout=20) as client:
-                        r = await client.post(
-                            "https://openrouter.ai/api/v1/chat/completions",
-                            json=payload, headers=headers,
-                        )
-                        if r.status_code == 200:
-                            raw_facts = r.json()["choices"][0]["message"]["content"]
-                            print(f"[Research/{member_name}] Step1 Perplexity sonar 성공 ({len(raw_facts)}자)")
-            except Exception as e:
-                print(f"[Research/{member_name}] Step1 Perplexity 실패: {e}")
-        else:
-            print(f"[Research/{member_name}] Step1 OpenRouter 사용 중 — 학습기반으로 즉시 전환")
+        try:
+            sem = _ENGINE_SEMAPHORES["openrouter"]
+            async with sem:
+                await _BUCKETS["openrouter"].acquire()
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            f"당신은 {member_name}({lens})입니다. "
+                            f"학습된 지식으로 이 안건을 '{lens_angle}' 관점에서 조사하세요. "
+                            "불확실한 내용은 반드시 [추정]으로 명시하세요."
+                        ),
+                    },
+                    {"role": "user", "content": fact_prompt},
+                ]
+                headers = {
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://ai-congress.app",
+                    "X-Title": "AI Congress Research",
+                }
+                payload = {
+                    "model": "mistralai/mistral-small-3.1-24b-instruct:free",
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "max_tokens": 900,
+                }
+                async with httpx.AsyncClient(timeout=35) as client:
+                    r = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        json=payload, headers=headers,
+                    )
+                    if r.status_code == 200:
+                        raw_facts = r.json()["choices"][0]["message"]["content"]
+                        print(f"[Research/{member_name}] Step1 mistral:free 성공 ({len(raw_facts)}자)")
+        except Exception as e:
+            print(f"[Research/{member_name}] Step1 mistral:free 실패: {e}")
 
     # 1-c: 학습 기반 폴백 (검색 없음)
     if not raw_facts:
@@ -645,178 +605,12 @@ def _lens_to_search_angle(lens: str) -> str:
         return "사회적 영향 연구·공정성 지표·인간 피드백 기반 정책 평가"
     elif "nvidia" in lens_lower or "하드웨어" in lens_lower or "과학" in lens_lower:
         return "기술적 타당성·컴퓨팅 자원·과학 논문·엔지니어링 벤치마크"
+    elif "allen" in lens_lower or "ai2" in lens_lower or "학술" in lens_lower or "공익" in lens_lower:
+        return "학술 논문·공공 정책 문서·비영리 연구·오픈 데이터셋·재현 가능성 연구"
+    elif "arcee" in lens_lower or "스타트업" in lens_lower or "실용주의" in lens_lower:
+        return "현장 적용 사례·비용 효율 분석·중소기업·스타트업 생태계 데이터"
+    elif "amazon" in lens_lower or "aws" in lens_lower or "클라우드" in lens_lower or "리스크" in lens_lower:
+        return "기업 운영 비용·클라우드 인프라 현황·컴플라이언스 규제·리스크 관리 사례"
     else:
         return "다각도 학술 연구·정책 효과 실증 데이터·국제 기관 보고서"
 
-# ─────────────────────────────────────────────
-# 토론 중 즉석 리서치 (중간 학습)
-# ─────────────────────────────────────────────
-async def call_research_targeted(
-    issue: str,
-    member_name: str,
-    lens: str,
-    trigger_speech: str,
-    unknown_terms: list,
-) -> str:
-    """
-    토론 도중 특정 용어·주장을 이해하지 못했을 때 즉석으로 실행하는
-    경량 2단계 리서치 (사전 리서치의 축약판).
-    Returns: 구조화된 즉석 리서치 텍스트 (최대 900자). 실패 시 "" 반환.
-    """
-    try:
-        return await asyncio.wait_for(
-            _call_research_targeted_inner(issue, member_name, lens, trigger_speech, unknown_terms),
-            timeout=20.0,
-        )
-    except asyncio.TimeoutError:
-        print(f"[MidResearch/{member_name}] ⏰ 20초 타임아웃 — 빈 결과 반환")
-        return ""
-
-
-async def _call_research_targeted_inner(
-    issue: str,
-    member_name: str,
-    lens: str,
-    trigger_speech: str,
-    unknown_terms: list,
-) -> str:
-    terms_str  = ", ".join(f'"{t}"' for t in (unknown_terms or [])[:5])
-    lens_angle = _lens_to_search_angle(lens)
-
-    fact_prompt = (
-        f"토론 안건: \"{issue}\"\n"
-        f"직전 발언: \"{trigger_speech[:400]}\"\n\n"
-        f"위 발언에서 다음 용어·주장이 등장했습니다: {terms_str}\n\n"
-        f"당신은 {member_name}({lens})입니다. '{lens_angle}' 관점에서 조사하세요.\n\n"
-        "수집 목표 (400자 이내, 출처·연도 필수):\n"
-        f"A. {terms_str} 의 정확한 정의와 맥락\n"
-        "B. 이 주장을 뒷받침하거나 반박하는 실증 수치\n"
-        "C. 이 주장의 논리적 강점과 약점 각 1개\n"
-        "불확실한 정보는 반드시 [추정] 표시."
-    )
-
-    raw_facts = ""
-
-    # 1-a: Gemini grounding
-    # [병렬 최적화] semaphore non-blocking 확인
-    if GEMINI_API_KEY:
-        sem = _ENGINE_SEMAPHORES["gemini"]
-        if sem._value > 0:
-            try:
-                async with sem:
-                    await _BUCKETS["gemini"].acquire()
-                    contents = [{"role": "user", "parts": [{"text": fact_prompt}]}]
-                    url = (
-                        f"https://generativelanguage.googleapis.com/v1beta"
-                        f"/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
-                    )
-                    payload = {
-                        "contents": contents,
-                        "system_instruction": {"parts": [{"text": (
-                            f"당신은 {member_name}({lens})입니다. "
-                            "Google 검색으로 직전 발언의 핵심 용어를 빠르게 조사하세요. "
-                            "출처와 연도를 반드시 명시하세요."
-                        )}]},
-                        "tools": [{"google_search": {}}],
-                        "generationConfig": {"temperature": 0.15, "maxOutputTokens": 500},
-                    }
-                    async with httpx.AsyncClient(timeout=15) as client:
-                        r = await client.post(url, json=payload)
-                        if r.status_code == 200:
-                            parts = r.json()["candidates"][0]["content"]["parts"]
-                            # [BUG-B 수정] parts[0]이 항상 text가 아님 (grounding metadata 혼재 가능)
-                            raw_facts = next((p["text"] for p in parts if "text" in p), "")
-                            print(f"[MidResearch/{member_name}] Step1 Gemini 성공 ({len(raw_facts)}자)")
-            except Exception as e:
-                print(f"[MidResearch/{member_name}] Step1 Gemini 실패: {e}")
-        else:
-            print(f"[MidResearch/{member_name}] Step1 Gemini 사용 중 — Perplexity로 즉시 전환")
-
-    # 1-b: Perplexity sonar 폴백
-    if not raw_facts and OPENROUTER_API_KEY:
-        try:
-            async with _ENGINE_SEMAPHORES["openrouter"]:
-                await _BUCKETS["openrouter"].acquire()
-                msgs = [
-                    {"role": "system", "content": f"당신은 {member_name}({lens})입니다. 웹 검색으로 핵심 용어를 조사하세요."},
-                    {"role": "user", "content": fact_prompt},
-                ]
-                headers = {
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://ai-congress.app",
-                    "X-Title": "AI Congress MidDebate Research",
-                }
-                payload = {"model": "perplexity/sonar", "messages": msgs, "temperature": 0.15, "max_tokens": 500}
-                async with httpx.AsyncClient(timeout=30) as client:
-                    r = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        json=payload, headers=headers,
-                    )
-                    if r.status_code == 200:
-                        raw_facts = r.json()["choices"][0]["message"]["content"]
-                        print(f"[MidResearch/{member_name}] Step1 Perplexity 성공 ({len(raw_facts)}자)")
-        except Exception as e:
-            print(f"[MidResearch/{member_name}] Step1 Perplexity 실패: {e}")
-
-    # 1-c: 학습 기반 폴백
-    if not raw_facts:
-        try:
-            fallback_msgs = [
-                {"role": "system", "content": f"당신은 {member_name}({lens})입니다. 학습된 지식에서 아래 발언의 핵심 용어를 조사하세요. 불확실하면 [추정]으로 명시."},
-                {"role": "user", "content": fact_prompt},
-            ]
-            for caller_fn, ename in (
-                (lambda m: call_groq(m, temperature=0.2, max_tokens=400), "groq"),
-                (lambda m: call_gemini(m, temperature=0.2, max_tokens=400), "gemini"),
-            ):
-                try:
-                    raw_facts = await caller_fn(fallback_msgs)
-                    print(f"[MidResearch/{member_name}] Step1 {ename} 학습기반 성공")
-                    break
-                except Exception as fe:
-                    print(f"[MidResearch/{member_name}] Step1 {ename} 실패: {fe}")
-        except Exception as e:
-            print(f"[MidResearch/{member_name}] Step1 학습기반 전체 실패: {e}")
-
-    if not raw_facts:
-        return ""
-
-    # STEP 2: 즉석 내면화
-    deliberation_prompt = (
-        f"토론 안건: \"{issue}\"\n"
-        f"상대 발언: \"{trigger_speech[:300]}\"\n"
-        f"방금 조사한 내용:\n{raw_facts[:500]}\n\n"
-        f"당신은 {member_name}({lens})입니다. 위 정보를 내면화하여:\n"
-        "1. 【이제 이해한 것】 상대 주장의 실제 의미와 근거 (1~2문장)\n"
-        "2. 【나의 대응 전략】 이 정보로 반박하거나 활용할 방법 (1~2문장, 구체적 수치 포함)\n"
-        "3. 【즉시 쓸 논거】 다음 발언에서 꺼낼 핵심 카드 1개\n"
-        "300자 이내로 간결하게."
-    )
-    deliberation = ""
-    delib_msgs = [
-        {"role": "system", "content": f"당신은 {member_name} 의원입니다. 조사한 정보를 즉시 토론 전략으로 소화하세요. 구체적 수치와 인과관계 중심."},
-        {"role": "user", "content": deliberation_prompt},
-    ]
-    for caller_fn, ename in (
-        (lambda m: call_groq(m, temperature=0.3, max_tokens=350), "groq"),
-        (lambda m: call_gemini(m, temperature=0.3, max_tokens=350), "gemini"),
-        (lambda m: call_openrouter(m, temperature=0.3, max_tokens=350), "openrouter"),
-    ):
-        try:
-            deliberation = await caller_fn(delib_msgs)
-            print(f"[MidResearch/{member_name}] Step2 내면화 {ename} 성공")
-            break
-        except Exception as e:
-            print(f"[MidResearch/{member_name}] Step2 {ename} 실패: {e}")
-
-    if not deliberation:
-        return raw_facts[:600]
-
-    result = (
-        f"=== {member_name} 중간 즉석 학습 ({', '.join((unknown_terms or [])[:3])}) ===\n\n"
-        f"[조사된 사실]\n{raw_facts[:400]}\n\n"
-        f"[내면화 및 대응 전략]\n{deliberation[:350]}"
-    )
-    print(f"[MidResearch/{member_name}] 완료 — 총 {len(result)}자")
-    return result[:900]

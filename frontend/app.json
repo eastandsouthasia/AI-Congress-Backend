@@ -35,8 +35,8 @@
       }
     },
     "plugins": [
-      "expo-sharing"
- 
+      "expo-sharing",
+      "expo-speech"
     ]
   }
 }

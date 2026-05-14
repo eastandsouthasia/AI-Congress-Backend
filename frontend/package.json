@@ -12,20 +12,14 @@
     "@expo/vector-icons": "^15.1.1",
     "@react-native-async-storage/async-storage": "^2.2.0",
     "axios": "^1.16.0",
-    "expo": "^55.0.23",
+    "expo": "~55.0.15",
     "expo-file-system": "~55.0.15",
     "expo-linear-gradient": "~55.0.9",
     "expo-sharing": "~55.0.9",
-    "expo-speech": "~55.0.13",
+    "expo-speech": "~55.0.9",
     "expo-status-bar": "~55.0.6",
     "react": "19.2.0",
-    "react-native": "0.83.6"
+    "react-native": "0.83.4"
   },
-  "private": true,
-  "devDependencies": {
-    "@expo/cli": "^55.0.29",
-    "metro": "^0.83.3",
-    "metro-config": "^0.84.4",
-    "metro-resolver": "^0.84.4"
-  }
+  "private": true
 }

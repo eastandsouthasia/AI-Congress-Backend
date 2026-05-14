@@ -39,6 +39,7 @@ const cleanForTTS = (text) => {
     .replace(/Gemini/gi, "제미나이").replace(/Llama4?/gi, "라마")
     .replace(/Mistral/gi, "미스트랄").replace(/GPT.?OSS/gi, "지피티")
     .replace(/Nemotron/gi, "엔비디아")
+    .replace(/OLMo/gi, "올모").replace(/Trinity/gi, "트리니티").replace(/Nova/gi, "노바")
     .replace(/≥/g, "이상").replace(/≤/g, "이하")
     .replace(/>/g, "초과").replace(/</g, "미만")
     .replace(/\*{2}/g, "").replace(/\*/g, "")
@@ -54,6 +55,9 @@ const VOICE_SETTINGS = {
   mistral:  { pitch: 1.12, rate: 1.02 },
   gptoss:   { pitch: 0.96, rate: 0.84 },
   nemotron: { pitch: 0.91, rate: 0.81 },
+  olmo:     { pitch: 1.02, rate: 0.88 },
+  trinity:  { pitch: 1.08, rate: 0.90 },
+  nova:     { pitch: 0.97, rate: 0.86 },
 };
 
 // ─── 음성 재생 패널 ───────────────────────────────────
@@ -231,6 +235,9 @@ const MEMBER_NAMES = {
   mistral:  '미스트랄',
   gptoss:   '지피티',
   nemotron: '엔비디아',
+  olmo:     '올모',
+  trinity:  '트리니티',
+  nova:     '노바',
 };
 
 const MEMBER_AVATARS = {
@@ -240,6 +247,9 @@ const MEMBER_AVATARS = {
   mistral:  '🌊',  // 기존: 🌪
   gptoss:   '⚡',  // 기존: 🤖
   nemotron: '🖥️', // 기존: ⚡
+  olmo:     '🔬',
+  trinity:  '⚔️',
+  nova:     '☁️',
 };
 
 // ─── 투표 결과 파싱 (DebateScreen.js의 parseVoteResult와 동일 로직 유지) ──

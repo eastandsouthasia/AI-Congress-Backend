@@ -291,6 +291,9 @@ const getVoiceSettings = async (memberId) => {
     case "mistral":  pitch = 1.12; rate = 1.02; break;
     case "gptoss":   pitch = 0.96; rate = 0.84; volume = 0.98; break;
     case "nemotron": pitch = 0.91; rate = 0.81; volume = 0.97; break;
+    case "olmo":     pitch = 1.02; rate = 0.88; break;
+    case "trinity":  pitch = 1.08; rate = 0.90; break;
+    case "nova":     pitch = 0.97; rate = 0.86; break;
   }
   try {
     if (_cachedKoreanVoices === null) {
@@ -335,6 +338,7 @@ const cleanForTTS = (text) => {
     .replace(/Gemini/gi, "제미나이").replace(/Llama4?/gi, "라마")
     .replace(/Mistral/gi, "미스트랄").replace(/GPT.?OSS/gi, "지피티")
     .replace(/Nemotron/gi, "엔비디아")
+    .replace(/OLMo/gi, "올모").replace(/Trinity/gi, "트리니티").replace(/Nova/gi, "노바")
     .replace(/≥/g, "이상").replace(/≤/g, "이하")
     .replace(/>/g, "초과").replace(/</g, "미만")
     .replace(/={2,}/g, "동일")
@@ -426,13 +430,30 @@ const PlaybackPanel = ({ history, onClose }) => {
   const handlePrev = () => {
     const next = Math.max(0, currentIdx - 1);
     setCurrentIdx(next);
-    if (isPlaying) { Speech.stop(); stopSignal.current = false; speakItem(next); }
+    if (isPlaying) {
+      stopSignal.current = true;
+      Speech.stop();
+      // Speech.stop()의 onStopped 콜백이 처리된 후 재생 시작
+      setTimeout(() => {
+        if (!isMountedRef?.current === false) return;
+        stopSignal.current = false;
+        speakItem(next);
+      }, 80);
+    }
   };
 
   const handleNext = () => {
     const next = Math.min(playable.length - 1, currentIdx + 1);
     setCurrentIdx(next);
-    if (isPlaying) { Speech.stop(); stopSignal.current = false; speakItem(next); }
+    if (isPlaying) {
+      stopSignal.current = true;
+      Speech.stop();
+      setTimeout(() => {
+        if (!isMountedRef?.current === false) return;
+        stopSignal.current = false;
+        speakItem(next);
+      }, 80);
+    }
   };
 
   const current     = playable[currentIdx];
@@ -633,7 +654,14 @@ const DebateScreen = ({
       if (isMountedRef.current) setIsFinished(true);
     };
 
-    ws.onclose = () => console.log("[WS] 연결 종료");
+    ws.onclose = (event) => {
+      console.log("[WS] 연결 종료");
+      // done/result 없이 서버가 연결을 끊은 경우 UI가 '진행 중' 상태로 먹통이 되는 것을 방지
+      if (isMountedRef.current) {
+        setIsFinished(true);
+        setStatus(event.wasClean ? "연결 종료" : "⚠️ 서버 연결이 끊겼습니다");
+      }
+    };
 
     return () => {
       Speech.stop();

@@ -11,12 +11,19 @@ WebSocket 엔드포인트:
     "debateFormat":   str,   # "릴레이" | "집중토론" | "전문가패널" | "자유토론"
     "conclusionType": str,   # "VOTE" | "RESOLUTION"
     "activeMembers":  list,  # 참여 의원 ID 배열 (없으면 전원 참여)
+                             # 의원 ID 목록 (members.py 기준 8명):
+                             #   gemini, llama4, mistral, gptoss, nemotron,
+                             #   olmo, trinity, nova
   }
 
 v2 변경:
   - duration(분) → maxTurns(발언 횟수) 교체
-  - maxTurns 범위 보정: 5 ~ 200턴
+  - maxTurns 범위 보정: 5 ~ 50턴 (무료 API 한도 기준 — openrouter :free RPM/RPD 보호)
   - DebateEngine 생성자 파라미터 동기화
+
+멤버 구성은 members.py가 SSOT(단일 진실 공급원).
+main.py는 activeMembers ID를 그대로 DebateEngine에 전달하며
+멤버 데이터를 직접 참조하지 않습니다.
 """
 
 import os
@@ -85,8 +92,11 @@ async def debate_ws(ws: WebSocket):
         await ws.send_json({"type": "done"})
         return
 
-    # 턴 수 범위 보정 (5~200)
-    max_turns = max(5, min(200, max_turns))
+    # 턴 수 범위 보정 (5~50)
+    # 무료 API 한도 기준:
+    #   openrouter :free → 1세션 약 70~110회 호출 (25턴 기준)
+    #   50턴 초과 시 openrouter RPM/RPD 초과 및 429 루프 반복 위험
+    max_turns = max(5, min(50, max_turns))
 
     print(
         f"[WS] 안건: {issue[:40]} / {max_turns}턴 / {debate_format} / "

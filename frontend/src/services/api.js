@@ -12,13 +12,16 @@ const OPENROUTER_API_KEY = process.env.EXPO_PUBLIC_OPENROUTER_API_KEY || "";
 // 의원별 전용 엔진 매핑
 // 각 의원이 실제로 다른 AI API를 호출
 // ─────────────────────────────────────────────
-// api.js
+// api.js — members.py SSOT 기준으로 동기화
 export const MEMBER_ENGINE_MAP = {
-  gemini:   { engine: "gemini",      model: "gemini-2.5-pro" },
+  gemini:   { engine: "gemini",      model: "gemini-2.5-flash" },
   llama4:   { engine: "groq",        model: "meta-llama/llama-4-scout-17b-16e-instruct" },
-  mistral:  { engine: "openrouter",  model: "mistralai/mistral-small-3.2-24b-instruct:free" },
-  gptoss:   { engine: "openrouter",  model: "openai/gpt-oss-120b:free" },       // ✅ 확정
-  nemotron: { engine: "openrouter",  model: "nvidia/llama-3.1-nemotron-ultra-253b-v1:free" }, // ✅ 확정
+  mistral:  { engine: "openrouter",  model: "mistralai/mistral-small-3.1-24b-instruct:free" },
+  gptoss:   { engine: "openrouter",  model: "openai/gpt-oss-120b:free" },
+  nemotron: { engine: "openrouter",  model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free" },
+  olmo:     { engine: "openrouter",  model: "allenai/olmo-3.1-32b-think:free" },
+  trinity:  { engine: "openrouter",  model: "arcee-ai/trinity-large-preview:free" },
+  nova:     { engine: "openrouter",  model: "amazon/nova-pro-v1" },
 };
 // ─────────────────────────────────────────────
 // 발언 끊김 방지: 불완전 문장 제거

@@ -4,16 +4,21 @@ conviction_tracker.py — 의원별 확신도 추적기
 각 의원의 찬반 확신도를 -100(완전 반대) ~ +100(완전 찬성) 범위로 추적합니다.
 
 동작 원리:
-  1. 발언 후 경량 LLM 호출로 논리 점수(1~10)와 설득 방향을 평가
-  2. [ADMIT] → 발언자 본인 확신도를 상대 방향으로 이동
-  3. [REFUTE] → 논리 점수가 높으면 반박 대상 의원 확신도를 이동
-  4. 최종 투표 시 확신도를 반영하여 실제 토론 결과가 표결에 영향
+  1. 초기값: bias 기반 기본값으로 설정
+  2. 안건 기반 보정: DebateEngine._deliberate_initial_stance()에서
+     각 AI가 안건을 직접 읽고 판단한 결과(conviction_delta)를 주입해
+     초기 확신도를 안건에 맞게 조정한다.
+     → PRO/CON 강제 배정 없이, 자율 숙고 결과가 conviction에 반영됨.
+  3. 발언 후 경량 LLM 호출로 논리 점수(1~10)와 설득 방향을 평가
+  4. [ADMIT] → 발언자 본인 확신도를 상대 방향으로 이동
+  5. [REFUTE] → 논리 점수가 높으면 반박 대상 의원 확신도를 이동
+  6. 최종 투표 시 확신도를 반영하여 실제 토론 결과가 표결에 영향
 
-bias → 초기 확신도 매핑:
-  '진보·개혁·공정'  → +55   (안건이 변화/개혁적일 때 찬성 경향)
-  '자유주의·분권'   → +30   (개인 자유 방향 시 찬성, 규제 시 반대)
-  '실용·데이터중심' → +10   (데이터 보기 전 중립)
-  '보수·안정·점진'  → -30   (급진적 변화에 회의적)
+bias → 초기 확신도 매핑 (안건 기반 보정 전 기준값):
+  '진보·개혁·공정'  → +25   (개혁적 안건에 찬성 경향) — gptoss, olmo
+  '자유주의·분권'   → +20   (개인 자유 방향 시 찬성)  — llama4
+  '실용·데이터중심' → +10   (데이터 보기 전 중립에 가까움) — gemini, trinity, nova
+  '보수·안정·점진'  → -25   (급진적 변화에 회의적)    — mistral, nemotron
   기타              → 0
 
 LLM 평가 비용 최소화:
@@ -29,7 +34,13 @@ from ai_caller import call_groq, call_gemini
 
 # bias → 초기 확신도
 # [정합성 수정④] "기술주의·효율" 키 제거.
-# members.py의 5개 의원 중 해당 bias를 가진 의원이 없는 미사용 항목이었음.
+# members.py의 8명 의원 중 해당 bias를 가진 의원이 없는 미사용 항목이었음.
+#
+# 멤버별 bias 매핑 (8명):
+#   진보·개혁·공정  (+25): gptoss, olmo
+#   자유주의·분권   (+20): llama4
+#   실용·데이터중심 (+10): gemini, trinity, nova
+#   보수·안정·점진  (-25): mistral, nemotron
 #
 # [균형 수정] 기존값: 진보+55 / 자유+30 / 실용+10 / 보수-30
 # 문제: 진보+55가 너무 높아 CON으로 배정돼도 토론 중 설득이 4회 이상 필요
@@ -345,9 +356,10 @@ async def _call_eval(messages: list) -> str:
     """
     평가 LLM 호출 — Groq 우선, 실패 시 Gemini 폴백
     평가용이므로 temperature=0.1로 고정, max_tokens는 기본값
+    라마 멤버 모델과 동일한 llama-4-scout 사용 (members.py SSOT 기준)
     """
     try:
-        return await call_groq(messages, temperature=0.1, model="llama-3.3-70b-versatile")
+        return await call_groq(messages, temperature=0.1, model="meta-llama/llama-4-scout-17b-16e-instruct")
     except Exception:
         pass
     try:

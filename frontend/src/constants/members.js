@@ -1,9 +1,12 @@
 export const MEMBERS = [
-  { id: "gemini",   name: "제미나이", lens: "Google 학습 기반 — 웹·학술·다국어",        color: "#4285F4", avatar: "♊",  pitch: 1.0  },
-  { id: "llama4",   name: "라마",     lens: "Meta 학습 기반 — 오픈소스·다국어·중립",     color: "#0668E1", avatar: "🦙", pitch: 1.05 },
-  { id: "mistral",  name: "미스트랄", lens: "Mistral AI 학습 기반 — 유럽·오픈소스·효율", color: "#FF7000", avatar: "🌊", pitch: 0.9  },
-  { id: "gptoss",   name: "지피티",   lens: "OpenAI 오픈소스 기반 — Apache 2.0·120B",   color: "#10A37F", avatar: "⚡",  pitch: 1.1  },
-  { id: "nemotron", name: "엔비디아", lens: "NVIDIA 학습 기반 — 하드웨어·과학·추론",     color: "#76B900", avatar: "🖥️", pitch: 0.95 },
+  { id: "gemini",   name: "제미나이", lens: "Google 학습 기반 — 웹·학술·다국어",                    color: "#4285F4", avatar: "♊",  pitch: 1.0  },
+  { id: "llama4",   name: "라마",     lens: "Meta 학습 기반 — 오픈소스·다국어·중립",                 color: "#0668E1", avatar: "🦙", pitch: 1.05 },
+  { id: "mistral",  name: "미스트랄", lens: "Mistral AI — 유럽·법치·오픈소스",                      color: "#FF7000", avatar: "🌊", pitch: 0.9  },
+  { id: "gptoss",   name: "지피티",   lens: "OpenAI 학습 기반 — RLHF·추론·체인오브쏘트",            color: "#10A37F", avatar: "⚡",  pitch: 1.1  },
+  { id: "nemotron", name: "엔비디아", lens: "NVIDIA 학습 기반 — 과학·엔지니어링·추론",               color: "#76B900", avatar: "🖥️", pitch: 0.95 },
+  { id: "olmo",     name: "올모",     lens: "AI2(Allen Institute) — 학술·공익·완전공개",             color: "#8B5CF6", avatar: "🔬", pitch: 1.02 },
+  { id: "trinity",  name: "트리니티", lens: "Arcee AI — 미국 스타트업·효율·실용주의",                color: "#EF4444", avatar: "⚔️", pitch: 1.08 },
+  { id: "nova",     name: "노바",     lens: "Amazon AWS — 클라우드 인프라·기업 현실·리스크 관리",    color: "#FF9900", avatar: "☁️", pitch: 0.97 },
 ];
 
 export const COLORS = {
