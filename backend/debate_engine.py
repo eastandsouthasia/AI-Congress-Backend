@@ -1,37 +1,34 @@
 """
-AI Congress Debate Engine — v3 (첫발언 즉석리서치 · 중간학습 제거)
+AI Congress Debate Engine — v4 (리서치 제거 · 단일 API 호출)
 
-[v3 변경 사항 — v2 대비]
-  1. 사전 리서치 구조 전면 재설계
-     - 제거: research_phase() — 모든 의원 동시 사전 리서치
-     - 제거: _deliberate_initial_stance() — 토론 전 일괄 입장 숙고
-     - 추가: _first_speech_prep() — 각 의원이 첫 발언 직전에 리서치+입장결정 통합 실행
-       * 의장: run() 진입 직후 리서치 → 개회사
-       * 의원 A: 개회사 직후 첫 발언 직전 리서치+입장결정 → 발언
-       * 의원 B: A 발언을 들은 뒤 첫 발언 직전 리서치+입장결정 → 발언
-       * 의원 C: A·B 발언을 들은 뒤 첫 발언 직전 리서치+입장결정 → 발언
-       * 2번째 발언부터: 바로 발언 생성 (추가 리서치 없음)
+[v4 변경 사항 — v3 대비]
+  1. 사전 리서치·deliberation 완전 제거
+     - 제거: _first_speech_prep() — 리서치+입장결정 통합 준비
+     - 제거: call_research() 호출
+     - 제거: research_cache, deliberation_cache, _first_speech_done
+     - 근거: LLM은 이미 방대한 지식을 학습한 상태. 리서치·deliberation은
+             발언 1회에 API 3번 호출하는 구조로 속도를 극도로 저하시켰음.
+             get_opinion() 프롬프트에 "학습 기반에서 직접 판단·발언" 지시로 대체.
 
-  2. 중간 즉석 학습 완전 제거
-     - 제거: mid_debate_research()
-     - 제거: _detect_unknown_terms()
-     - 제거: _mid_research_last_turn, _mid_research_log 캐시
-     - 근거: LLM이 컨텍스트로 모든 선행 발언을 읽고 있으므로 별도 리서치 불필요.
-             첫 발언 전 심층 리서치로 배경 지식 충분히 확보.
+  2. 발언 1회 = API 1회 호출
+     - 기존: call_research + call_member(deliberation) + call_member(발언) = 3회
+     - 변경: call_member(발언) = 1회
+     - 효과: 의원 1명당 대기 시간 80~180초 → 5~30초
 
-  3. 체감 속도 개선
-     - 기존: "조사 중×N명" 화면을 수분간 보여준 후 토론 시작
-     - 변경: 의장 리서치+개회사가 즉시 출력되고 토론 흐름 안에서 리서치 진행
+  3. stance_map 단순화
+     - 토론 전 전원 UNDECIDED로 초기화
+     - 토론 중 [ADMIT]/[REFUTE] 발언으로 conviction이 변화하며 자연스럽게 입장 형성
+
+  4. get_opinion() round_num==1 프롬프트 강화
+     - 첫 발언 시 "학습 기반에서 직접 핵심 데이터·입장 판단 후 발언" 지시 추가
+
+[v3 변경 사항]
+  - _first_speech_prep() 추가 (v4에서 제거)
+  - 중간 즉석 학습 제거
 
 [v2 변경 사항]
-  1. 시간 제한 완전 제거 → 턴(발언 횟수) 기반으로 전환
-  2. TTS ACK 대기 로직 전면 제거
-  3. 시간 기반 경고 → 턴 기반 경고
-  4. 라운드 수: max_turns에서 자동 계산
-  5. 개회사에서 "XX분" 언급 제거, 턴/라운드 안내로 교체
-
-[멤버 업데이트 — 8명 기준]
-  members.py가 SSOT. debate_engine.py는 멤버 데이터를 직접 하드코딩하지 않음.
+  - 시간 제한 제거 → 턴 기반 전환
+  - TTS ACK 제거
 """
 
 import json
@@ -42,7 +39,7 @@ import time
 import datetime
 from fastapi import WebSocket
 from members import MEMBERS
-from ai_caller import call_member, call_research
+from ai_caller import call_member
 from debate_context import DebateContext
 from conviction_tracker import ConvictionTracker
 
@@ -113,14 +110,8 @@ class DebateEngine:
         self._active_members_fallback: bool = getattr(self, '_active_members_fallback', False)
         self.conviction = ConvictionTracker(self.members, issue)
 
-        # 사전 리서치 결과 캐시 — member_id → 리서치 요약 텍스트
-        self.research_cache: dict[str, str] = {m["id"]: "" for m in self.members}
-
-        # 내면화(deliberation) 결과 캐시 — member_id → 숙고 텍스트
-        self.deliberation_cache: dict[str, str] = {m["id"]: "" for m in self.members}
-
-        # 첫 발언 완료 여부 추적 — member_id → bool (첫발언 전 리서치 실행 여부)
-        self._first_speech_done: dict[str, bool] = {m["id"]: False for m in self.members}
+        # 토론 전 전원 UNDECIDED — 토론 중 conviction 변화로 자연스럽게 입장 형성
+        # 의장만 NEUTRAL로 별도 설정 (run()에서 처리)
 
         # 라운드 수 자동 계산 — 의원 수 기반 (의장 1명 제외한 발언자 수 기준)
         # 예) 7명 발언자, max_turns=25 → 25//7=3라운드 (실제발언 21턴, 84% 활용)
@@ -151,137 +142,6 @@ class DebateEngine:
 
     def _turns_remaining(self) -> int:
         return max(0, self.max_turns - self._turn_count)
-
-    # ══════════════════════════════════════════════
-    # 첫 발언 전 리서치 + 입장 결정 통합
-    # ══════════════════════════════════════════════
-    async def _first_speech_prep(self, member: dict, chair_id: str):
-        """
-        각 의원(또는 의장)이 첫 발언 직전 딱 한 번 실행하는 통합 준비 단계.
-
-        의장(is_chair=True):
-          - call_research()만 실행 → research_cache 갱신
-          - deliberation/stance 결정은 건너뜀 (의장은 중립 고정)
-
-        의원(is_chair=False):
-          - call_research() → deliberation → stance/conviction 결정 순 실행
-          - _stance_map / deliberation_cache / research_cache 갱신
-
-        이미 첫 발언이 끝난 멤버(_first_speech_done[id] == True)는 건너뜀.
-        """
-        mid      = member["id"]
-        is_chair = (mid == chair_id)
-
-        if self._first_speech_done.get(mid):
-            return
-
-        name    = member["name"]
-        lens    = member.get("lens", "")
-        bias    = member.get("bias", "중립")
-        persona = member.get("persona", "")
-
-        role_label = "의장" if is_chair else "의원"
-        await self.send("status", message=f"📡 {name} {role_label} 안건 자료 수집 중...")
-
-        # ── Step 1: 사실 수집 (의장·의원 공통) ────────────────────
-        try:
-            result = await asyncio.wait_for(
-                call_research(self.issue, name, lens),
-                timeout=80,
-            )
-            if result:
-                self.research_cache[mid] = result
-                print(f"[FirstPrep/{name}] 리서치 완료 ({len(result)}자)")
-            else:
-                print(f"[FirstPrep/{name}] 리서치 결과 없음 — 학습 기반으로 진행")
-        except asyncio.TimeoutError:
-            print(f"[FirstPrep/{name}] 리서치 타임아웃 — 학습 기반으로 진행")
-        except Exception as e:
-            print(f"[FirstPrep/{name}] 리서치 오류 ({e}) — 학습 기반으로 진행")
-
-        # ── Step 2: 내면화 + 초기 입장 결정 (의원만) ──────────────
-        if is_chair:
-            # 의장은 stance를 NEUTRAL로 고정, deliberation 불필요
-            self._stance_map[mid] = "NEUTRAL"
-            self._first_speech_done[mid] = True
-            print(f"[FirstPrep/{name}] 의장 리서치 완료 (stance=NEUTRAL)")
-            return
-
-        await self.send("status", message=f"🧠 {name} 의원 논거 정리 및 입장 결정 중...")
-
-        research_txt = self.research_cache.get(mid, "")
-
-        deliberation_prompt = (
-            f"토론 안건: \"{self.issue}\"\n\n"
-            f"당신은 {name}({bias} 성향)입니다.\n"
-            f"{persona[:200]}\n\n"
-        )
-        if research_txt:
-            deliberation_prompt += f"[방금 수집한 리서치 자료]\n{research_txt[:1000]}\n\n"
-        deliberation_prompt += (
-            "위 자료를 당신의 이념·성향·지식 기반으로 소화하여 아래를 작성하세요:\n\n"
-            "1. 【나의 초기 입장】\n"
-            "   이 안건에 대한 나의 첫 번째 판단과 그 이유 (2~3문장)\n"
-            "   마지막 줄에 반드시 JSON: {\"stance\": \"LEAN_PRO\"|\"LEAN_CON\"|\"UNDECIDED\", "
-            "\"conviction_delta\": -30~30}\n\n"
-            "2. 【첫 발언에서 꺼낼 핵심 카드】\n"
-            "   리서치에서 발견한 가장 강력한 논거 1개를 구체적 수치·출처와 함께\n\n"
-            "3. 【내가 경계해야 할 상대의 논거】\n"
-            "   상대가 꺼낼 가장 강한 반박과, 내가 준비한 재반박\n\n"
-            "4. 【나만의 차별적 관점】\n"
-            f"   {bias} 성향·{name}의 학습 기반에서만 나올 수 있는 고유한 시각 1가지\n\n"
-            "각 항목 2~3문장으로 간결하게. 총 500자 이내."
-        )
-
-        deliberation_msgs = [
-            {
-                "role": "system",
-                "content": (
-                    f"당신은 {name} 의원입니다. {persona[:150]} "
-                    "수집한 자료를 당신의 가치관으로 내면화하세요. "
-                    "추상적 서술 금지 — 구체적 수치와 인과관계 중심으로 작성하세요."
-                ),
-            },
-            {"role": "user", "content": deliberation_prompt},
-        ]
-
-        try:
-            result = await call_member(member, deliberation_msgs, temperature=0.4)
-            if result and len(result) > 30:
-                self.deliberation_cache[mid] = result
-                print(f"[FirstPrep/{name}] 내면화 완료 ({len(result)}자)")
-
-                # JSON stance 파싱
-                import json as _j
-                s = result.rfind('{'); e = result.rfind('}')
-                if s != -1 and e != -1 and e > s:
-                    try:
-                        parsed = _j.loads(result[s:e+1])
-                        raw_stance = str(parsed.get("stance", "UNDECIDED")).upper()
-                        if raw_stance in ("LEAN_PRO", "LEAN_CON", "UNDECIDED"):
-                            self._stance_map[mid] = raw_stance
-                        delta = float(parsed.get("conviction_delta", 0))
-                        delta = max(-30.0, min(30.0, delta))
-                        curr = self.conviction.convictions.get(mid, 0.0)
-                        adjusted = max(-100.0, min(100.0, curr + delta))
-                        self.conviction.convictions[mid] = adjusted
-                        print(
-                            f"[FirstPrep/{name}] 입장: {self._stance_map[mid]} / "
-                            f"conviction {curr:+.1f} → {adjusted:+.1f}"
-                        )
-                    except Exception as je:
-                        print(f"[FirstPrep/{name}] stance JSON 파싱 실패 ({je}) — UNDECIDED 유지")
-            else:
-                print(f"[FirstPrep/{name}] 내면화 응답 비정상 — 건너뜀")
-        except Exception as e:
-            print(f"[FirstPrep/{name}] 내면화 오류 ({e}) — 건너뜀")
-
-        # stance가 아직 설정 안 됐으면 UNDECIDED
-        if mid not in self._stance_map:
-            self._stance_map[mid] = "UNDECIDED"
-
-        self._first_speech_done[mid] = True
-        print(f"[FirstPrep/{name}] 첫발언 준비 완료")
 
     # ══════════════════════════════════════════════
     # 전송 헬퍼
@@ -359,17 +219,6 @@ class DebateEngine:
         non_chair_names = [m["name"] for m in self.members if m["id"] != chair["id"]]
         non_chair_list_str = "\n".join(f"- {n}" for n in non_chair_names)
 
-        # 의장 리서치 결과 주입 — 개회사에만 반영 (사회 멘트에는 불필요)
-        research_inject = ""
-        if is_opening:
-            chair_research = self.research_cache.get(chair["id"], "")
-            if chair_research:
-                research_inject = (
-                    f"\n\n【의장 사전 리서치 요약 — 개회사에 핵심 쟁점 반영 시 활용】\n"
-                    f"{chair_research[:600]}\n"
-                    "위 내용을 바탕으로 안건의 맥락과 핵심 쟁점을 개회사에 구체적으로 녹여내세요.\n"
-                )
-
         if is_opening:
             opening_guide = (
                 "\n【개회사 작성 지침 — 반드시 준수】\n"
@@ -391,7 +240,6 @@ class DebateEngine:
                     f"참여 의원 목록 (발언 지목 대상):\n{non_chair_list_str}\n\n"
                     "역할: 사회자. 반드시 지시된 사회 멘트만 출력하세요.\n"
                     f"{opening_guide}"
-                    f"{research_inject}"
                     "⚠️ 절대 금지 사항:\n"
                     f"  1. 본인({chair['name']})을 발언자로 지목하거나 호명하는 것\n"
                     "  2. 의원의 발언 내용을 대신 생성하거나 이어 쓰는 것\n"
@@ -410,9 +258,16 @@ class DebateEngine:
             result = await call_member(chair, messages, temperature=0.3)
             cleaned = self._strip_prefix(result)
             cleaned = self._remove_self_nomination(cleaned, chair)
-            if len(cleaned) > max_chars * 1.5:
+            # max_chars 초과 시 문장 단위로 자르되, 최소 1문장은 보장
+            if len(cleaned) > max_chars:
                 parts = re.split(r'(?<=[.!?。！？])\s+', cleaned)
-                cleaned = parts[0] if parts else cleaned[:max_chars]
+                truncated = ""
+                for part in parts:
+                    if len(truncated) + len(part) + 1 <= max_chars:
+                        truncated = (truncated + " " + part).strip()
+                    else:
+                        break
+                cleaned = truncated if truncated else cleaned[:max_chars]
             return cleaned
         except Exception as e:
             print(f"[의장 사회] 실패: {e}")
@@ -531,7 +386,6 @@ class DebateEngine:
         is_rebuttal: bool = False,
         target_speech: str = None,
         free_mode: bool = False,
-        is_chair_conclusion: bool = False,
     ) -> str:
 
         if free_mode:
@@ -563,10 +417,11 @@ class DebateEngine:
             )
         else:
             max_round = self.rounds
-            if round_num == 1:
+            if round_num == 1 and not is_rebuttal:
                 action_guide = (
                     "【1라운드 — 입장 표명 + 데이터 기반 논거】\n"
-                    "이것이 첫 발언입니다. 이 안건에 대한 본인의 입장과 핵심 근거를 명확히 밝히세요.\n"
+                    "이것이 첫 발언입니다. 별도 자료 조사 없이 당신이 학습한 지식에서 바로 판단하여 발언하세요.\n"
+                    "이 안건에 대한 본인의 입장과 핵심 근거를 명확히 밝히세요.\n"
                     "반드시 당신이 학습한 구체적 통계·연구·사례를 최소 1개 이상 [DATA] 태그로 제시하세요.\n"
                     "기관명·연도·수치를 포함한 실증 데이터가 없는 주장은 설득력이 없습니다.\n"
                     "국제 비교 사례나 국내 현황 데이터가 있다면 적극 활용하세요."
@@ -613,39 +468,6 @@ class DebateEngine:
         temperature   = member.get("temperature", 0.6)
         stance_guide  = self._get_stance_guide(member["id"])
 
-        # 사전 리서치 + 내면화 결과 주입
-        # 의장 최종 소견(is_chair_conclusion)은 리서치 블록 불필요 — 토론 컨텍스트로 충분
-        research_text     = self.research_cache.get(member["id"], "")
-        deliberation_text = self.deliberation_cache.get(member["id"], "")
-
-        if (research_text or deliberation_text) and not is_chair_conclusion:
-            if round_num == 1 and not is_rebuttal:
-                research_block = "\n\n【사전 심층 리서치 — 반드시 발언에 활용】\n"
-                if research_text:
-                    research_block += (
-                        "▶ 수집된 핵심 사실·통계 (출처 포함):\n"
-                        f"{research_text[:700]}\n\n"
-                    )
-                if deliberation_text:
-                    research_block += (
-                        "▶ 당신이 이 자료를 내면화한 결과 (나의 논거·전략):\n"
-                        f"{deliberation_text[:500]}\n"
-                    )
-                research_block += (
-                    "\n⚠️ 위 자료를 반드시 [DATA] 태그와 함께 발언에 인용하세요.\n"
-                    "리서치에서 발견한 구체적 수치를 첫 문장부터 사용하세요.\n"
-                    "[추정] 표시된 항목은 발언 시 '추정에 따르면'으로 표현하세요."
-                )
-            else:
-                research_block = "\n\n【보유 논거 카드 — 아직 사용 안 한 것 우선 활용】\n"
-                if deliberation_text:
-                    research_block += f"{deliberation_text[:300]}\n"
-                elif research_text:
-                    research_block += f"{research_text[:300]}\n"
-                research_block += "⚠️ 이전 라운드에서 이미 쓴 논거는 반복하지 마세요."
-        else:
-            research_block = ""
-
         system = (
             f"당신은 AI 의회 토론 참여자입니다.\n"
             f"당신은 {member['name']} 의원입니다.\n\n"
@@ -666,8 +488,7 @@ class DebateEngine:
             "【찬반 균형 — 심층 토론을 위한 핵심 원칙】\n"
             "설령 당신이 한쪽 입장을 지지하더라도, 상대방의 최강 논거를 먼저 정확히 요약한 뒤 반박하라.\n"
             "상대 논거를 무시하거나 약하게 설정(스트로맨)하는 것은 금지. 상대 논거의 핵심을 인정하면서 "
-            "왜 그럼에도 불구하고 자신의 결론이 더 타당한지를 논증하라.\n"
-            f"{research_block}\n\n"
+            "왜 그럼에도 불구하고 자신의 결론이 더 타당한지를 논증하라.\n\n"
             f"【핵심 원칙 — 반드시 준수】\n"
             "1. 주장은 반드시 '근거 → 논리 → 결론' 순서로 전개하라.\n"
             "2. 확실한 것은 자신 있게, 불확실한 것은 반드시 '불확실' 또는 '추정'으로 명시하라.\n"
@@ -743,7 +564,7 @@ class DebateEngine:
                     )
                     await asyncio.sleep(2)
         print(f"[{member['name']}] 2회 모두 실패: {last_ex}")
-        return f"{member['name']} 의원은 신중한 검토가 필요하다고 봅니다."
+        return "신중한 검토가 필요한 안건이라고 봅니다."
 
     # ══════════════════════════════════════════════
     # 발언 처리 공통 헬퍼
@@ -891,16 +712,6 @@ class DebateEngine:
             "status",
             message=f"⚡ {candidate['name']} 의원 반박 발언 준비 중...",
         )
-
-        # 반박 체인으로 처음 발언하는 의원일 경우 사전 리서치 실행
-        if not self._first_speech_done.get(candidate["id"]):
-            try:
-                await self._first_speech_prep(candidate, chair["id"])
-            except Exception as e:
-                print(f"[Engine] {candidate['name']} 반박 첫발언 준비 실패 (발언은 정상 진행): {e}")
-                self._first_speech_done[candidate["id"]] = True
-                if candidate["id"] not in self._stance_map:
-                    self._stance_map[candidate["id"]] = "UNDECIDED"
 
         rebuttal = await self.get_opinion(
             candidate, chair["name"],
@@ -1097,7 +908,7 @@ class DebateEngine:
             }
         ]
         from ai_caller import (
-            call_gemini as _cg, call_groq as _cgr, call_openrouter as _cor,
+            call_gemini as _cg, call_openrouter as _cor,
             _ENGINE_SEMAPHORES, _BUCKETS,
         )
         engine = chair.get("engine", "openrouter")
@@ -1113,20 +924,12 @@ class DebateEngine:
         if engine == "gemini":
             order = [
                 ("gemini",     _cg,  "gemini-2.5-flash"),
-                ("groq",       _cgr, "meta-llama/llama-4-scout-17b-16e-instruct"),
-                ("openrouter", _cor, "mistralai/mistral-small-3.1-24b-instruct:free"),
-            ]
-        elif engine == "groq":
-            order = [
-                ("groq",       _cgr, model),
-                ("gemini",     _cg,  "gemini-2.5-flash"),
                 ("openrouter", _cor, "mistralai/mistral-small-3.1-24b-instruct:free"),
             ]
         else:
             order = [
                 ("openrouter", _cor, model),
                 ("gemini",     _cg,  "gemini-2.5-flash"),
-                ("groq",       _cgr, "meta-llama/llama-4-scout-17b-16e-instruct"),
             ]
 
         for eng_name, fn, mdl in order:
@@ -1160,7 +963,6 @@ class DebateEngine:
                     round_num=1,
                     is_rebuttal=False,
                     free_mode=False,
-                    is_chair_conclusion=True,
                 )
                 if chair_final and len(chair_final) > 10:
                     self.memories[chair["id"]].append(chair_final)
@@ -1332,15 +1134,9 @@ class DebateEngine:
             )
             print("[Engine] activeMembers 폴백: 유효 의원 부족 → 전체 8명으로 진행")
 
-        # 의장 사전 리서치 — 개회사 전 딱 한 번
-        # (_first_speech_prep 내부에서 stance=NEUTRAL로 설정됨)
-        await self.send("status", message=f"📡 {chair['name']} 의장 안건 자료 수집 중...")
-        try:
-            await self._first_speech_prep(chair, chair["id"])
-        except Exception as e:
-            print(f"[Engine] 의장 사전 리서치 실패 (개회사는 정상 진행): {e}")
-            self._stance_map[chair["id"]] = "NEUTRAL"
-            self._first_speech_done[chair["id"]] = True
+        # stance_map 초기화 — 의장 NEUTRAL, 나머지 전원 UNDECIDED
+        for m in self.members:
+            self._stance_map[m["id"]] = "NEUTRAL" if m["id"] == chair["id"] else "UNDECIDED"
 
         dispatch = {
             "릴레이":     self._run_relay,
@@ -1404,18 +1200,12 @@ class DebateEngine:
                     await self.run_conclusion(chair, timed_out=True)
                     return
 
-                if idx > 0:
+                # 1라운드 idx==0: 개회사에서 이미 지목됨 → 추가 지목 없음
+                # 1라운드 idx>0 또는 2라운드 이상: 항상 지목
+                if round_num == 1 and idx == 0:
+                    pass  # 개회사에서 지목 완료
+                else:
                     await self._nominate(chair, m)
-
-                # 첫 발언 직전 리서치+입장결정 (최초 1회만)
-                if not self._first_speech_done.get(m["id"]):
-                    try:
-                        await self._first_speech_prep(m, chair["id"])
-                    except Exception as e:
-                        print(f"[Engine] {m['name']} 첫발언 준비 실패 (발언은 정상 진행): {e}")
-                        self._first_speech_done[m["id"]] = True
-                        if m["id"] not in self._stance_map:
-                            self._stance_map[m["id"]] = "UNDECIDED"
 
                 cur_opinion, cur_stype = await self.prepare_speech(
                     chair, m, fmt_guide, round_num
@@ -1493,18 +1283,12 @@ class DebateEngine:
                 if self._turns_over():
                     await self.run_conclusion(chair, timed_out=True)
                     return
-                if _pi > 0:
-                    await self._nominate(chair, m, text=f"{m['name']} 의원님, 발언해 주십시오.")
 
-                # 첫 발언 직전 리서치+입장결정 (최초 1회만)
-                if not self._first_speech_done.get(m["id"]):
-                    try:
-                        await self._first_speech_prep(m, chair["id"])
-                    except Exception as e:
-                        print(f"[Engine] {m['name']} 첫발언 준비 실패 (발언은 정상 진행): {e}")
-                        self._first_speech_done[m["id"]] = True
-                        if m["id"] not in self._stance_map:
-                            self._stance_map[m["id"]] = "UNDECIDED"
+                # 1라운드 첫 debater(_pi==0): 개회사에서 이미 지목됨
+                if round_num == 1 and _pi == 0:
+                    pass
+                else:
+                    await self._nominate(chair, m, text=f"{m['name']} 의원님, 발언해 주십시오.")
 
                 _po, _ps = await self.prepare_speech(chair, m, fmt_guide, round_num)
                 await self.deliver_speech(chair, m, _po, _ps, non_chair, fmt_guide, round_num)
@@ -1532,16 +1316,6 @@ class DebateEngine:
                     break
                 await self._nominate(chair, m,
                     text=f"{m['name']} 의원님, 핵심 토론자의 논거에 대해 반박하거나 보완 질의해 주십시오.")
-
-                # 첫 발언 직전 리서치+입장결정 (최초 1회만)
-                if not self._first_speech_done.get(m["id"]):
-                    try:
-                        await self._first_speech_prep(m, chair["id"])
-                    except Exception as e:
-                        print(f"[Engine] {m['name']} 첫발언 준비 실패 (발언은 정상 진행): {e}")
-                        self._first_speech_done[m["id"]] = True
-                        if m["id"] not in self._stance_map:
-                            self._stance_map[m["id"]] = "UNDECIDED"
 
                 # observer는 직전 debater 발언을 대상으로 반박 유도
                 last_ctx = self._get_last_speech_context(m)
@@ -1574,29 +1348,46 @@ class DebateEngine:
         general = [m for m in non_chair if m not in panels]
         p_names = ", ".join(p["name"] for p in panels)
 
-        summary = await self.chair_speak(
+        first_panel = panels[0] if panels else None
+        open_text = await self.chair_speak(
             chair,
             f"지금부터 AI 의회 전문가패널 토론을 개회합니다. "
-            f"안건은 '{self.issue}'입니다. "
-            f"패널로는 {p_names} 의원님께서 선정되었습니다. "
-            "패널 의원님들의 심층 발언과 일반 의원들의 질의로 진행됩니다.",
-            max_chars=CHAIR_MAX_LEN + 100,
+            f"오늘 상정된 안건은 '{self.issue}'입니다. "
+            f"이 안건의 사회적·정책적 배경과 현시점에 논의가 필요한 이유를 2~3문장으로 소개하고, "
+            f"찬반 양측이 집중적으로 다룰 핵심 쟁점 2~3가지를 구체적으로 예고해 주세요. "
+            f"패널로는 {p_names} 의원님께서 선정되었으며, "
+            "패널 의원님들의 심층 발언과 일반 의원들의 질의로 진행됩니다. "
+            + (f"먼저 {first_panel['name']} 의원님, 안건에 대한 전문가 견해를 발언해 주십시오." if first_panel else ""),
+            max_chars=CHAIR_MAX_LEN + 250,
             is_opening=True,
         )
-        self.ctx.push(f"[의장 {chair['name']}]", summary)
-        await self.send_speech(chair, summary, "NORMAL", True)
+        self.ctx.push(f"[의장 {chair['name']}]", open_text)
+        await self.send_speech(chair, open_text, "NORMAL", True)
 
         qa_rounds = max(1, self.rounds - 1)
         for qa_round in range(1, qa_rounds + 1):
             if self._turns_over():
                 break
-            qa_text = await self.chair_speak(
-                chair,
-                f"전체 질의·응답 {qa_round}라운드를 시작합니다.",
-                max_chars=100,
-            )
-            self.ctx.push(f"[의장 {chair['name']}]", qa_text)
-            await self.send_speech(chair, qa_text, "NORMAL", True)
+
+            if qa_round > 1:
+                qa_text = await self.chair_speak(
+                    chair,
+                    f"전체 질의·응답 {qa_round}라운드를 시작합니다.",
+                    max_chars=100,
+                )
+                self.ctx.push(f"[의장 {chair['name']}]", qa_text)
+                await self.send_speech(chair, qa_text, "NORMAL", True)
+
+            # 1라운드: 개회사에서 이미 첫 패널을 지목했으므로 바로 발언
+            # 이후 라운드: 일반 의원 질의 → 패널 응답 순
+            if qa_round == 1:
+                for idx_p, p in enumerate(panels):
+                    if self._turns_over():
+                        break
+                    if idx_p > 0:
+                        await self._nominate(chair, p, text=f"패널 {p['name']} 의원님, 전문가 견해를 발언해 주십시오.")
+                    _ro, _rs = await self.prepare_speech(chair, p, fmt_guide, max(1, self.rounds - 1))
+                    await self.deliver_speech(chair, p, _ro, _rs, non_chair, fmt_guide, max(1, self.rounds - 1))
 
             if general:
                 shuffled_gen = general.copy()
@@ -1605,16 +1396,6 @@ class DebateEngine:
                     if self._turns_over():
                         break
                     await self._nominate(chair, m, text=f"{m['name']} 의원님, 패널에 질의해 주십시오.")
-
-                    if not self._first_speech_done.get(m["id"]):
-                        try:
-                            await self._first_speech_prep(m, chair["id"])
-                        except Exception as e:
-                            print(f"[Engine] {m['name']} 첫발언 준비 실패: {e}")
-                            self._first_speech_done[m["id"]] = True
-                            if m["id"] not in self._stance_map:
-                                self._stance_map[m["id"]] = "UNDECIDED"
-
                     _go, _gs = await self.prepare_speech(chair, m, fmt_guide, max(1, self.rounds - 1))
                     await self.deliver_speech(chair, m, _go, _gs, non_chair, fmt_guide, max(1, self.rounds - 1))
 
@@ -1622,16 +1403,6 @@ class DebateEngine:
                 if self._turns_over():
                     break
                 await self._nominate(chair, p, text=f"패널 {p['name']} 의원님, 질의에 응답해 주십시오.")
-
-                if not self._first_speech_done.get(p["id"]):
-                    try:
-                        await self._first_speech_prep(p, chair["id"])
-                    except Exception as e:
-                        print(f"[Engine] {p['name']} 첫발언 준비 실패: {e}")
-                        self._first_speech_done[p["id"]] = True
-                        if p["id"] not in self._stance_map:
-                            self._stance_map[p["id"]] = "UNDECIDED"
-
                 _ro, _rs = await self.prepare_speech(chair, p, fmt_guide, max(1, self.rounds - 1))
                 await self.deliver_speech(chair, p, _ro, _rs, non_chair, fmt_guide, max(1, self.rounds - 1))
 
@@ -1651,6 +1422,9 @@ class DebateEngine:
 
         warn_threshold = int(self.max_free_turns * 0.8)
 
+        non_chair = [m for m in self.members if m["id"] != chair["id"]]
+        first_speaker = random.choice(non_chair) if non_chair else None
+
         open_text = await self.chair_speak(
             chair,
             f"지금부터 AI 의회 본회의를 개회합니다. "
@@ -1660,7 +1434,8 @@ class DebateEngine:
             f"본 토론은 자유토론 형식으로 최대 {self.max_free_turns}회 발언 한도 내에서 "
             "순서 제한 없이 자유롭게 발언할 수 있습니다. "
             "의원들이 실증 데이터, 통계, 문헌 근거를 적극 활용해 논거를 전개해 줄 것을 당부하며, "
-            "발언 한도 종료 후에는 즉시 최종 의결로 이행합니다.",
+            "발언 한도 종료 후에는 즉시 최종 의결로 이행합니다."
+            + (f" 먼저 {first_speaker['name']} 의원님, 첫 번째 발언을 시작해 주십시오." if first_speaker else ""),
             max_chars=CHAIR_MAX_LEN + 250,
             is_opening=True,
         )
@@ -1668,7 +1443,6 @@ class DebateEngine:
         await self.send_speech(chair, open_text, "NORMAL", True)
 
         warned    = False
-        non_chair = [m for m in self.members if m["id"] != chair["id"]]
         # [BUG-2 수정] 로컬 turn 변수 제거 — _turn_count를 단일 기준으로 사용.
         # 기존: turn(로컬)과 _turn_count(deliver_speech 내부 increment) 이중 카운트로
         #       실제 발언이 max_turns보다 적게 끝나는 문제 수정.
@@ -1692,9 +1466,11 @@ class DebateEngine:
                 if self._turns_over():
                     break
 
-            # 발언자 선택
+            # 발언자 선택 — 첫 턴은 개회사에서 지목된 의원이 먼저 발언
             speaker = None
-            if self.ctx.all_logs:
+            if turns_used == 0 and first_speaker:
+                speaker = first_speaker
+            elif self.ctx.all_logs:
                 last_log  = self.ctx.all_logs[-1]
                 last_text = last_log.get("text", "")
                 last_spk  = last_log.get("speaker", "")
@@ -1716,16 +1492,6 @@ class DebateEngine:
             await self.send("status",
                 message=f"[자유토론] {speaker['name']} 의원 발언 준비 중... "
                         f"({turns_used+1}/{self.max_free_turns}턴)")
-
-            # 첫 발언 직전 리서치+입장결정 (최초 1회만)
-            if not self._first_speech_done.get(speaker["id"]):
-                try:
-                    await self._first_speech_prep(speaker, chair["id"])
-                except Exception as e:
-                    print(f"[Engine] {speaker['name']} 첫발언 준비 실패 (발언은 정상 진행): {e}")
-                    self._first_speech_done[speaker["id"]] = True
-                    if speaker["id"] not in self._stance_map:
-                        self._stance_map[speaker["id"]] = "UNDECIDED"
 
             _fo, _fs = await self.prepare_speech(chair, speaker, fmt_guide, 1, free_mode=True)
             await self.deliver_speech(chair, speaker, _fo, _fs, non_chair, fmt_guide, 1, free_mode=True)

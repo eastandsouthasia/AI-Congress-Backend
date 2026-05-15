@@ -83,8 +83,8 @@ MEMBERS = [
         "color":  "#0668E1",
         "avatar": "🦙",
         "pitch":  1.05,
-        "engine": "groq",
-        "model":  "meta-llama/llama-4-scout-17b-16e-instruct",
+        "engine": "openrouter",
+        "model":  "meta-llama/llama-3.3-70b-instruct:free",
     },
     # ③ 미스트랄 — Small 3.1 :free 유지 (유럽, 법제·규범 관점 유일)
     {
@@ -198,7 +198,7 @@ MEMBERS = [
         "avatar": "🔬",
         "pitch":  1.02,
         "engine": "openrouter",
-        "model":  "allenai/olmo-3.1-32b-think:free",
+        "model":  "allenai/olmo-3-32b-think:free",
     },
     # ⑦ 트리니티 — Arcee AI (미국 스타트업·효율·실용주의)
     {
@@ -252,7 +252,7 @@ MEMBERS = [
         "avatar": "☁️",
         "pitch":  0.97,
         "engine": "openrouter",
-        "model":  "amazon/nova-pro-v1",
+        "model":  "nvidia/nemotron-3-super-120b-a12b:free",
     },
 ]
 
